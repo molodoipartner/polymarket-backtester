@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}New strategy group - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="mb-8"><p class="eyebrow">Portfolio builder</p><h1>Create a strategy group</h1><p class="mt-2 muted">Configure one historical experiment. The backend generates and tests distinct algorithms against identical data.</p></div>
+<form id="group-generation-form" method="post" action="/groups">
+  <section class="panel mb-6"><div class="flex gap-4"><span class="builder-step">1</span><div><p class="eyebrow">Theme</p><h2>Fixed-time activity</h2><p class="mt-2 muted">Consecutive Polymarket Up/Down contracts are the only supported MVP event type.</p></div></div></section>
+  <section class="panel mb-6">
+    <div class="mb-5 flex gap-4"><span class="builder-step">2</span><div><p class="eyebrow">Market scope</p><h2>Assets and timeframe</h2><p class="mt-2 muted">Every generated algorithm uses this same event universe.</p></div></div>
+    <div class="asset-grid">{% for symbol,label in assets.items() %}<label class="market-choice"><input type="checkbox" name="asset_symbols" value="{{ symbol }}" {{ 'checked' if loop.first }}><span><strong>{{ symbol }}</strong><small>{{ label }}</small></span></label>{% endfor %}</div>
+    <div class="mt-6 grid gap-3 sm:grid-cols-4">{% for value,label in timeframes.items() %}<label class="market-choice"><input type="radio" name="timeframe" value="{{ value }}" {{ 'checked' if loop.first }}><span><strong>{{ value }}</strong><small>{{ label }}</small></span></label>{% endfor %}</div>
+  </section>
+  <section class="panel">
+    <div class="mb-5 flex gap-4"><span class="builder-step">3</span><div><p class="eyebrow">Group inputs</p><h2>Backtest setup</h2><p class="mt-2 muted">All fields are required and stored with the resulting group.</p></div></div>
+    <div class="grid gap-4 md:grid-cols-2">
+      <label>Group name<input name="group_name" maxlength="80" placeholder="Crypto_Scalping_BTC" required></label>
+      <label>Starting balance<input type="number" name="starting_balance" min="1" step="0.01" value="{{ '%.2f'|format(default_balance) }}" required></label>
+      <label>Start date<input type="date" name="start_date" value="{{ default_start }}" required></label>
+      <label>End date<input type="date" name="end_date" value="{{ default_end }}" required></label>
+      <label>Number of strategies<input type="number" name="strategy_count" min="1" max="300" value="10" required><small class="muted">1 to 300 unique algorithm configurations</small></label>
+      <label>Assumed Ask price, cents<input type="number" name="assumed_ask_price_cents" min="1" max="99" step="0.01" value="51" required><small class="muted">Every UP/DOWN entry uses this price exactly at contract open.</small></label>
+    </div>
+    <div id="cache-calendar" class="cache-calendar mt-6" data-default-start="{{ default_start }}" data-default-end="{{ default_end }}">
+      <div class="section-title"><div><p class="eyebrow">Local history cache</p><h2>Cached date coverage</h2><p class="muted">Green days are already stored locally for the selected assets/timeframe. Missing days are downloaded incrementally.</p></div><span id="cache-calendar-status" class="badge">Loading</span></div>
+      <div id="cache-calendar-grid" class="cache-calendar-grid"></div>
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs muted"><div class="flex flex-wrap gap-3"><span><i class="cache-dot cached"></i>Fully cached</span><span><i class="cache-dot partial"></i>Partially cached</span><span><i class="cache-dot missing"></i>Not cached yet</span></div><button id="cache-delete-selected" class="danger" type="button">Delete selected range cache</button></div>
+    </div>
+    <button class="primary mt-6" type="submit">Generate group and backtest</button>
+  </section>
+</form>
+<section id="generation-progress" class="panel mt-6 hidden" aria-live="polite">
+  <div class="section-title"><div><p class="eyebrow">Live generation</p><h2>Backend progress</h2></div><div class="flex items-center gap-3"><button id="generation-cancel" class="danger hidden" type="button">Stop / Cancel</button><span id="generation-status" class="badge">Starting</span></div></div>
+  <div class="progress-track"><div id="generation-progress-bar" class="progress-fill" style="width:0%"></div></div>
+  <div class="mt-5 grid gap-3 md:grid-cols-2">
+    <div class="progress-step" data-stage="download"><span>1</span><p>Loading historical data from the Polymarket API...</p></div>
+    <div class="progress-step" data-stage="validation"><span>2</span><p>Parsing and validating events...</p></div>
+    <div class="progress-step" data-stage="backtest"><span>3</span><p>Running strategy backtests...</p></div>
+    <div class="progress-step" data-stage="finalization"><span>4</span><p>Calculating final balances and saving the group...</p></div>
+  </div>
+  <div id="generation-live-log" class="live-log mt-5"></div>
+</section>
+{% endblock %}

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="mb-10 flex flex-wrap items-end justify-between gap-5">
+  <div class="max-w-2xl"><p class="eyebrow">Welcome, {{ user.display_name }}</p><h1>Strategy groups</h1><p class="mt-3 text-slate-300">Generate and compare multiple fixed-time algorithms inside one reproducible backtest package.</p></div>
+  <a class="primary" href="/groups/new">Create strategy group</a>
+</div>
+{% if groups %}
+<div class="grid gap-5 lg:grid-cols-2">
+  {% for group in groups %}
+  <section class="panel">
+    <div class="section-title"><div><p class="eyebrow">{{ group.timeframe }} - {{ group.assets|join(', ') }}</p><h2 class="text-xl"><a class="hover:text-neon" href="/groups/{{ group.id }}">{{ group.name }}</a></h2></div><span class="badge">{{ group.strategy_count }} strategies</span></div>
+    <div class="grid grid-cols-3 gap-3 py-4">
+      <div><p class="muted">Best ROI</p><p class="mt-1 {{ 'profit' if group.summary.best_roi >= 0 else 'loss' }}">{{ '%+.2f'|format(group.summary.best_roi) }}%</p></div>
+      <div><p class="muted">Profitable</p><p class="mt-1">{{ group.summary.profitable_strategies }}/{{ group.strategy_count }}</p></div>
+      <div><p class="muted">Events</p><p class="mt-1">{{ group.event_count }}</p></div>
+    </div>
+    <p class="muted">{{ group.period.start_date }} through {{ group.period.end_date }} - starting balance ${{ '{:,.2f}'.format(group.starting_balance) }}</p>
+    <div class="mt-5 flex items-center justify-between border-t border-line pt-5"><a class="secondary" href="/groups/{{ group.id }}">Open dashboard</a><form method="post" action="/groups/{{ group.id }}/delete" onsubmit="return confirm('Permanently delete this group, its strategies and transactions?')"><button class="text-sm text-red-300 hover:text-red-200">Delete group</button></form></div>
+  </section>
+  {% endfor %}
+</div>
+<form class="mt-7 text-right" method="post" action="/groups/clear" onsubmit="return confirm('Permanently delete every strategy group? This cannot be undone.')"><button class="text-sm text-red-300 hover:text-red-200">Delete all groups</button></form>
+{% else %}
+<section class="panel empty"><p>You have 0 strategy groups.</p><a class="primary mt-5" href="/groups/new">Create your first group</a></section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: polymarket-backtester
+    runtime: python
+    plan: starter
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.api.app:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: polymarket-data
+      mountPath: /var/data
+      sizeGB: 20
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATA_ROOT
+        value: /var/data/polymarket-backtester
+      - key: WORKERS
+        value: 1
+      - key: ALLOWED_HOSTS
+        value: "*.onrender.com"
+      - key: SESSION_COOKIE_SECURE
+        value: true
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: EXPORT_TOKEN
+        generateValue: true
+      - key: USERNAME
+        sync: false
+      - key: PASSWORD
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Create account' if mode == 'signup' else 'Log in' }} - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="mx-auto mt-10 max-w-md">
+  <div class="mb-8 text-center">
+    <p class="eyebrow">Fixed-time market research</p>
+    <h1>{{ 'Create your workspace' if mode == 'signup' else 'Welcome back' }}</h1>
+    <p class="mt-2 muted">Each user starts with zero strategies and an isolated workspace.</p>
+  </div>
+  <form class="panel space-y-5" method="post" action="/{{ mode }}">
+    {% if mode == 'signup' %}<label>Display name<input name="display_name" autocomplete="name" required></label>{% endif %}
+    <label>{{ 'Email' if mode == 'signup' else 'Email or admin username' }}<input name="email" autocomplete="username" required></label>
+    <label>Password<input type="password" name="password" minlength="8" autocomplete="{{ 'new-password' if mode == 'signup' else 'current-password' }}" required></label>
+    <button class="primary w-full">{{ 'Create account' if mode == 'signup' else 'Log in' }}</button>
+  </form>
+  <p class="mt-5 text-center text-sm text-slate-400">
+    {% if mode == 'signup' %}Already have an account? <a class="text-neon" href="/login">Log in</a>{% else %}New here? <a class="text-neon" href="/signup">Create account</a>{% endif %}
+  </p>
+</div>
+{% endblock %}

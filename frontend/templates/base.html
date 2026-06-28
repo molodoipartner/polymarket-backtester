@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/tailwind.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}">
+  <script src="{{ url_for('static', path='/vendor/chart.umd.js') }}"></script>
+</head>
+<body class="min-h-screen bg-ink text-slate-100 antialiased">
+  <header class="border-b border-line bg-ink/90 backdrop-blur">
+    <div class="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
+      <a href="{{ '/admin' if is_admin else '/' }}" class="font-semibold tracking-wide"><span class="text-neon">POLY</span> LAB</a>
+      {% if user %}
+      <nav class="flex items-center gap-4 text-sm text-slate-300">
+        {% if is_admin %}<a href="/admin" class="hover:text-neon">Admin</a>{% else %}<a href="/" class="hover:text-neon">Groups</a><a href="/saved-strategies" class="hover:text-neon">Favorites</a><a href="/groups/new" class="hover:text-neon">New group</a><a href="/live-monitor" class="hover:text-neon">Live monitor</a>{% endif %}
+        <span class="hidden text-slate-500 sm:inline">{{ user.display_name }}</span>
+        <form method="post" action="/logout"><button class="text-slate-400 hover:text-white">Log out</button></form>
+      </nav>
+      {% endif %}
+    </div>
+  </header>
+  <main class="mx-auto max-w-6xl px-4 py-10">
+    {% if message %}<div class="mb-6 rounded-lg border border-neon/40 bg-neon/10 p-3 text-sm text-neon">{{ message }}</div>{% endif %}
+    {% if error %}<div class="mb-6 rounded-lg border border-red-400/40 bg-red-400/10 p-3 text-sm text-red-300">{{ error }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <script src="{{ url_for('static', path='/js/app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
