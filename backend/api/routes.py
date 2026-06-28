@@ -52,6 +52,7 @@ def _context(request: Request, **values) -> dict:
     return {
         "request": request,
         "app_name": settings.app_name,
+        "asset_version": _asset_version(),
         "user": _user(request),
         "is_admin": _is_admin(request),
         "local_data_tools": _local_data_tools_available(request),
@@ -59,6 +60,17 @@ def _context(request: Request, **values) -> dict:
         "error": request.session.pop("error", None),
         **values,
     }
+
+
+def _asset_version() -> str:
+    paths = (
+        ROOT_DIR / "frontend" / "static" / "css" / "app.css",
+        ROOT_DIR / "frontend" / "static" / "js" / "app.js",
+    )
+    try:
+        return str(max(path.stat().st_mtime_ns for path in paths))
+    except OSError:
+        return "dev"
 
 
 def _local_data_tools_available(request: Request) -> bool:
