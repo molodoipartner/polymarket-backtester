@@ -619,15 +619,19 @@ class PolymarketCryptoPriceFeed:
             payload = message.get("payload") or {}
             if str(payload.get("symbol", "")).lower() != self.symbol:
                 continue
-            price = _crypto_price_from_payload(payload)
-            if price is None:
+            price_point = _crypto_price_point_from_payload(payload)
+            if price_point is None:
                 continue
+            price, price_ts = price_point
             self._last_price_at = time.monotonic()
             self.state.crypto_price = price
-            self.state.crypto_updated_at = time.time()
+            self.state.crypto_updated_at = price_ts or time.time()
             self.state.crypto_status = "ready"
             self.state.last_error = None
-            await self.on_update("crypto", {"symbol": self.symbol})
+            await self.on_update(
+                "crypto",
+                {"symbol": self.symbol, "price_ts": self.state.crypto_updated_at},
+            )
 
     async def _watchdog(self) -> None:
         while True:
@@ -791,6 +795,10 @@ class LiveMonitorSession:
         self._last_sample_write_error_at = 0.0
         self._last_sample_write_error: str | None = None
         self._preloaded_next: PreloadedPolymarketOrderBook | None = None
+
+    @property
+    def is_finished(self) -> bool:
+        return self._stopped or self.state.quote_status in {"ended", "stopped"}
 
     async def start(self) -> None:
         self._write_meta()
@@ -1173,19 +1181,21 @@ class LiveMonitorSession:
                 str(detail.get("message", "")),
             )
             return
+        target_locked = False
         if update_type == "quote":
             token_id = str(detail.get("token_id", ""))
             self._remember_quote_update(token_id)
         elif update_type == "crypto":
             self._remember_crypto_update()
+            target_locked = self._maybe_lock_target_price(self.state.crypto_updated_at)
         if update_type in {"quote", "crypto"}:
             self._pending_live_update_count += 1
             now = time.time()
-            should_publish = (
+            should_publish = target_locked or (
                 now - self._last_live_update_publish_at
                 >= LIVE_STREAM_MIN_INTERVAL_SECONDS
             )
-            should_sample = (
+            should_sample = target_locked or (
                 now - self._last_sample_enqueue_at
                 >= SAMPLE_WRITE_MIN_INTERVAL_SECONDS
             )
@@ -1299,10 +1309,17 @@ class LiveMonitorSession:
             return
         updated_at = self.state.crypto_updated_at or time.time()
         point = (updated_at, self.state.crypto_price)
-        if self._crypto_timeline and self._crypto_timeline[-1][0] == updated_at:
-            self._crypto_timeline[-1] = point
+        for index, (existing_at, _price) in enumerate(self._crypto_timeline):
+            if existing_at == updated_at:
+                self._crypto_timeline[index] = point
+                break
         else:
             self._crypto_timeline.append(point)
+            if (
+                len(self._crypto_timeline) > 1
+                and updated_at < self._crypto_timeline[-2][0]
+            ):
+                self._crypto_timeline.sort(key=lambda item: item[0])
         self._trim_crypto_timeline()
 
     def _trim_quote_timeline(self, token_id: str) -> None:
@@ -1350,17 +1367,41 @@ class LiveMonitorSession:
             return window_start
         return self.started_at_ts
 
+    def _target_price_candidate(
+        self,
+        timestamp: float,
+        lock_after: float | None,
+    ) -> tuple[float, float] | None:
+        max_ts = timestamp + 1e-6
+        for updated_at, price in self._crypto_timeline:
+            if lock_after is not None and updated_at + 1e-6 < lock_after:
+                continue
+            if updated_at <= max_ts:
+                return price, updated_at
+        if self._crypto_timeline:
+            return None
+        if self.state.crypto_price is None:
+            return None
+        updated_at = self.state.crypto_updated_at or timestamp
+        if lock_after is not None and updated_at + 1e-6 < lock_after:
+            return None
+        if updated_at > max_ts:
+            return None
+        return self.state.crypto_price, updated_at
+
     def _maybe_lock_target_price(self, timestamp: float | None = None) -> bool:
         if self.state.target_price is not None:
-            return False
-        if self.state.crypto_price is None:
             return False
         lock_after = self._target_lock_after_ts()
         timestamp = time.time() if timestamp is None else timestamp
         if lock_after is not None and timestamp < lock_after:
             return False
-        self.state.target_price = _price_to_beat(self.state.crypto_price)
-        self._target_price_ts = timestamp
+        candidate = self._target_price_candidate(timestamp, lock_after)
+        if candidate is None:
+            return False
+        price, price_ts = candidate
+        self.state.target_price = _price_to_beat(price)
+        self._target_price_ts = price_ts
         return True
 
     def _append_history_row(
@@ -1844,6 +1885,7 @@ class LiveMonitorManager:
     def __init__(self, data_root: Path) -> None:
         self.data_root = data_root
         self.sessions: dict[str, LiveMonitorSession] = {}
+        self.active_by_user: dict[str, str] = {}
         self.data_root.mkdir(parents=True, exist_ok=True)
         (self.data_root / "sessions").mkdir(exist_ok=True)
         (self.data_root / "samples").mkdir(exist_ok=True)
@@ -1854,19 +1896,38 @@ class LiveMonitorManager:
         event_url: str,
         crypto_symbol: str | None = None,
     ) -> LiveMonitorSession:
+        active = self.active_session(user_id)
+        if active is not None:
+            await self.stop(active.id)
         event = await resolve_polymarket_event(event_url, crypto_symbol)
         session = LiveMonitorSession(uuid.uuid4().hex, user_id, event, self.data_root)
         self.sessions[session.id] = session
+        self.active_by_user[user_id] = session.id
         await session.start()
         return session
 
     def get(self, session_id: str) -> LiveMonitorSession | None:
         return self.sessions.get(session_id)
 
+    def active_session(self, user_id: str) -> LiveMonitorSession | None:
+        session_id = self.active_by_user.get(user_id)
+        if not session_id:
+            return None
+        session = self.sessions.get(session_id)
+        if session is None:
+            self.active_by_user.pop(user_id, None)
+            return None
+        if session.user_id != user_id or session.is_finished:
+            self.active_by_user.pop(user_id, None)
+            return None
+        return session
+
     async def stop(self, session_id: str) -> bool:
         session = self.sessions.pop(session_id, None)
         if not session:
             return False
+        if self.active_by_user.get(session.user_id) == session_id:
+            self.active_by_user.pop(session.user_id, None)
         await session.close()
         return True
 
@@ -2185,14 +2246,73 @@ def _market_tokens(market: dict) -> list[LiveToken]:
     return result
 
 
-def _crypto_price_from_payload(payload: dict) -> float | None:
-    try:
-        if "data" in payload and payload["data"]:
-            return float(payload["data"][-1]["value"])
-        value = payload.get("value")
-        return float(value) if value is not None else None
-    except (TypeError, ValueError, KeyError):
+def _crypto_price_point_from_payload(payload: dict) -> tuple[float, float | None] | None:
+    source: Any = payload
+    data = payload.get("data")
+    if isinstance(data, list) and data:
+        source = data[-1]
+    elif isinstance(data, dict):
+        source = data
+    if not isinstance(source, dict):
+        source = {"value": source}
+
+    price = _float_from_keys(source, ("value", "price", "last_price"))
+    if price is None and source is not payload:
+        price = _float_from_keys(payload, ("value", "price", "last_price"))
+    if price is None:
         return None
+
+    timestamp = _timestamp_from_mapping(source)
+    if timestamp is None and source is not payload:
+        timestamp = _timestamp_from_mapping(payload)
+    return price, timestamp
+
+
+def _crypto_price_from_payload(payload: dict) -> float | None:
+    point = _crypto_price_point_from_payload(payload)
+    return point[0] if point is not None else None
+
+
+def _float_from_keys(payload: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _timestamp_from_mapping(payload: dict) -> float | None:
+    return _timestamp_from_value(
+        payload.get("timestamp")
+        or payload.get("ts")
+        or payload.get("time")
+        or payload.get("updated_at")
+        or payload.get("created_at")
+        or payload.get("published_at")
+    )
+
+
+def _timestamp_from_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    if parsed > 100_000_000_000_000:
+        return parsed / 1_000_000_000
+    if parsed > 100_000_000_000:
+        return parsed / 1_000
+    return parsed
 
 
 async def _fetch_clob_book(

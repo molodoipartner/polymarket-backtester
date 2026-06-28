@@ -219,6 +219,11 @@ function initLiveMonitor(){
     else if(level==='warning')console.warn('[live-monitor]',entry);
     else console.info('[live-monitor]',entry);
   };
+  const renderSnapshotLogs=logs=>{
+    if(!liveLog||!Array.isArray(logs)||!logs.length)return;
+    liveLog.textContent='';
+    for(const entry of logs.slice(-80))appendLog(entry);
+  };
   const setDot=(element,connected,error=false)=>{if(!element)return;element.classList.toggle('connected',!!connected&&!error);element.classList.toggle('error',!!error)};
   const setBusy=busy=>{
     const button=form.querySelector('button[type="submit"]');
@@ -390,6 +395,8 @@ function initLiveMonitor(){
     lastPayloadAt=Date.now();staleWarningShown=false;
     eventTitle.textContent=payload.event?.title||'Live session';
     eventSlug.textContent=payload.event?.slug||'-';
+    const eventUrlInput=form.querySelector('input[name="event_url"]');
+    if(eventUrlInput&&payload.event?.url)eventUrlInput.value=payload.event.url;
     cryptoPrice.textContent=fmtPrice(payload.crypto?.price);
     cryptoStatus.textContent=(payload.crypto?.symbol||'')+' - target '+fmtPriceToBeat(payload.crypto?.target_price)+' - '+(payload.status?.crypto||'waiting')+' - '+fmtAge(payload.crypto?.updated_at);
     quoteStatus.textContent=payload.status?.quotes||'waiting';
@@ -401,6 +408,35 @@ function initLiveMonitor(){
     setDot(quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
     setDot(cryptoDot,!!payload.health?.crypto?.connected,!!payload.status?.last_error&&payload.status?.crypto==='reconnecting');
     renderRows(payload);updateChart(payload);
+  };
+  const connectSession=payload=>{
+    closeSource();
+    sessionId=payload.session_id;
+    stopUrl=payload.stop_url;
+    render(payload.snapshot);
+    renderSnapshotLogs(payload.snapshot?.logs);
+    stopButton.classList.remove('hidden');
+    appendLog({level:'info',source:'browser',message:'Connected to live monitor session '+sessionId+'.'});
+    source=new EventSource(payload.events_url);
+    const listener=message=>render(JSON.parse(message.data));
+    source.addEventListener('snapshot',listener);source.addEventListener('quote',listener);source.addEventListener('crypto',listener);source.addEventListener('status',listener);source.addEventListener('tick',listener);source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')})});
+    source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Saved completed contract'});loadSaved()});
+    source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data);appendLog(data.log)});
+    source.addEventListener('ended',message=>{render(JSON.parse(message.data));appendLog({level:'warning',source:'browser',message:'Tracking ended'});closeSource();sessionId=null;stopUrl=null;stopButton.classList.add('hidden');loadSaved()});
+    source.onerror=error=>{quoteStatus.textContent='Stream reconnecting';console.error('[live-monitor] SSE error',error);appendLog({level:'error',source:'browser',message:'SSE stream interrupted; browser will retry.'})};
+  };
+  const restoreActiveSession=async()=>{
+    try{
+      const response=await fetch('/api/live-monitors/active',{headers:{Accept:'application/json'}});
+      if(!response.ok)return;
+      const payload=await response.json();
+      if(!payload.active)return;
+      connectSession(payload);
+      appendLog({level:'info',source:'browser',message:'Restored active session after page load.'});
+    }catch(error){
+      console.error('[live-monitor] restore failed',error);
+      appendLog({level:'error',source:'browser',message:'Unable to restore active session: '+error.message});
+    }
   };
   const loadSaved=async()=>{
     if(!savedRows)return;
@@ -457,7 +493,7 @@ function initLiveMonitor(){
   stopButton.addEventListener('click',async()=>{
     stopButton.disabled=true;closeSource();
     if(stopUrl){try{await fetch(stopUrl,{method:'POST',headers:{Accept:'application/json'}})}catch(error){console.error('[live-monitor] stop failed',error);appendLog({level:'error',source:'browser',message:error.message})}}
-    quoteStatus.textContent='Stopped';cryptoStatus.textContent='Stopped';setDot(quoteDot,false);setDot(cryptoDot,false);stopButton.classList.add('hidden');stopButton.disabled=false;
+    sessionId=null;stopUrl=null;quoteStatus.textContent='Stopped';cryptoStatus.textContent='Stopped';setDot(quoteDot,false);setDot(cryptoDot,false);stopButton.classList.add('hidden');stopButton.disabled=false;
     loadSaved();
   });
   form.addEventListener('submit',async event=>{
@@ -466,16 +502,7 @@ function initLiveMonitor(){
       const response=await fetch('/api/live-monitors',{method:'POST',body:new FormData(form),headers:{Accept:'application/json'}});
       const payload=await response.json();
       if(!response.ok)throw new Error(payload.detail||'Unable to start live monitor');
-      sessionId=payload.session_id;stopUrl=payload.stop_url;render(payload.snapshot);
-      appendLog({level:'info',source:'browser',message:'SSE stream opening for session '+sessionId});
-      stopButton.classList.remove('hidden');
-      source=new EventSource(payload.events_url);
-      const listener=message=>render(JSON.parse(message.data));
-      source.addEventListener('snapshot',listener);source.addEventListener('quote',listener);source.addEventListener('crypto',listener);source.addEventListener('status',listener);source.addEventListener('tick',listener);source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')})});
-      source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Saved completed contract'});loadSaved()});
-      source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data);appendLog(data.log)});
-      source.addEventListener('ended',message=>{render(JSON.parse(message.data));appendLog({level:'warning',source:'browser',message:'Tracking ended'});closeSource();stopButton.classList.add('hidden');loadSaved()});
-      source.onerror=error=>{quoteStatus.textContent='Stream reconnecting';console.error('[live-monitor] SSE error',error);appendLog({level:'error',source:'browser',message:'SSE stream interrupted; browser will retry.'})};
+      connectSession(payload);
     }catch(error){
       console.error('[live-monitor] start failed',error);
       eventTitle.textContent='Unable to start';
@@ -494,6 +521,7 @@ function initLiveMonitor(){
   if(savedDeleteCategory)savedDeleteCategory.addEventListener('click',deleteSavedCategory);
   if(savedDetailClose)savedDetailClose.addEventListener('click',()=>{savedDetail.classList.add('hidden');resetSavedChart()});
   loadSaved();
+  restoreActiveSession();
 }
 function initLocalDataTools(){
   const openButton=document.getElementById('local-data-open'),drawer=document.getElementById('local-data-drawer'),backdrop=document.getElementById('local-data-backdrop');

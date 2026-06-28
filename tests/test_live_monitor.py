@@ -259,6 +259,73 @@ def test_stopped_before_window_end_marks_record_unsuitable(tmp_path, monkeypatch
     assert record["unsuitable_reason"] == "Tracking stopped before the contract window ended."
 
 
+def test_manager_tracks_active_session_per_user(tmp_path):
+    manager = LiveMonitorManager(tmp_path)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+    )
+    session = manager.sessions["session-1"] = LiveMonitorSession(
+        "session-1",
+        "user-1",
+        event,
+        tmp_path,
+    )
+    manager.active_by_user["user-1"] = "session-1"
+
+    assert manager.active_session("user-1") is session
+
+    session._stopped = True
+    assert manager.active_session("user-1") is None
+    assert "user-1" not in manager.active_by_user
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_clears_active_session(tmp_path, monkeypatch):
+    manager = LiveMonitorManager(tmp_path)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+    )
+    session = manager.sessions["session-1"] = LiveMonitorSession(
+        "session-1",
+        "user-1",
+        event,
+        tmp_path,
+    )
+    manager.active_by_user["user-1"] = "session-1"
+
+    async def close_without_io():
+        session._stopped = True
+
+    monkeypatch.setattr(session, "close", close_without_io)
+
+    assert await manager.stop("session-1") is True
+    assert manager.active_session("user-1") is None
+    assert "session-1" not in manager.sessions
+    assert "user-1" not in manager.active_by_user
+
+
 def test_polymarket_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
@@ -533,7 +600,17 @@ async def test_crypto_watchdog_raises_when_price_feed_goes_stale(monkeypatch):
         await feed._watchdog()
 
 
-def test_target_price_locks_on_first_window_sample(tmp_path):
+def test_crypto_price_payload_reads_nested_timestamp():
+    point = live_monitor._crypto_price_point_from_payload({
+        "symbol": "eth/usd",
+        "timestamp": 1_000_000_001_000,
+        "data": [{"value": "99.005", "timestamp": 1_000_000_000_250}],
+    })
+
+    assert point == (99.005, 1_000_000_000.25)
+
+
+def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/eth-updown-5m-1000",
         slug="eth-updown-5m-1000",
@@ -560,19 +637,18 @@ def test_target_price_locks_on_first_window_sample(tmp_path):
 
     session._capture_history_row(timestamp=1000.0, captured_at=1000.0)
 
-    assert session.state.target_price == 99.01
-    assert [row["t"] for row in session._history] == [1000.0]
-    assert session._history[0]["target_price"] == 99.01
-    assert session._history[0]["target_price_ts"] == 1000.0
+    assert session.state.target_price is None
+    assert session._history == []
 
     session.state.crypto_price = 101.005
     session.state.crypto_updated_at = 1000.2
     session._remember_crypto_update()
     session._capture_history_row(timestamp=1000.5, captured_at=1000.5)
 
-    assert [row["t"] for row in session._history] == [1000.0, 1000.5]
-    assert session.state.target_price == 99.01
-    assert session._history[1]["target_price"] == 99.01
+    assert [row["t"] for row in session._history] == [1000.5]
+    assert session.state.target_price == 101.01
+    assert session._history[0]["target_price"] == 101.01
+    assert session._history[0]["target_price_ts"] == 1000.2
 
 
 @pytest.mark.asyncio
