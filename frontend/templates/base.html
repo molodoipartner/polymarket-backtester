@@ -26,6 +26,31 @@
     {% if error %}<div class="mb-6 rounded-lg border border-red-400/40 bg-red-400/10 p-3 text-sm text-red-300">{{ error }}</div>{% endif %}
     {% block content %}{% endblock %}
   </main>
+  {% if local_data_tools %}
+  <button id="local-data-open" class="local-data-open" type="button">Data</button>
+  <div id="local-data-backdrop" class="local-data-backdrop hidden"></div>
+  <aside id="local-data-drawer" class="local-data-drawer hidden" aria-label="Local data">
+    <div class="local-data-header">
+      <div>
+        <p class="eyebrow">Local only</p>
+        <h2>Data profiles</h2>
+      </div>
+      <button id="local-data-close" class="secondary" type="button">Close</button>
+    </div>
+    <div id="local-data-status" class="local-data-status">Loading</div>
+    <div class="local-data-actions">
+      <button id="local-data-refresh" class="secondary" type="button">Refresh</button>
+      <button id="local-data-download" class="primary" type="button">Download Render data</button>
+    </div>
+    <form id="local-data-token-form" class="local-data-token-form">
+      <label>Render export token
+        <input id="local-data-token" type="password" autocomplete="off" placeholder="Paste EXPORT_TOKEN">
+      </label>
+      <button class="secondary" type="submit">Save token</button>
+    </form>
+    <div id="local-data-list" class="local-data-list"></div>
+  </aside>
+  {% endif %}
   <script src="{{ url_for('static', path='/js/app.js') }}"></script>
   {% block scripts %}{% endblock %}
 </body>

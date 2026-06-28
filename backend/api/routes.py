@@ -4,10 +4,12 @@ import asyncio
 import hmac
 import json
 import queue
+import shutil
 import tarfile
 import threading
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlencode
 
@@ -16,15 +18,19 @@ from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from backend.auth import hash_password, verify_password
+from backend.auth import FileSessionStore, hash_password, verify_password
 from backend.backtester import FileBacktester
+from backend.core.jobs import GenerationJobStore
+from backend.data import DataCollector
 from backend.fixed_time import ASSETS, TIMEFRAMES, parse_period, validate_selection
+from backend.live_monitor import LiveMonitorManager
 from backend.storage import FileStore
 from backend.strategy_generator import StrategyGroupGenerator
 from config.settings import ROOT_DIR, settings
 
 router = APIRouter()
 templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
+LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
 
 
 def _store(request: Request) -> FileStore:
@@ -48,10 +54,26 @@ def _context(request: Request, **values) -> dict:
         "app_name": settings.app_name,
         "user": _user(request),
         "is_admin": _is_admin(request),
+        "local_data_tools": _local_data_tools_available(request),
         "message": request.session.pop("message", None),
         "error": request.session.pop("error", None),
         **values,
     }
+
+
+def _local_data_tools_available(request: Request) -> bool:
+    if settings.environment.lower() == "production":
+        return False
+    host = request.client.host if request.client else ""
+    url_host = request.url.hostname or ""
+    return host in {"127.0.0.1", "::1", "testclient"} or url_host in {
+        "127.0.0.1", "localhost", "::1", "testserver",
+    }
+
+
+def _require_local_data_tools(request: Request) -> None:
+    if not _local_data_tools_available(request):
+        raise HTTPException(404, "Local data tools are available only in local development")
 
 
 def _ensure_stability(strategy: dict) -> None:
@@ -1140,6 +1162,244 @@ def export_data(request: Request):
             "Cache-Control": "no-store",
         },
     )
+
+
+def _snapshot_base() -> Path:
+    return Path(settings.data_snapshots_root).expanduser().resolve()
+
+
+def _local_data_tools_config() -> dict:
+    if not LOCAL_DATA_TOOLS_CONFIG.exists():
+        return {}
+    try:
+        value = json.loads(LOCAL_DATA_TOOLS_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _save_local_data_tools_config(value: dict) -> None:
+    temporary = LOCAL_DATA_TOOLS_CONFIG.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(LOCAL_DATA_TOOLS_CONFIG)
+
+
+def _render_export_token() -> str:
+    return settings.render_export_token.strip() or str(
+        _local_data_tools_config().get("render_export_token", "")
+    ).strip()
+
+
+def _local_server_data_root() -> Path:
+    return (ROOT_DIR / "server_data").resolve()
+
+
+def _render_snapshot_root(snapshot_id: str) -> Path:
+    safe_id = "".join(character for character in snapshot_id if character.isalnum() or character in "-_")
+    if safe_id != snapshot_id or not snapshot_id:
+        raise HTTPException(422, "Invalid snapshot identifier")
+    return (_snapshot_base() / "render" / snapshot_id / "server_data").resolve()
+
+
+def _latest_render_snapshot_id() -> str | None:
+    marker = _snapshot_base() / "render" / "latest.txt"
+    if not marker.exists():
+        return None
+    value = marker.read_text(encoding="utf-8").strip()
+    return value or None
+
+
+def _local_data_profiles(current_root: Path) -> list[dict]:
+    profiles = []
+
+    def add_profile(profile_id: str, label: str, path: Path, kind: str, latest: bool = False) -> None:
+        resolved = path.resolve()
+        profiles.append({
+            "id": profile_id,
+            "label": label,
+            "path": str(resolved),
+            "kind": kind,
+            "exists": resolved.exists(),
+            "current": resolved == current_root.resolve(),
+            "latest": latest,
+        })
+
+    add_profile("local", "Local server_data", _local_server_data_root(), "local")
+    render_root = _snapshot_base() / "render"
+    latest_id = _latest_render_snapshot_id()
+    if latest_id:
+        add_profile(
+            "render-latest",
+            f"Render latest ({latest_id})",
+            _render_snapshot_root(latest_id),
+            "render",
+            latest=True,
+        )
+    if render_root.exists():
+        for directory in sorted(
+            (path for path in render_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        ):
+            server_data = directory / "server_data"
+            if not server_data.exists():
+                continue
+            add_profile(
+                f"render:{directory.name}",
+                f"Render snapshot {directory.name}",
+                server_data,
+                "render",
+                latest=directory.name == latest_id,
+            )
+    return profiles
+
+
+def _resolve_local_data_profile(profile_id: str) -> Path:
+    if profile_id == "local":
+        return _local_server_data_root()
+    if profile_id == "render-latest":
+        latest_id = _latest_render_snapshot_id()
+        if not latest_id:
+            raise HTTPException(404, "No Render snapshot has been downloaded yet")
+        return _render_snapshot_root(latest_id)
+    if profile_id.startswith("render:"):
+        return _render_snapshot_root(profile_id.split(":", 1)[1])
+    raise HTTPException(422, "Unknown data profile")
+
+
+def _safe_extract_server_data_archive(archive_path: Path, target_root: Path) -> None:
+    target_root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for member in archive.getmembers():
+            name = member.name.replace("\\", "/")
+            if member.issym() or member.islnk() or not name.startswith("server_data/"):
+                continue
+            destination = (target_root / name).resolve()
+            if destination != target_root and target_root not in destination.parents:
+                raise RuntimeError("Archive contains an unsafe path")
+            archive.extract(member, path=target_root)
+
+
+async def _replace_local_data_root(request: Request, data_root: Path) -> None:
+    data_root = data_root.resolve()
+    tasks = tuple(getattr(request.app.state, "background_tasks", set()))
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    old_live_monitor = getattr(request.app.state, "live_monitor", None)
+    old_collector = getattr(request.app.state, "collector", None)
+    if old_live_monitor:
+        await old_live_monitor.close()
+    if old_collector:
+        await old_collector.close()
+
+    store = FileStore(data_root)
+    store.ensure_user(settings.username, hash_password(settings.password), "Test User")
+    store.log_system("local_data_profile_selected", {"data_root": str(data_root)})
+    request.app.state.store = store
+    request.app.state.collector = DataCollector(store)
+    request.app.state.session_store = FileSessionStore(
+        store.root / "sessions", settings.session_max_age_seconds
+    )
+    request.app.state.job_store = GenerationJobStore(store.root / "jobs")
+    request.app.state.live_monitor = LiveMonitorManager(store.root / "live_monitor")
+    request.app.state.background_tasks = set()
+    request.app.state.job_tasks = {}
+
+
+@router.get("/api/local-data/profiles")
+def local_data_profiles(request: Request):
+    _require_local_data_tools(request)
+    return {
+        "current_root": str(_store(request).root),
+        "download_configured": bool(_render_export_token()),
+        "profiles": _local_data_profiles(_store(request).root),
+    }
+
+
+@router.post("/api/local-data/config")
+def save_local_data_config(
+    request: Request,
+    render_export_token: Annotated[str, Form()] = "",
+):
+    _require_local_data_tools(request)
+    config = _local_data_tools_config()
+    token = render_export_token.strip()
+    if token:
+        config["render_export_token"] = token
+    else:
+        config.pop("render_export_token", None)
+    _save_local_data_tools_config(config)
+    return {"download_configured": bool(_render_export_token())}
+
+
+@router.post("/api/local-data/download-render")
+async def download_render_data(request: Request):
+    _require_local_data_tools(request)
+    token = _render_export_token()
+    if not token:
+        raise HTTPException(400, "Set RENDER_EXPORT_TOKEN in .env before downloading")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    render_root = _snapshot_base() / "render"
+    archive_dir = render_root / "archives"
+    target_root = render_root / timestamp
+    archive_path = archive_dir / f"{timestamp}.tar.gz"
+    temporary_path = archive_path.with_suffix(".tar.gz.tmp")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+            async with client.stream(
+                "GET",
+                settings.render_export_url,
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                    raise HTTPException(
+                        response.status_code,
+                        detail or "Render data export failed",
+                    )
+                with temporary_path.open("wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        handle.write(chunk)
+        temporary_path.replace(archive_path)
+        if target_root.exists():
+            shutil.rmtree(target_root)
+        await asyncio.to_thread(_safe_extract_server_data_archive, archive_path, target_root)
+        (render_root / "latest.txt").write_text(timestamp, encoding="utf-8")
+    except HTTPException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    except Exception as error:
+        temporary_path.unlink(missing_ok=True)
+        if target_root.exists():
+            shutil.rmtree(target_root)
+        raise HTTPException(500, f"Render data download failed: {error}") from error
+
+    return {
+        "snapshot_id": timestamp,
+        "archive_path": str(archive_path.resolve()),
+        "data_root": str((target_root / "server_data").resolve()),
+        "profiles": _local_data_profiles(_store(request).root),
+    }
+
+
+@router.post("/api/local-data/use")
+async def use_local_data_profile(request: Request, profile_id: Annotated[str, Form()]):
+    _require_local_data_tools(request)
+    data_root = _resolve_local_data_profile(profile_id)
+    if not data_root.exists():
+        raise HTTPException(404, "The selected data profile does not exist")
+    request.session.clear()
+    await _replace_local_data_root(request, data_root)
+    return {
+        "current_root": str(data_root),
+        "profiles": _local_data_profiles(_store(request).root),
+        "reload_url": "/login",
+    }
 
 
 @router.get("/api/state")

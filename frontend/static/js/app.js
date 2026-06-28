@@ -495,5 +495,105 @@ function initLiveMonitor(){
   if(savedDetailClose)savedDetailClose.addEventListener('click',()=>{savedDetail.classList.add('hidden');resetSavedChart()});
   loadSaved();
 }
+function initLocalDataTools(){
+  const openButton=document.getElementById('local-data-open'),drawer=document.getElementById('local-data-drawer'),backdrop=document.getElementById('local-data-backdrop');
+  if(!openButton||!drawer||!backdrop)return;
+  const closeButton=document.getElementById('local-data-close'),status=document.getElementById('local-data-status'),list=document.getElementById('local-data-list'),refreshButton=document.getElementById('local-data-refresh'),downloadButton=document.getElementById('local-data-download'),tokenForm=document.getElementById('local-data-token-form'),tokenInput=document.getElementById('local-data-token');
+  let loading=false;
+  const setStatus=(text,mode='')=>{status.textContent=text;status.className='local-data-status '+mode};
+  const open=()=>{drawer.classList.remove('hidden');backdrop.classList.remove('hidden');loadProfiles()};
+  const close=()=>{drawer.classList.add('hidden');backdrop.classList.add('hidden')};
+  const requestJson=async(url,options={})=>{
+    const response=await fetch(url,{headers:{Accept:'application/json',...(options.headers||{})},...options});
+    const payload=await response.json().catch(()=>({detail:'Request failed'}));
+    if(!response.ok)throw new Error(payload.detail||'Request failed');
+    return payload;
+  };
+  const renderProfiles=payload=>{
+    list.textContent='';
+    const profiles=payload.profiles||[];
+    if(downloadButton)downloadButton.disabled=!payload.download_configured||loading;
+    if(!profiles.length){list.innerHTML='<p class="muted">No data profiles found.</p>';return}
+    for(const profile of profiles){
+      const row=document.createElement('article');
+      row.className='local-data-profile'+(profile.current?' current':'')+(!profile.exists?' missing':'');
+      const meta=[profile.kind,profile.latest?'latest':null,profile.exists?'ready':'missing'].filter(Boolean).join(' / ');
+      row.innerHTML='<div><strong></strong><small></small><code></code></div><button class="secondary" type="button"></button>';
+      row.querySelector('strong').textContent=profile.label;
+      row.querySelector('small').textContent=meta;
+      row.querySelector('code').textContent=profile.path;
+      const button=row.querySelector('button');
+      button.textContent=profile.current?'Active':'Use';
+      button.disabled=profile.current||!profile.exists||loading;
+      button.addEventListener('click',()=>useProfile(profile.id));
+      list.appendChild(row);
+    }
+  };
+  const loadProfiles=async()=>{
+    if(loading)return;
+    setStatus('Loading');
+    try{
+      const payload=await requestJson('/api/local-data/profiles');
+      renderProfiles(payload);
+      setStatus('Current: '+payload.current_root,'ok');
+      if(downloadButton&&!payload.download_configured)setStatus('Paste EXPORT_TOKEN or set RENDER_EXPORT_TOKEN in .env','warn');
+    }catch(error){
+      setStatus(error.message,'error');
+    }
+  };
+  const downloadRender=async()=>{
+    if(loading)return;
+    loading=true;
+    if(downloadButton){downloadButton.disabled=true;downloadButton.textContent='Downloading...'}
+    setStatus('Downloading Render data');
+    try{
+      const payload=await requestJson('/api/local-data/download-render',{method:'POST'});
+      renderProfiles(payload);
+      setStatus('Downloaded '+payload.snapshot_id,'ok');
+    }catch(error){
+      setStatus(error.message,'error');
+    }finally{
+      loading=false;
+      if(downloadButton){downloadButton.textContent='Download Render data';downloadButton.disabled=false}
+      loadProfiles();
+    }
+  };
+  const saveToken=async event=>{
+    event.preventDefault();
+    const token=(tokenInput?.value||'').trim();
+    if(!token){setStatus('Paste EXPORT_TOKEN first','warn');return}
+    const body=new FormData();body.append('render_export_token',token);
+    setStatus('Saving token');
+    try{
+      await requestJson('/api/local-data/config',{method:'POST',body});
+      if(tokenInput)tokenInput.value='';
+      setStatus('Token saved locally','ok');
+      loadProfiles();
+    }catch(error){
+      setStatus(error.message,'error');
+    }
+  };
+  const useProfile=async(profileId)=>{
+    if(loading)return;
+    loading=true;
+    setStatus('Switching data profile');
+    const body=new FormData();body.append('profile_id',profileId);
+    try{
+      const payload=await requestJson('/api/local-data/use',{method:'POST',body});
+      setStatus('Switched to '+payload.current_root+'. Reloading...','ok');
+      setTimeout(()=>window.location.assign(payload.reload_url||'/login'),600);
+    }catch(error){
+      setStatus(error.message,'error');
+      loading=false;
+      loadProfiles();
+    }
+  };
+  openButton.addEventListener('click',open);
+  closeButton&&closeButton.addEventListener('click',close);
+  backdrop.addEventListener('click',close);
+  refreshButton&&refreshButton.addEventListener('click',loadProfiles);
+  downloadButton&&downloadButton.addEventListener('click',downloadRender);
+  tokenForm&&tokenForm.addEventListener('submit',saveToken);
+}
 window.addEventListener('pagehide',()=>{chartInstances.forEach(chart=>chart.destroy());chartInstances.clear()},{once:true});
-document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveMonitor()});
+document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveMonitor();initLocalDataTools()});

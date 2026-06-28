@@ -1,4 +1,5 @@
 .env
+.local_data_tools.json
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,3 +9,4 @@ __pycache__/
 node_modules/
 tools/
 server_data/
+data_snapshots/

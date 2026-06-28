@@ -18,12 +18,15 @@ class Settings(BaseSettings):
     port: int = 8000
     workers: int = 1
     data_root: Path = ROOT_DIR / "server_data"
+    data_snapshots_root: Path = ROOT_DIR / "data_snapshots"
     allowed_hosts: str = "127.0.0.1,localhost,testserver"
     session_secret: str = "change-this-local-session-secret"
     session_cookie_name: str = "poly_session"
     session_cookie_secure: bool = False
     session_max_age_seconds: int = 86_400
     export_token: str = ""
+    render_export_url: str = "https://polymarket-backtester.onrender.com/api/admin/export-data"
+    render_export_token: str = ""
     username: str = "test"
     password: str = "TestUser123!"
     admin_username: str = "admin"

@@ -85,6 +85,19 @@ Persistent Disk at `/var/data`. The app writes all JSON/JSONL data under
 `DATA_ROOT`, so production data remains on the Render disk instead of the Git
 repository or your local computer.
 
+## Local data profiles
+
+In development mode, the site shows a local-only **Data** drawer. It can download
+a Render data snapshot, store it under `data_snapshots/`, and switch the running
+local app between `server_data/` and downloaded snapshots. The drawer is disabled
+in production.
+
+Paste the Render `EXPORT_TOKEN` into the drawer once, or set it in `.env`:
+
+```dotenv
+RENDER_EXPORT_TOKEN=your-render-export-token
+```
+
 ## Start and verify
 
 ```powershell
