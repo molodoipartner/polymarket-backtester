@@ -186,6 +186,60 @@ async def test_price_change_prefers_exchange_best_bid_ask_over_local_book():
 
 
 @pytest.mark.asyncio
+async def test_crossed_polymarket_quote_is_ignored_without_disconnect():
+    updates = []
+
+    async def on_update(kind, detail):
+        updates.append((kind, detail))
+
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+    await client._apply_message(
+        {
+            "event_type": "book",
+            "asset_id": "token-1",
+            "bids": [{"price": "0.41", "size": "7"}],
+            "asks": [{"price": "0.44", "size": "9"}],
+        }
+    )
+    updates.clear()
+
+    await client._apply_message(
+        {
+            "event_type": "price_change",
+            "price_changes": [
+                {
+                    "asset_id": "token-1",
+                    "side": "buy",
+                    "price": "0.99",
+                    "size": "3",
+                    "best_bid": "0.99",
+                    "best_ask": "0.98",
+                }
+            ],
+        }
+    )
+
+    assert state.quotes["token-1"].bid == 0.41
+    assert state.quotes["token-1"].ask == 0.44
+    assert state.quotes["token-1"].event_count == 1
+    assert client.disconnect_count == 0
+    assert updates == [
+        (
+            "log",
+            {
+                "level": "warning",
+                "source": "polymarket",
+                "message": (
+                    "Ignored crossed Polymarket order book for "
+                    "token-1: bid=0.99, ask=0.98."
+                ),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_finished_record_is_saved_per_user(tmp_path):
     manager = LiveMonitorManager(tmp_path)
     event = ResolvedPolymarketEvent(

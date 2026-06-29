@@ -397,9 +397,18 @@ class PolymarketLiveOrderBook:
     ) -> None:
         previous = self.state.quotes[token_id]
         if bid is not None and ask is not None and bid > ask:
-            raise ValueError(
-                f"Polymarket crossed order book for {token_id}: bid={bid}, ask={ask}"
+            await self.on_update(
+                "log",
+                {
+                    "level": "warning",
+                    "source": "polymarket",
+                    "message": (
+                        "Ignored crossed Polymarket order book for "
+                        f"{token_id}: bid={bid}, ask={ask}."
+                    ),
+                },
             )
+            return
         price_changed = previous.bid != bid or previous.ask != ask
         self.state.quotes[token_id] = LiveQuote(
             bid=bid,
