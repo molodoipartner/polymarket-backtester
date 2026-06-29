@@ -259,7 +259,7 @@ def test_stopped_before_window_end_marks_record_unsuitable(tmp_path, monkeypatch
     assert record["unsuitable_reason"] == "Tracking stopped before the contract window ended."
 
 
-def test_manager_tracks_active_session_per_user(tmp_path):
+def test_manager_tracks_active_sessions_per_user(tmp_path):
     manager = LiveMonitorManager(tmp_path)
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
@@ -275,19 +275,26 @@ def test_manager_tracks_active_session_per_user(tmp_path):
         ],
         crypto_symbol="btc/usd",
     )
-    session = manager.sessions["session-1"] = LiveMonitorSession(
+    session_1 = manager.sessions["session-1"] = LiveMonitorSession(
         "session-1",
         "user-1",
         event,
         tmp_path,
     )
-    manager.active_by_user["user-1"] = "session-1"
+    session_2 = manager.sessions["session-2"] = LiveMonitorSession(
+        "session-2",
+        "user-1",
+        event,
+        tmp_path,
+    )
+    manager.active_by_user["user-1"] = ["session-1", "session-2"]
 
-    assert manager.active_session("user-1") is session
+    assert manager.active_sessions("user-1") == [session_1, session_2]
+    assert manager.active_session("user-1") is session_1
 
-    session._stopped = True
-    assert manager.active_session("user-1") is None
-    assert "user-1" not in manager.active_by_user
+    session_1._stopped = True
+    assert manager.active_sessions("user-1") == [session_2]
+    assert manager.active_by_user["user-1"] == ["session-2"]
 
 
 @pytest.mark.asyncio
@@ -313,7 +320,13 @@ async def test_manager_stop_clears_active_session(tmp_path, monkeypatch):
         event,
         tmp_path,
     )
-    manager.active_by_user["user-1"] = "session-1"
+    second_session = manager.sessions["session-2"] = LiveMonitorSession(
+        "session-2",
+        "user-1",
+        event,
+        tmp_path,
+    )
+    manager.active_by_user["user-1"] = ["session-1", "session-2"]
 
     async def close_without_io():
         session._stopped = True
@@ -321,9 +334,42 @@ async def test_manager_stop_clears_active_session(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "close", close_without_io)
 
     assert await manager.stop("session-1") is True
-    assert manager.active_session("user-1") is None
+    assert manager.active_session("user-1") is second_session
     assert "session-1" not in manager.sessions
-    assert "user-1" not in manager.active_by_user
+    assert manager.active_by_user["user-1"] == ["session-2"]
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_more_than_five_active_sessions(tmp_path):
+    manager = LiveMonitorManager(tmp_path)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+    )
+    session_ids = []
+    for index in range(live_monitor.MAX_ACTIVE_LIVE_MONITORS_PER_USER):
+        session_id = f"session-{index}"
+        session_ids.append(session_id)
+        manager.sessions[session_id] = LiveMonitorSession(
+            session_id,
+            "user-1",
+            event,
+            tmp_path,
+        )
+    manager.active_by_user["user-1"] = session_ids
+
+    with pytest.raises(ValueError, match="Maximum 5 active live monitors"):
+        await manager.start("user-1", event.url)
 
 
 def test_polymarket_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):

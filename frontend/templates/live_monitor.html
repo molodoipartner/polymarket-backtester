@@ -18,56 +18,12 @@
     </label>
     <div class="live-monitor-actions">
       <button class="primary" type="submit">Start tracking</button>
-      <button class="secondary hidden" id="live-monitor-stop" type="button">Stop</button>
     </div>
   </form>
-
-  <div class="live-status-grid">
-    <div class="metric-card">
-      <p>Event</p>
-      <strong id="live-event-title">No session</strong>
-      <span class="muted" id="live-event-slug">Paste an event URL and start tracking.</span>
-    </div>
-    <div class="metric-card">
-      <p>Crypto price</p>
-      <strong id="live-crypto-price">-</strong>
-      <span class="muted"><span class="ws-dot" id="live-crypto-dot"></span><span id="live-crypto-status">Waiting</span></span>
-    </div>
-    <div class="metric-card">
-      <p>Order book</p>
-      <strong id="live-quote-status">Idle</strong>
-      <span class="muted"><span class="ws-dot" id="live-quote-dot"></span><span id="live-sample-path">Saved samples will appear after start.</span></span>
-    </div>
-  </div>
-
-  <div class="live-monitor-log" id="live-monitor-log">
-    <p class="muted">Live WebSocket events and errors will appear here.</p>
-  </div>
-
-  <div class="live-chart-wrap">
-    <canvas id="live-monitor-chart" height="120"></canvas>
-  </div>
-
-  <div class="overflow-x-auto">
-    <table class="live-monitor-table">
-      <thead>
-        <tr>
-          <th>Market</th>
-          <th>Outcome</th>
-          <th>Bid</th>
-          <th>Ask</th>
-          <th>Spread</th>
-          <th>Size</th>
-          <th>Updates</th>
-          <th>Token</th>
-        </tr>
-      </thead>
-      <tbody id="live-monitor-rows">
-        <tr><td colspan="8" class="empty">No live session yet.</td></tr>
-      </tbody>
-    </table>
-  </div>
+  <p class="muted mt-3" id="live-monitor-start-status">Up to 5 live monitors can run at the same time.</p>
 </section>
+
+<div class="live-monitor-sessions" id="live-monitor-sessions"></div>
 
 <section class="panel mt-6 live-saved" id="live-monitor-saved">
   <div class="section-title">

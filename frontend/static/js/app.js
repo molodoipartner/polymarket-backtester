@@ -179,10 +179,8 @@ function initFavoriteForms(){
 }
 function initLiveMonitor(){
   const panel=document.getElementById('live-monitor');if(!panel)return;
-  const form=document.getElementById('live-monitor-form'),stopButton=document.getElementById('live-monitor-stop'),rows=document.getElementById('live-monitor-rows');
-  const eventTitle=document.getElementById('live-event-title'),eventSlug=document.getElementById('live-event-slug'),cryptoPrice=document.getElementById('live-crypto-price'),cryptoStatus=document.getElementById('live-crypto-status'),quoteStatus=document.getElementById('live-quote-status'),samplePath=document.getElementById('live-sample-path');
-  const quoteDot=document.getElementById('live-quote-dot'),cryptoDot=document.getElementById('live-crypto-dot'),liveLog=document.getElementById('live-monitor-log');
-  const chartElement=document.getElementById('live-monitor-chart'),savedRows=document.getElementById('live-saved-rows'),savedRefresh=document.getElementById('live-saved-refresh'),savedCategory=document.getElementById('live-saved-category'),savedDeleteCategory=document.getElementById('live-saved-delete-category');
+  const form=document.getElementById('live-monitor-form'),sessionsContainer=document.getElementById('live-monitor-sessions'),startStatus=document.getElementById('live-monitor-start-status');
+  const savedRows=document.getElementById('live-saved-rows'),savedRefresh=document.getElementById('live-saved-refresh'),savedCategory=document.getElementById('live-saved-category'),savedDeleteCategory=document.getElementById('live-saved-delete-category');
   const savedPrev=document.getElementById('live-saved-prev'),savedNext=document.getElementById('live-saved-next'),savedPageSummary=document.getElementById('live-saved-page-summary');
   const savedDetail=document.getElementById('live-saved-detail'),savedDetailClose=document.getElementById('live-saved-detail-close'),savedChartElement=document.getElementById('live-saved-chart');
   const savedDetailCategory=document.getElementById('live-saved-detail-category'),savedDetailTitle=document.getElementById('live-saved-detail-title'),savedDetailMeta=document.getElementById('live-saved-detail-meta');
@@ -191,10 +189,9 @@ function initLiveMonitor(){
   const savedCoverage=document.getElementById('live-saved-coverage'),savedAverageSpread=document.getElementById('live-saved-average-spread'),savedFinalDeviation=document.getElementById('live-saved-final-deviation'),savedYesRange=document.getElementById('live-saved-yes-range');
   const savedDisconnectCount=document.getElementById('live-saved-disconnect-count'),savedDisconnectedSeconds=document.getElementById('live-saved-disconnected-seconds');
   const savedCryptoDisconnectCount=document.getElementById('live-saved-crypto-disconnect-count'),savedCryptoDisconnectedSeconds=document.getElementById('live-saved-crypto-disconnected-seconds');
-  let source=null,sessionId=null,stopUrl=null,chart=null,savedChart=null,selectedSavedCategory='all',savedPage=1;
+  let savedChart=null,selectedSavedCategory='all',savedPage=1;
   const savedPageSize=20;
-  let lastPayloadAt=0,staleWarningShown=false;
-  const closeSource=()=>{if(source){source.close();source=null}};
+  const sessionControllers=new Map();
   const fmtCents=(value,empty='-')=>Number.isFinite(value)?(value*100).toFixed(2)+'c':empty;
   const fmtHistoryCents=value=>Number.isFinite(value)?Number(value).toFixed(2)+'c':'-';
   const fmtSize=value=>Number.isFinite(value)?Number(value).toLocaleString(undefined,{maximumFractionDigits:4}):'-';
@@ -210,39 +207,111 @@ function initLiveMonitor(){
     const base=String(value||'').split('/')[0].toLowerCase();
     return ({btc:'Bitcoin',eth:'Ethereum',sol:'Solana',xrp:'XRP',doge:'Dogecoin'}[base])||base.toUpperCase()||'-';
   };
-  const appendLog=(entry)=>{
-    if(!entry||!liveLog)return;
+  const firstController=()=>sessionControllers.values().next().value||null;
+  const appendLog=(entry,controller=null)=>{
+    const target=controller?.log||firstController()?.log;
+    if(!entry)return;
     const level=entry.level||'info',message=entry.message||String(entry);
     const row=document.createElement('p');row.className=level;row.textContent=(entry.time||new Date().toLocaleTimeString())+' ['+(entry.source||'browser')+'] '+message;
-    liveLog.appendChild(row);while(liveLog.childElementCount>160)liveLog.firstElementChild.remove();liveLog.scrollTop=liveLog.scrollHeight;
+    if(target){
+      target.appendChild(row);while(target.childElementCount>160)target.firstElementChild.remove();target.scrollTop=target.scrollHeight;
+    }
     if(level==='error')console.error('[live-monitor]',entry);
     else if(level==='warning')console.warn('[live-monitor]',entry);
     else console.info('[live-monitor]',entry);
   };
-  const renderSnapshotLogs=logs=>{
-    if(!liveLog||!Array.isArray(logs)||!logs.length)return;
-    liveLog.textContent='';
-    for(const entry of logs.slice(-80))appendLog(entry);
+  const renderSnapshotLogs=(logs,controller)=>{
+    if(!controller?.log||!Array.isArray(logs)||!logs.length)return;
+    controller.log.textContent='';
+    for(const entry of logs.slice(-80))appendLog(entry,controller);
   };
   const setDot=(element,connected,error=false)=>{if(!element)return;element.classList.toggle('connected',!!connected&&!error);element.classList.toggle('error',!!error)};
   const setBusy=busy=>{
     const button=form.querySelector('button[type="submit"]');
     button.disabled=busy;button.textContent=busy?'Starting...':'Start tracking';
   };
-  const resetChart=()=>{if(chart){chart.destroy();chart=null}};
   const resetSavedChart=()=>{if(savedChart){savedChart.destroy();savedChart=null}};
-  const ensureChart=()=>{
-    if(chart||!chartElement)return chart;
-    chart=replaceChart(chartElement,{type:'line',data:{datasets:[
+  const closeController=controller=>{if(controller?.source){controller.source.close();controller.source=null}};
+  const destroyController=controller=>{
+    closeController(controller);
+    if(controller?.chart){controller.chart.destroy();controller.chart=null}
+    if(controller?.card)controller.card.remove();
+    if(controller?.id)sessionControllers.delete(controller.id);
+  };
+  const setStartStatus=(text,mode='')=>{
+    if(!startStatus)return;
+    startStatus.textContent=text;
+    startStatus.className='muted mt-3 '+mode;
+  };
+  const createSessionCard=payload=>{
+    const id=payload.session_id;
+    const card=document.createElement('section');
+    card.className='panel live-session-card';
+    card.dataset.sessionId=id;
+    card.innerHTML=[
+      '<div class="section-title">',
+      '<div><p class="eyebrow">Live monitor</p><h2 class="text-xl" data-live-event-title>Live session</h2><p class="muted" data-live-event-slug>-</p></div>',
+      '<button class="secondary" type="button" data-live-stop>Stop</button>',
+      '</div>',
+      '<div class="live-status-grid">',
+      '<div class="metric-card"><p>Crypto price</p><strong data-live-crypto-price>-</strong><span class="muted"><span class="ws-dot" data-live-crypto-dot></span><span data-live-crypto-status>Waiting</span></span></div>',
+      '<div class="metric-card"><p>Order book</p><strong data-live-quote-status>Idle</strong><span class="muted"><span class="ws-dot" data-live-quote-dot></span><span data-live-sample-path>Saved samples will appear after start.</span></span></div>',
+      '<div class="metric-card"><p>Session</p><strong data-live-session-short>-</strong><span class="muted">Separate stream and console</span></div>',
+      '</div>',
+      '<div class="live-monitor-log" data-live-log><p class="muted">Live WebSocket events and errors will appear here.</p></div>',
+      '<div class="live-chart-wrap"><canvas data-live-chart height="120"></canvas></div>',
+      '<div class="overflow-x-auto"><table class="live-monitor-table"><thead><tr><th>Market</th><th>Outcome</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Size</th><th>Updates</th><th>Token</th></tr></thead><tbody data-live-rows><tr><td colspan="8" class="empty">Waiting for live session.</td></tr></tbody></table></div>'
+    ].join('');
+    sessionsContainer.prepend(card);
+    const controller={
+      id,
+      stopUrl:payload.stop_url,
+      eventsUrl:payload.events_url,
+      source:null,
+      chart:null,
+      card,
+      lastPayloadAt:0,
+      staleWarningShown:false,
+      eventTitle:card.querySelector('[data-live-event-title]'),
+      eventSlug:card.querySelector('[data-live-event-slug]'),
+      cryptoPrice:card.querySelector('[data-live-crypto-price]'),
+      cryptoStatus:card.querySelector('[data-live-crypto-status]'),
+      quoteStatus:card.querySelector('[data-live-quote-status]'),
+      samplePath:card.querySelector('[data-live-sample-path]'),
+      quoteDot:card.querySelector('[data-live-quote-dot]'),
+      cryptoDot:card.querySelector('[data-live-crypto-dot]'),
+      rows:card.querySelector('[data-live-rows]'),
+      log:card.querySelector('[data-live-log]'),
+      chartElement:card.querySelector('[data-live-chart]'),
+      stopButton:card.querySelector('[data-live-stop]'),
+      sessionShort:card.querySelector('[data-live-session-short]')
+    };
+    controller.sessionShort.textContent=shortToken(id);
+    controller.stopButton.addEventListener('click',()=>stopSession(controller));
+    sessionControllers.set(id,controller);
+    return controller;
+  };
+  const getOrCreateController=payload=>{
+    const existing=sessionControllers.get(payload.session_id);
+    if(existing){
+      existing.stopUrl=payload.stop_url;
+      existing.eventsUrl=payload.events_url;
+      return existing;
+    }
+    return createSessionCard(payload);
+  };
+  const ensureChart=controller=>{
+    if(controller.chart||!controller.chartElement)return controller.chart;
+    controller.chart=replaceChart(controller.chartElement,{type:'line',data:{datasets:[
       {label:'Crypto',data:[],borderColor:neon,backgroundColor:'#29f19c12',yAxisID:'crypto',pointRadius:0,tension:.2,parsing:false},
       {label:'Target',data:[],borderColor:'#8293aa',borderDash:[5,5],yAxisID:'crypto',pointRadius:0,tension:0,parsing:false},
       {label:'YES bid',data:[],borderColor:'#60a5fa',backgroundColor:'#60a5fa12',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false},
       {label:'YES ask',data:[],borderColor:'#fbbf24',backgroundColor:'#fbbf2412',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false}
     ]},options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):''}}},scales:{x:timeScale,crypto:{type:'linear',position:'left',ticks:{color:text,callback:v=>'$'+v.toLocaleString()},grid:{color:grid}},contract:{type:'linear',position:'right',min:0,max:100,ticks:{color:text,callback:v=>v.toFixed(0)+'c'},grid:{drawOnChartArea:false,color:grid}}}}});
-    return chart;
+    return controller.chart;
   };
-  const updateChart=payload=>{
-    const current=ensureChart();if(!current)return;
+  const updateChart=(payload,controller)=>{
+    const current=ensureChart(controller);if(!current)return;
     const history=(payload.history||[]).filter(row=>Number.isFinite(row.t));
     const series=key=>history.map(row=>({x:Number(row.t)*1000,y:Number.isFinite(row[key])?Number(row[key]):null}));
     current.data.datasets[0].data=series('crypto_price');
@@ -371,10 +440,10 @@ function initLiveMonitor(){
     if(savedPrev)savedPrev.disabled=!payload.has_previous;
     if(savedNext)savedNext.disabled=!payload.has_next;
   };
-  const renderRows=payload=>{
+  const renderRows=(payload,controller)=>{
     const quotes=payload.quotes||[];
-    if(!quotes.length){rows.innerHTML='<tr><td colspan="8" class="empty">No token ids found.</td></tr>';return}
-    rows.textContent='';
+    if(!quotes.length){controller.rows.innerHTML='<tr><td colspan="8" class="empty">No token ids found.</td></tr>';return}
+    controller.rows.textContent='';
     for(const quote of quotes){
       const tr=document.createElement('tr');
       const spread=Number.isFinite(quote.bid)&&Number.isFinite(quote.ask)?quote.ask-quote.bid:null;
@@ -388,42 +457,45 @@ function initLiveMonitor(){
       tr.children[5].textContent=size;
       tr.children[6].textContent=String(quote.event_count||0);
       tr.children[7].querySelector('code').textContent=shortToken(quote.token_id);
-      rows.appendChild(tr);
+      controller.rows.appendChild(tr);
     }
   };
-  const render=payload=>{
-    lastPayloadAt=Date.now();staleWarningShown=false;
-    eventTitle.textContent=payload.event?.title||'Live session';
-    eventSlug.textContent=payload.event?.slug||'-';
-    const eventUrlInput=form.querySelector('input[name="event_url"]');
-    if(eventUrlInput&&payload.event?.url)eventUrlInput.value=payload.event.url;
-    cryptoPrice.textContent=fmtPrice(payload.crypto?.price);
-    cryptoStatus.textContent=(payload.crypto?.symbol||'')+' - target '+fmtPriceToBeat(payload.crypto?.target_price)+' - '+(payload.status?.crypto||'waiting')+' - '+fmtAge(payload.crypto?.updated_at);
-    quoteStatus.textContent=payload.status?.quotes||'waiting';
+  const render=(payload,controller)=>{
+    controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;
+    controller.eventTitle.textContent=payload.event?.title||'Live session';
+    controller.eventSlug.textContent=payload.event?.slug||'-';
+    controller.cryptoPrice.textContent=fmtPrice(payload.crypto?.price);
+    controller.cryptoStatus.textContent=(payload.crypto?.symbol||'')+' - target '+fmtPriceToBeat(payload.crypto?.target_price)+' - '+(payload.status?.crypto||'waiting')+' - '+fmtAge(payload.crypto?.updated_at);
+    controller.quoteStatus.textContent=payload.status?.quotes||'waiting';
     const wsAge=payload.health?.polymarket?.last_message_age;
     const wsAgeText=Number.isFinite(wsAge)?' | ws age '+wsAge.toFixed(1)+'s':'';
     const restPolls=payload.health?.rest?.poll_count||0;
-    samplePath.textContent=(payload.saved_path||payload.samples_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
-    if(payload.status?.last_error)samplePath.textContent='Last error: '+payload.status.last_error;
-    setDot(quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
-    setDot(cryptoDot,!!payload.health?.crypto?.connected,!!payload.status?.last_error&&payload.status?.crypto==='reconnecting');
-    renderRows(payload);updateChart(payload);
+    controller.samplePath.textContent=(payload.saved_path||payload.samples_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
+    if(payload.status?.last_error)controller.samplePath.textContent='Last error: '+payload.status.last_error;
+    setDot(controller.quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
+    setDot(controller.cryptoDot,!!payload.health?.crypto?.connected,!!payload.status?.last_error&&payload.status?.crypto==='reconnecting');
+    renderRows(payload,controller);updateChart(payload,controller);
   };
   const connectSession=payload=>{
-    closeSource();
-    sessionId=payload.session_id;
-    stopUrl=payload.stop_url;
-    render(payload.snapshot);
-    renderSnapshotLogs(payload.snapshot?.logs);
-    stopButton.classList.remove('hidden');
-    appendLog({level:'info',source:'browser',message:'Connected to live monitor session '+sessionId+'.'});
-    source=new EventSource(payload.events_url);
-    const listener=message=>render(JSON.parse(message.data));
-    source.addEventListener('snapshot',listener);source.addEventListener('quote',listener);source.addEventListener('crypto',listener);source.addEventListener('status',listener);source.addEventListener('tick',listener);source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')})});
-    source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data);appendLog({level:'info',source:'browser',message:'Saved completed contract'});loadSaved()});
-    source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data);appendLog(data.log)});
-    source.addEventListener('ended',message=>{render(JSON.parse(message.data));appendLog({level:'warning',source:'browser',message:'Tracking ended'});closeSource();sessionId=null;stopUrl=null;stopButton.classList.add('hidden');loadSaved()});
-    source.onerror=error=>{quoteStatus.textContent='Stream reconnecting';console.error('[live-monitor] SSE error',error);appendLog({level:'error',source:'browser',message:'SSE stream interrupted; browser will retry.'})};
+    const controller=getOrCreateController(payload);
+    closeController(controller);
+    render(payload.snapshot,controller);
+    renderSnapshotLogs(payload.snapshot?.logs,controller);
+    controller.stopButton.classList.remove('hidden');
+    appendLog({level:'info',source:'browser',message:'Connected to live monitor session '+controller.id+'.'},controller);
+    controller.source=new EventSource(payload.events_url);
+    const listener=message=>render(JSON.parse(message.data),controller);
+    controller.source.addEventListener('snapshot',listener);
+    controller.source.addEventListener('quote',listener);
+    controller.source.addEventListener('crypto',listener);
+    controller.source.addEventListener('status',listener);
+    controller.source.addEventListener('tick',listener);
+    controller.source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')},controller)});
+    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);loadSaved()});
+    controller.source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog(data.log,controller)});
+    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved()});
+    controller.source.onerror=error=>{controller.quoteStatus.textContent='Stream reconnecting';console.error('[live-monitor] SSE error',error);appendLog({level:'error',source:'browser',message:'SSE stream interrupted; browser will retry.'},controller)};
+    return controller;
   };
   const restoreActiveSession=async()=>{
     try{
@@ -431,8 +503,9 @@ function initLiveMonitor(){
       if(!response.ok)return;
       const payload=await response.json();
       if(!payload.active)return;
-      connectSession(payload);
-      appendLog({level:'info',source:'browser',message:'Restored active session after page load.'});
+      const sessions=payload.sessions||[payload];
+      for(const session of sessions)connectSession(session);
+      appendLog({level:'info',source:'browser',message:'Restored '+sessions.length+' active session(s) after page load.'});
     }catch(error){
       console.error('[live-monitor] restore failed',error);
       appendLog({level:'error',source:'browser',message:'Unable to restore active session: '+error.message});
@@ -480,35 +553,47 @@ function initLiveMonitor(){
       savedRows.innerHTML='<tr><td colspan="9" class="empty">Saved contracts failed: '+error.message+'</td></tr>';
     }
   };
-  window.addEventListener('pagehide',closeSource,{once:true});
-  setInterval(()=>{
-    if(!source||!lastPayloadAt)return;
-    const age=(Date.now()-lastPayloadAt)/1000;
-    if(age>4&&!staleWarningShown){
-      staleWarningShown=true;
-      setDot(quoteDot,false,true);
-      appendLog({level:'error',source:'browser',message:'No SSE payload received for '+age.toFixed(1)+'s. Backend stream may be stuck.'});
+  const stopSession=async controller=>{
+    controller.stopButton.disabled=true;
+    closeController(controller);
+    try{
+      if(controller.stopUrl)await fetch(controller.stopUrl,{method:'POST',headers:{Accept:'application/json'}});
+      controller.quoteStatus.textContent='Stopped';
+      controller.cryptoStatus.textContent='Stopped';
+      setDot(controller.quoteDot,false);
+      setDot(controller.cryptoDot,false);
+      appendLog({level:'warning',source:'browser',message:'Tracking stopped'},controller);
+      controller.stopButton.classList.add('hidden');
+      loadSaved();
+    }catch(error){
+      console.error('[live-monitor] stop failed',error);
+      appendLog({level:'error',source:'browser',message:error.message},controller);
+      controller.stopButton.disabled=false;
     }
+  };
+  window.addEventListener('pagehide',()=>sessionControllers.forEach(closeController),{once:true});
+  setInterval(()=>{
+    sessionControllers.forEach(controller=>{
+      if(!controller.source||!controller.lastPayloadAt)return;
+      const age=(Date.now()-controller.lastPayloadAt)/1000;
+      if(age>4&&!controller.staleWarningShown){
+        controller.staleWarningShown=true;
+        setDot(controller.quoteDot,false,true);
+        appendLog({level:'error',source:'browser',message:'No SSE payload received for '+age.toFixed(1)+'s. Backend stream may be stuck.'},controller);
+      }
+    });
   },1000);
-  stopButton.addEventListener('click',async()=>{
-    stopButton.disabled=true;closeSource();
-    if(stopUrl){try{await fetch(stopUrl,{method:'POST',headers:{Accept:'application/json'}})}catch(error){console.error('[live-monitor] stop failed',error);appendLog({level:'error',source:'browser',message:error.message})}}
-    sessionId=null;stopUrl=null;quoteStatus.textContent='Stopped';cryptoStatus.textContent='Stopped';setDot(quoteDot,false);setDot(cryptoDot,false);stopButton.classList.add('hidden');stopButton.disabled=false;
-    loadSaved();
-  });
   form.addEventListener('submit',async event=>{
-    event.preventDefault();closeSource();resetChart();setBusy(true);
+    event.preventDefault();setBusy(true);setStartStatus('Starting live monitor...');
     try{
       const response=await fetch('/api/live-monitors',{method:'POST',body:new FormData(form),headers:{Accept:'application/json'}});
       const payload=await response.json();
       if(!response.ok)throw new Error(payload.detail||'Unable to start live monitor');
       connectSession(payload);
+      setStartStatus(sessionControllers.size+' active live monitor(s). Limit is 5.');
     }catch(error){
       console.error('[live-monitor] start failed',error);
-      eventTitle.textContent='Unable to start';
-      eventSlug.textContent=error.message;
-      quoteStatus.textContent='Failed';
-      setDot(quoteDot,false,true);setDot(cryptoDot,false,true);
+      setStartStatus(error.message,'error');
       appendLog({level:'error',source:'browser',message:error.message});
     }finally{
       setBusy(false);

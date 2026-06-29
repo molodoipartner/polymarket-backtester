@@ -33,6 +33,15 @@ templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
 
 
+def _live_monitor_session_payload(session) -> dict:
+    return {
+        "session_id": session.id,
+        "events_url": f"/api/live-monitors/{session.id}/events",
+        "stop_url": f"/api/live-monitors/{session.id}/stop",
+        "snapshot": session.snapshot(),
+    }
+
+
 def _store(request: Request) -> FileStore:
     return request.app.state.store
 
@@ -329,29 +338,20 @@ async def start_live_monitor(
         )
     except (httpx.HTTPError, ValueError, OSError) as error:
         raise HTTPException(422, _error_message(error)) from error
-    return JSONResponse(
-        {
-            "session_id": session.id,
-            "events_url": f"/api/live-monitors/{session.id}/events",
-            "stop_url": f"/api/live-monitors/{session.id}/stop",
-            "snapshot": session.snapshot(),
-        },
-        status_code=202,
-    )
+    return JSONResponse(_live_monitor_session_payload(session), status_code=202)
 
 
 @router.get("/api/live-monitors/active")
 def active_live_monitor(request: Request):
     user = _require_user(request)
-    session = request.app.state.live_monitor.active_session(user["id"])
-    if not session:
+    sessions = request.app.state.live_monitor.active_sessions(user["id"])
+    if not sessions:
         return {"active": False}
+    payloads = [_live_monitor_session_payload(session) for session in sessions]
     return {
         "active": True,
-        "session_id": session.id,
-        "events_url": f"/api/live-monitors/{session.id}/events",
-        "stop_url": f"/api/live-monitors/{session.id}/stop",
-        "snapshot": session.snapshot(),
+        "sessions": payloads,
+        **payloads[0],
     }
 
 

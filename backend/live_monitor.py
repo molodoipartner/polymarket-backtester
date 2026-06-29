@@ -43,6 +43,7 @@ SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
 SAMPLE_WRITE_QUEUE_SIZE = 5000
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
 PARTIAL_CONTRACT_GRACE_SECONDS = 10
+MAX_ACTIVE_LIVE_MONITORS_PER_USER = 5
 
 logger = logging.getLogger(__name__)
 
@@ -1969,7 +1970,7 @@ class LiveMonitorManager:
     def __init__(self, data_root: Path) -> None:
         self.data_root = data_root
         self.sessions: dict[str, LiveMonitorSession] = {}
-        self.active_by_user: dict[str, str] = {}
+        self.active_by_user: dict[str, list[str]] = {}
         self.data_root.mkdir(parents=True, exist_ok=True)
         (self.data_root / "sessions").mkdir(exist_ok=True)
         (self.data_root / "samples").mkdir(exist_ok=True)
@@ -1980,37 +1981,60 @@ class LiveMonitorManager:
         event_url: str,
         crypto_symbol: str | None = None,
     ) -> LiveMonitorSession:
-        active = self.active_session(user_id)
-        if active is not None:
-            await self.stop(active.id)
+        if len(self.active_sessions(user_id)) >= MAX_ACTIVE_LIVE_MONITORS_PER_USER:
+            raise ValueError(
+                f"Maximum {MAX_ACTIVE_LIVE_MONITORS_PER_USER} active live monitors reached"
+            )
         event = await resolve_polymarket_event(event_url, crypto_symbol)
         session = LiveMonitorSession(uuid.uuid4().hex, user_id, event, self.data_root)
         self.sessions[session.id] = session
-        self.active_by_user[user_id] = session.id
-        await session.start()
+        self.active_by_user.setdefault(user_id, []).append(session.id)
+        try:
+            await session.start()
+        except Exception:
+            self.sessions.pop(session.id, None)
+            session_ids = self.active_by_user.get(user_id) or []
+            kept_ids = [active_id for active_id in session_ids if active_id != session.id]
+            if kept_ids:
+                self.active_by_user[user_id] = kept_ids
+            else:
+                self.active_by_user.pop(user_id, None)
+            await session.close()
+            raise
         return session
 
     def get(self, session_id: str) -> LiveMonitorSession | None:
         return self.sessions.get(session_id)
 
     def active_session(self, user_id: str) -> LiveMonitorSession | None:
-        session_id = self.active_by_user.get(user_id)
-        if not session_id:
-            return None
-        session = self.sessions.get(session_id)
-        if session is None:
+        sessions = self.active_sessions(user_id)
+        return sessions[0] if sessions else None
+
+    def active_sessions(self, user_id: str) -> list[LiveMonitorSession]:
+        session_ids = self.active_by_user.get(user_id) or []
+        active: list[LiveMonitorSession] = []
+        kept_ids: list[str] = []
+        for session_id in session_ids:
+            session = self.sessions.get(session_id)
+            if session is None or session.user_id != user_id or session.is_finished:
+                continue
+            active.append(session)
+            kept_ids.append(session_id)
+        if kept_ids:
+            self.active_by_user[user_id] = kept_ids
+        else:
             self.active_by_user.pop(user_id, None)
-            return None
-        if session.user_id != user_id or session.is_finished:
-            self.active_by_user.pop(user_id, None)
-            return None
-        return session
+        return active
 
     async def stop(self, session_id: str) -> bool:
         session = self.sessions.pop(session_id, None)
         if not session:
             return False
-        if self.active_by_user.get(session.user_id) == session_id:
+        session_ids = self.active_by_user.get(session.user_id) or []
+        kept_ids = [active_id for active_id in session_ids if active_id != session_id]
+        if kept_ids:
+            self.active_by_user[session.user_id] = kept_ids
+        else:
             self.active_by_user.pop(session.user_id, None)
         await session.close()
         return True
