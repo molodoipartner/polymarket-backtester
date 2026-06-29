@@ -651,6 +651,58 @@ def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path
     assert session._history[0]["target_price_ts"] == 1000.2
 
 
+def test_initial_history_backfills_first_half_second_samples(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1000",
+        slug="eth-updown-5m-1000",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Ethereum Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session.started_at_ts = 999.0
+    session.state.crypto_price = 101.005
+    session.state.crypto_updated_at = 1000.2
+    session._remember_crypto_update()
+    session.state.quotes["token-1"] = LiveQuote(
+        bid=0.4,
+        ask=0.45,
+        updated_at=1001.5,
+        event_at=1001.5,
+        event_count=1,
+        price_change_count=1,
+    )
+    session._remember_quote_update("token-1")
+
+    sample_ts = session._initial_history_sample_ts(1001.5)
+    captured_at = 1001.502
+    while sample_ts <= captured_at + 0.001:
+        session._capture_history_row(timestamp=sample_ts, captured_at=captured_at)
+        sample_ts = round(sample_ts + live_monitor.HISTORY_CAPTURE_INTERVAL_SECONDS, 3)
+
+    assert [row["t"] for row in session._history[:4]] == [
+        1000.0,
+        1000.5,
+        1001.0,
+        1001.5,
+    ]
+    assert session._history[0]["target_price"] == 101.01
+    assert session._history[0]["target_price_ts"] == 1000.2
+    assert session._history[0]["crypto_updated_at"] == 1000.2
+    assert session._history[0]["quote_event_at"] == 1001.5
+    assert session._history[0]["captured_at"] == 1001.502
+
+
 @pytest.mark.asyncio
 async def test_preloaded_switch_preserves_rollover_target_price(tmp_path):
     current_event = ResolvedPolymarketEvent(

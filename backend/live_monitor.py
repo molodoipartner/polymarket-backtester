@@ -38,6 +38,7 @@ LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
 HISTORY_MAX_CATCH_UP_SAMPLES = 20
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
+INITIAL_SOURCE_BACKFILL_SECONDS = 5.0
 SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
 SAMPLE_WRITE_QUEUE_SIZE = 5000
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
@@ -861,6 +862,7 @@ class LiveMonitorSession:
                 )
                 await asyncio.sleep(max(0, sample_ts - time.time()))
                 captured_at = time.time()
+                sample_ts = self._initial_history_sample_ts(sample_ts)
                 self._tick_count += 1
                 self._last_tick_at = captured_at
                 catch_up_count = 0
@@ -1281,6 +1283,19 @@ class LiveMonitorSession:
         anchor = time.time() if anchor_ts is None else anchor_ts
         self._next_history_sample_ts = _ceil_history_sample_time(anchor)
 
+    def _initial_history_sample_ts(self, sample_ts: float) -> float:
+        if self._last_history_sample_ts is not None:
+            return sample_ts
+        lock_after = self._target_lock_after_ts()
+        if lock_after is None:
+            return sample_ts
+        initial_sample_ts = _ceil_history_sample_time(lock_after)
+        if sample_ts <= initial_sample_ts:
+            return sample_ts
+        if sample_ts - initial_sample_ts > INITIAL_SOURCE_BACKFILL_SECONDS:
+            return sample_ts
+        return initial_sample_ts
+
     def _remember_quote_update(self, token_id: str) -> None:
         quote = self.state.quotes.get(token_id)
         if quote is None:
@@ -1338,13 +1353,23 @@ class LiveMonitorSession:
             self._crypto_timeline.pop(0)
 
     def _quote_at(self, token_id: str, sample_ts: float) -> LiveQuote | None:
-        for quote in reversed(self._quote_timeline.get(token_id) or []):
+        timeline = self._quote_timeline.get(token_id) or []
+        for quote in reversed(timeline):
             if quote.event_at is not None and quote.event_at <= sample_ts:
                 return quote
+        initial_quote = self._initial_quote_at(token_id, sample_ts, timeline)
+        if initial_quote is not None:
+            return initial_quote
         quote = self.state.quotes.get(token_id)
         if quote is None:
             return None
         if quote.event_at is None or quote.event_at <= sample_ts:
+            return quote
+        if (
+            not timeline
+            and quote.event_count == 1
+            and self._is_initial_source_backfill_sample(sample_ts, quote.event_at)
+        ):
             return quote
         return None
 
@@ -1352,6 +1377,9 @@ class LiveMonitorSession:
         for updated_at, price in reversed(self._crypto_timeline):
             if updated_at <= sample_ts:
                 return price, updated_at
+        initial_crypto = self._initial_crypto_price_at(sample_ts)
+        if initial_crypto is not None:
+            return initial_crypto
         if self.state.crypto_price is None:
             return None, None
         updated_at = self.state.crypto_updated_at
@@ -1376,7 +1404,11 @@ class LiveMonitorSession:
         for updated_at, price in self._crypto_timeline:
             if lock_after is not None and updated_at + 1e-6 < lock_after:
                 continue
-            if updated_at <= max_ts:
+            if updated_at <= max_ts or self._is_initial_source_backfill_sample(
+                timestamp,
+                updated_at,
+                lock_after=lock_after,
+            ):
                 return price, updated_at
         if self._crypto_timeline:
             return None
@@ -1388,6 +1420,58 @@ class LiveMonitorSession:
         if updated_at > max_ts:
             return None
         return self.state.crypto_price, updated_at
+
+    def _initial_quote_at(
+        self,
+        token_id: str,
+        sample_ts: float,
+        timeline: list[LiveQuote] | None = None,
+    ) -> LiveQuote | None:
+        timeline = (
+            timeline if timeline is not None else self._quote_timeline.get(token_id)
+        )
+        if not timeline:
+            return None
+        quote = timeline[0]
+        if quote.event_count != 1 or quote.event_at is None:
+            return None
+        if self._is_initial_source_backfill_sample(sample_ts, quote.event_at):
+            return quote
+        return None
+
+    def _initial_crypto_price_at(
+        self,
+        sample_ts: float,
+    ) -> tuple[float, float] | None:
+        lock_after = self._target_lock_after_ts()
+        for updated_at, price in self._crypto_timeline:
+            if lock_after is not None and updated_at + 1e-6 < lock_after:
+                continue
+            if self._is_initial_source_backfill_sample(
+                sample_ts,
+                updated_at,
+                lock_after=lock_after,
+            ):
+                return price, updated_at
+            return None
+        return None
+
+    def _is_initial_source_backfill_sample(
+        self,
+        sample_ts: float,
+        source_ts: float | None,
+        lock_after: float | None = None,
+    ) -> bool:
+        if source_ts is None:
+            return False
+        lock_after = self._target_lock_after_ts() if lock_after is None else lock_after
+        if lock_after is None:
+            return False
+        if sample_ts + 1e-6 < lock_after:
+            return False
+        if source_ts <= sample_ts + 1e-6:
+            return False
+        return source_ts - lock_after <= INITIAL_SOURCE_BACKFILL_SECONDS + 1e-6
 
     def _maybe_lock_target_price(self, timestamp: float | None = None) -> bool:
         if self.state.target_price is not None:
