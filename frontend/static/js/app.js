@@ -365,7 +365,8 @@ function initLiveMonitor(){
           const range=Number.isFinite(gap.start_second)&&Number.isFinite(gap.end_second)
             ?fmtSecondsPrecise(gap.start_second)+' - '+fmtSecondsPrecise(gap.end_second)
             :(gap.start_time||'-')+' - '+(gap.end_time||'-');
-          row.textContent=source+': '+range+'; duration '+fmtSecondsPrecise(gap.duration_seconds)+'.';
+          const reason=gap.reason?' reason: '+gap.reason+'.':'';
+          row.textContent=source+': '+range+'; duration '+fmtSecondsPrecise(gap.duration_seconds)+'.'+reason;
           savedGapList.appendChild(row);
         }
         savedGapList.classList.remove('hidden');

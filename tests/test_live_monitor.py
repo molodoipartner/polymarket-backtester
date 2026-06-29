@@ -402,6 +402,7 @@ def test_polymarket_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch
         "start_ts": 1782639660.0,
         "end_ts": 1782639667.25,
         "duration_seconds": 7.25,
+        "reason": "transport ended without a WebSocket close frame",
     }]
     monkeypatch.setattr(live_monitor.time, "time", lambda: 1782639901)
 
@@ -414,6 +415,10 @@ def test_polymarket_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch
     assert record["connection_gap_periods"][0]["source"] == "polymarket"
     assert record["connection_gap_periods"][0]["start_second"] == 60.0
     assert record["connection_gap_periods"][0]["end_second"] == 67.25
+    assert (
+        record["connection_gap_periods"][0]["reason"]
+        == "transport ended without a WebSocket close frame"
+    )
     assert (
         record["partial_reason"]
         == "Polymarket connection was interrupted during tracking."
@@ -531,6 +536,7 @@ def test_crypto_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):
         "start_ts": 1782639700.0,
         "end_ts": 1782639704.5,
         "duration_seconds": 4.5,
+        "reason": "Crypto price feed stale for 10.4s",
     }]
     monkeypatch.setattr(live_monitor.time, "time", lambda: 1782639901)
 
@@ -543,7 +549,34 @@ def test_crypto_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):
     assert record["connection_gap_periods"][0]["source"] == "crypto"
     assert record["connection_gap_periods"][0]["start_second"] == 100.0
     assert record["connection_gap_periods"][0]["end_second"] == 104.5
+    assert record["connection_gap_periods"][0]["reason"] == "Crypto price feed stale for 10.4s"
     assert "Crypto price feed was interrupted" in record["partial_reason"]
+
+
+def test_crypto_connection_stats_preserve_disconnect_reason(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState()
+    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
+    feed._ever_connected = True
+
+    feed._mark_disconnected(
+        since=10.0,
+        wall_since=1000.0,
+        reason="Crypto price feed stale for 10.4s",
+    )
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 14.5)
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1004.5)
+    feed._mark_connected()
+
+    assert feed.disconnect_count == 1
+    assert feed.disconnect_periods == [{
+        "start_ts": 1000.0,
+        "end_ts": 1004.5,
+        "duration_seconds": 4.5,
+        "reason": "Crypto price feed stale for 10.4s",
+    }]
 
 
 def test_disconnect_period_is_clipped_to_contract_window(tmp_path, monkeypatch):

@@ -32,7 +32,7 @@ RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
-CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 10.0
+CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 60.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
 LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
@@ -133,6 +133,7 @@ class PolymarketLiveOrderBook:
         self._ever_connected = False
         self._disconnected_since: float | None = None
         self._disconnected_wall_since: float | None = None
+        self._disconnected_reason: str | None = None
         self.disconnect_count = 0
         self.disconnected_seconds = 0.0
         self.disconnect_periods: list[dict] = []
@@ -148,7 +149,7 @@ class PolymarketLiveOrderBook:
             except Exception as error:
                 if self._closed:
                     break
-                self._mark_disconnected()
+                self._mark_disconnected(reason=_error_message(error))
                 self.state.quote_status = "reconnecting"
                 self.state.last_error = _error_message(error)
                 logger.warning("Polymarket WS reconnecting: %s", self.state.last_error)
@@ -188,6 +189,7 @@ class PolymarketLiveOrderBook:
             )
             listener = asyncio.create_task(self._listen(ws))
             heartbeat = asyncio.create_task(self._heartbeat(ws))
+            disconnect_reason = "Polymarket WebSocket stream ended"
             try:
                 done, _pending = await asyncio.wait(
                     (listener, heartbeat),
@@ -196,11 +198,14 @@ class PolymarketLiveOrderBook:
                 for task in done:
                     task.result()
                 raise TransientWebSocketDisconnect(
-                    "Polymarket WebSocket stream ended"
+                    disconnect_reason
                 )
+            except Exception as error:
+                disconnect_reason = _error_message(error)
+                raise
             finally:
                 if not self._closed:
-                    self._mark_disconnected()
+                    self._mark_disconnected(reason=disconnect_reason)
                     self.state.quote_status = "reconnecting"
                     await self.on_update(
                         "log",
@@ -434,25 +439,33 @@ class PolymarketLiveOrderBook:
             now = time.monotonic()
             wall_now = time.time()
             self.disconnected_seconds += now - self._disconnected_since
-            self.disconnect_periods.append({
+            period = {
                 "start_ts": self._disconnected_wall_since or wall_now,
                 "end_ts": wall_now,
                 "duration_seconds": round(now - self._disconnected_since, 3),
-            })
+            }
+            if self._disconnected_reason:
+                period["reason"] = self._disconnected_reason
+            self.disconnect_periods.append(period)
             self._disconnected_since = None
             self._disconnected_wall_since = None
+            self._disconnected_reason = None
         self._ever_connected = True
 
-    def _mark_disconnected(self) -> None:
+    def _mark_disconnected(self, reason: str | None = None) -> None:
+        if self._disconnected_since is not None:
+            if reason and not self._disconnected_reason:
+                self._disconnected_reason = reason
+            return
         if (
             self._closed
             or not self._ever_connected
-            or self._disconnected_since is not None
         ):
             return
         self.disconnect_count += 1
         self._disconnected_since = time.monotonic()
         self._disconnected_wall_since = time.time()
+        self._disconnected_reason = reason
 
     def connection_stats(self) -> dict:
         disconnected_seconds = self.disconnected_seconds
@@ -462,11 +475,14 @@ class PolymarketLiveOrderBook:
             wall_now = time.time()
             duration = now - self._disconnected_since
             disconnected_seconds += duration
-            periods.append({
+            period = {
                 "start_ts": self._disconnected_wall_since or wall_now,
                 "end_ts": wall_now,
                 "duration_seconds": round(duration, 3),
-            })
+            }
+            if self._disconnected_reason:
+                period["reason"] = self._disconnected_reason
+            periods.append(period)
         return {
             "disconnect_count": self.disconnect_count,
             "disconnected_seconds": round(disconnected_seconds, 3),
@@ -483,6 +499,7 @@ class PolymarketLiveOrderBook:
         self.disconnected_seconds = 0.0
         self._disconnected_since = None if connected else time.monotonic()
         self._disconnected_wall_since = None if connected else time.time()
+        self._disconnected_reason = None
         self._ever_connected = connected
         self.disconnect_periods = []
 
@@ -520,6 +537,7 @@ class PolymarketCryptoPriceFeed:
         self._ever_connected = False
         self._disconnected_since: float | None = None
         self._disconnected_wall_since: float | None = None
+        self._disconnected_reason: str | None = None
         self.disconnect_count = 0
         self.disconnected_seconds = 0.0
         self.disconnect_periods: list[dict] = []
@@ -535,7 +553,7 @@ class PolymarketCryptoPriceFeed:
             except Exception as error:
                 if self._closed:
                     break
-                self._mark_disconnected()
+                self._mark_disconnected(reason=_error_message(error))
                 self.state.crypto_status = "reconnecting"
                 self.state.last_error = _error_message(error)
                 logger.warning("Crypto WS reconnecting: %s", self.state.last_error)
@@ -586,6 +604,7 @@ class PolymarketCryptoPriceFeed:
             )
             listener = asyncio.create_task(self._listen(ws))
             watchdog = asyncio.create_task(self._watchdog())
+            disconnect_reason = "Crypto price WebSocket stream ended"
             try:
                 done, _pending = await asyncio.wait(
                     (listener, watchdog),
@@ -594,13 +613,17 @@ class PolymarketCryptoPriceFeed:
                 for task in done:
                     task.result()
                 raise TransientWebSocketDisconnect(
-                    "Crypto price WebSocket stream ended"
+                    disconnect_reason
                 )
+            except Exception as error:
+                disconnect_reason = _error_message(error)
+                raise
             finally:
                 if not self._closed:
                     self._mark_disconnected(
                         since=self._last_price_at or self._connected_at,
                         wall_since=self.state.crypto_updated_at,
+                        reason=disconnect_reason,
                     )
                 for task in (listener, watchdog):
                     task.cancel()
@@ -656,29 +679,38 @@ class PolymarketCryptoPriceFeed:
             now = time.monotonic()
             wall_now = time.time()
             self.disconnected_seconds += now - self._disconnected_since
-            self.disconnect_periods.append({
+            period = {
                 "start_ts": self._disconnected_wall_since or wall_now,
                 "end_ts": wall_now,
                 "duration_seconds": round(now - self._disconnected_since, 3),
-            })
+            }
+            if self._disconnected_reason:
+                period["reason"] = self._disconnected_reason
+            self.disconnect_periods.append(period)
             self._disconnected_since = None
             self._disconnected_wall_since = None
+            self._disconnected_reason = None
         self._ever_connected = True
 
     def _mark_disconnected(
         self,
         since: float | None = None,
         wall_since: float | None = None,
+        reason: str | None = None,
     ) -> None:
+        if self._disconnected_since is not None:
+            if reason and not self._disconnected_reason:
+                self._disconnected_reason = reason
+            return
         if (
             self._closed
             or not self._ever_connected
-            or self._disconnected_since is not None
         ):
             return
         self.disconnect_count += 1
         self._disconnected_since = since or time.monotonic()
         self._disconnected_wall_since = wall_since or time.time()
+        self._disconnected_reason = reason
 
     def connection_stats(self) -> dict:
         disconnected_seconds = self.disconnected_seconds
@@ -688,11 +720,14 @@ class PolymarketCryptoPriceFeed:
             wall_now = time.time()
             duration = now - self._disconnected_since
             disconnected_seconds += duration
-            periods.append({
+            period = {
                 "start_ts": self._disconnected_wall_since or wall_now,
                 "end_ts": wall_now,
                 "duration_seconds": round(duration, 3),
-            })
+            }
+            if self._disconnected_reason:
+                period["reason"] = self._disconnected_reason
+            periods.append(period)
         return {
             "disconnect_count": self.disconnect_count,
             "disconnected_seconds": round(disconnected_seconds, 3),
@@ -705,6 +740,7 @@ class PolymarketCryptoPriceFeed:
         self.disconnected_seconds = 0.0
         self._disconnected_since = None if connected else time.monotonic()
         self._disconnected_wall_since = None if connected else time.time()
+        self._disconnected_reason = None
         self._ever_connected = connected
         self.disconnect_periods = []
 
@@ -1854,6 +1890,9 @@ class LiveMonitorSession:
                 "raw_end_ts": round(raw_end_ts, 3),
                 "raw_duration_seconds": round(max(0, raw_end_ts - raw_start_ts), 3),
             }
+            reason = str(period.get("reason") or "").strip()
+            if reason:
+                item["reason"] = reason
             if window_start is not None:
                 item["start_second"] = round(max(0, start_ts - window_start), 3)
                 item["end_second"] = round(max(0, end_ts - window_start), 3)
