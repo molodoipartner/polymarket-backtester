@@ -44,6 +44,13 @@ SAMPLE_WRITE_QUEUE_SIZE = 5000
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
 PARTIAL_CONTRACT_GRACE_SECONDS = 10
 MAX_ACTIVE_LIVE_MONITORS_PER_USER = 5
+TARGET_PRICE_DECIMALS_BY_ASSET = {
+    "btc": 2,
+    "eth": 2,
+    "sol": 2,
+    "xrp": 4,
+    "doge": 6,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -1177,7 +1184,7 @@ class LiveMonitorSession:
         self.primary_token_id = event.tokens[0].token_id
         self.current_record_id = uuid.uuid4().hex
         self.state.target_price = (
-            _price_to_beat(target_price) if target_price is not None else None
+            self._price_to_beat(target_price) if target_price is not None else None
         )
         self._target_price_ts = None
         if target_price is not None:
@@ -1521,9 +1528,12 @@ class LiveMonitorSession:
         if candidate is None:
             return False
         price, price_ts = candidate
-        self.state.target_price = _price_to_beat(price)
+        self.state.target_price = self._price_to_beat(price)
         self._target_price_ts = price_ts
         return True
+
+    def _price_to_beat(self, price: float | None) -> float | None:
+        return _price_to_beat(price, self.event.crypto_symbol)
 
     def _append_history_row(
         self,
@@ -2330,10 +2340,19 @@ def _format_history_time(timestamp: float) -> str:
     return parsed.strftime("%H:%M:%S.%f")[:-3]
 
 
-def _price_to_beat(price: float | None) -> float | None:
+def _price_to_beat(price: float | None, crypto_symbol: str | None = None) -> float | None:
     if price is None:
         return None
-    return float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    decimals = _target_price_decimals(crypto_symbol)
+    quantum = Decimal("1").scaleb(-decimals)
+    return float(Decimal(str(price)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def _target_price_decimals(crypto_symbol: str | None) -> int:
+    if not crypto_symbol:
+        return 2
+    base = normalize_crypto_symbol(crypto_symbol).split("/", 1)[0]
+    return TARGET_PRICE_DECIMALS_BY_ASSET.get(base, 2)
 
 
 def _ceil_history_sample_time(timestamp: float) -> float:

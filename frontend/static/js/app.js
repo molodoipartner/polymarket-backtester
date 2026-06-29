@@ -196,7 +196,7 @@ function initLiveMonitor(){
   const fmtHistoryCents=value=>Number.isFinite(value)?Number(value).toFixed(2)+'c':'-';
   const fmtSize=value=>Number.isFinite(value)?Number(value).toLocaleString(undefined,{maximumFractionDigits:4}):'-';
   const fmtPrice=value=>Number.isFinite(value)?'$'+Number(value).toLocaleString(undefined,{maximumFractionDigits:3}):'-';
-  const fmtPriceToBeat=value=>Number.isFinite(value)?'$'+Number(value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):'-';
+  const fmtPriceToBeat=value=>Number.isFinite(value)?'$'+Number(value).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:8}):'-';
   const fmtPct=value=>Number.isFinite(value)?Number(value).toFixed(2)+'%':'-';
   const fmtSeconds=value=>Number.isFinite(value)?Math.round(value)+'s':'-';
   const fmtSecondsPrecise=value=>Number.isFinite(value)?Number(value).toFixed(1).replace(/\\.0$/,'')+'s':'-';

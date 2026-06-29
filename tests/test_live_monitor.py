@@ -18,6 +18,7 @@ from backend.live_monitor import (
     LiveToken,
     _fetch_clob_book,
     _market_tokens,
+    _price_to_beat,
     _record_partial_fields,
     _replace_slug_timestamp,
     _window_size_from_slug,
@@ -43,6 +44,13 @@ def test_crypto_symbol_inference_and_normalization():
     assert infer_crypto_symbol("Will Ethereum go up?") == "eth/usd"
     assert normalize_crypto_symbol("ETH") == "eth/usd"
     assert normalize_crypto_symbol(" sol/usd ") == "sol/usd"
+
+
+def test_price_to_beat_uses_asset_specific_precision():
+    assert _price_to_beat(63250.125, "btc/usd") == 63250.13
+    assert _price_to_beat(101.005, "eth/usd") == 101.01
+    assert _price_to_beat(1.04284, "xrp/usd") == 1.0428
+    assert _price_to_beat(0.0725164, "doge/usd") == 0.072516
 
 
 def test_window_metadata_from_updown_slug():
@@ -728,6 +736,37 @@ def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path
     assert session.state.target_price == 101.01
     assert session._history[0]["target_price"] == 101.01
     assert session._history[0]["target_price_ts"] == 1000.2
+
+
+def test_target_price_uses_dogecoin_precision(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1000",
+        slug="doge-updown-5m-1000",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Dogecoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session.started_at_ts = 999.0
+    session.state.quotes["token-1"] = LiveQuote(bid=0.4, ask=0.45)
+    session.state.crypto_price = 0.0725164
+    session.state.crypto_updated_at = 1000.2
+    session._remember_crypto_update()
+
+    session._capture_history_row(timestamp=1000.5, captured_at=1000.5)
+
+    assert session.state.target_price == 0.072516
+    assert session._history[0]["target_price"] == 0.072516
 
 
 def test_initial_history_backfills_first_half_second_samples(tmp_path):
