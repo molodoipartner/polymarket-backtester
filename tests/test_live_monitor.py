@@ -567,6 +567,37 @@ def test_finished_record_filters_history_inside_connection_gap(tmp_path):
     ]
 
 
+def test_live_snapshot_limits_history_payload(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=1782639600,
+        window_end_ts=1782639900,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session._history = [
+        {"t": index, "crypto_price": 100 + index}
+        for index in range(live_monitor.LIVE_SNAPSHOT_HISTORY_LIMIT + 20)
+    ]
+
+    snapshot = session.snapshot()
+
+    assert len(snapshot["history"]) == live_monitor.LIVE_SNAPSHOT_HISTORY_LIMIT
+    assert snapshot["history"][0]["t"] == 20
+    assert session.finished_record(status="ended")["history"][0]["t"] == 0
+
+
 def test_crypto_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
@@ -823,7 +854,7 @@ def test_target_price_uses_dogecoin_precision(tmp_path):
     assert session._history[0]["target_price"] == 0.072516
 
 
-def test_initial_history_backfills_first_half_second_samples(tmp_path):
+def test_late_history_capture_records_current_sample_only(tmp_path):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/eth-updown-5m-1000",
         slug="eth-updown-5m-1000",
@@ -844,7 +875,51 @@ def test_initial_history_backfills_first_half_second_samples(tmp_path):
     session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
     session.started_at_ts = 999.0
     session.state.crypto_price = 101.005
-    session.state.crypto_updated_at = 1000.2
+    session.state.crypto_updated_at = 1000.0
+    session._remember_crypto_update()
+    session.state.quotes["token-1"] = LiveQuote(
+        bid=0.4,
+        ask=0.45,
+        updated_at=999.7,
+        event_at=999.7,
+        event_count=1,
+        price_change_count=1,
+    )
+    session._remember_quote_update("token-1")
+
+    captured_at = 1001.502
+    session._capture_history_row(captured_at=captured_at)
+
+    assert [row["t"] for row in session._history] == [1001.5]
+    assert session._history[0]["target_price"] == 101.01
+    assert session._history[0]["target_price_ts"] == 1000.0
+    assert session._history[0]["crypto_updated_at"] == 1000.0
+    assert session._history[0]["quote_event_at"] == 999.7
+    assert session._history[0]["captured_at"] == 1001.502
+
+
+def test_history_does_not_use_future_source_points(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1000",
+        slug="eth-updown-5m-1000",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Ethereum Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session.started_at_ts = 999.0
+    session.state.crypto_price = 101.005
+    session.state.crypto_updated_at = 1001.5
     session._remember_crypto_update()
     session.state.quotes["token-1"] = LiveQuote(
         bid=0.4,
@@ -856,23 +931,88 @@ def test_initial_history_backfills_first_half_second_samples(tmp_path):
     )
     session._remember_quote_update("token-1")
 
-    sample_ts = session._initial_history_sample_ts(1001.5)
     captured_at = 1001.502
-    while sample_ts <= captured_at + 0.001:
-        session._capture_history_row(timestamp=sample_ts, captured_at=captured_at)
-        sample_ts = round(sample_ts + live_monitor.HISTORY_CAPTURE_INTERVAL_SECONDS, 3)
+    session._capture_history_row(timestamp=1001.0, captured_at=captured_at)
 
-    assert [row["t"] for row in session._history[:4]] == [
-        1000.0,
-        1000.5,
-        1001.0,
-        1001.5,
-    ]
-    assert session._history[0]["target_price"] == 101.01
-    assert session._history[0]["target_price_ts"] == 1000.2
-    assert session._history[0]["crypto_updated_at"] == 1000.2
+    assert session._history == []
+
+    session._capture_history_row(timestamp=1001.5, captured_at=captured_at)
+
+    assert [row["t"] for row in session._history] == [1001.5]
+    assert session._history[0]["crypto_updated_at"] == 1001.5
     assert session._history[0]["quote_event_at"] == 1001.5
-    assert session._history[0]["captured_at"] == 1001.502
+
+
+@pytest.mark.asyncio
+async def test_taking_preloaded_contract_does_not_stop_history_capture(tmp_path):
+    current_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1000",
+        slug="doge-updown-5m-1000",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="current-token",
+                market_question="Current",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    next_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1300",
+        slug="doge-updown-5m-1300",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="next-token",
+                market_question="Next",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1300,
+        window_end_ts=1600,
+    )
+    session = LiveMonitorSession("session-1", "user-1", current_event, tmp_path)
+
+    async def on_preload_update(_kind, _detail):
+        return None
+
+    preload_state = LiveMonitorState(quotes={"next-token": LiveQuote()})
+    orderbook = PolymarketLiveOrderBook(
+        ["next-token"],
+        preload_state,
+        on_preload_update,
+    )
+    task = asyncio.create_task(asyncio.sleep(60))
+    history_task = asyncio.create_task(asyncio.sleep(60))
+    session._preloaded_next = PreloadedPolymarketOrderBook(
+        event=next_event,
+        state=preload_state,
+        orderbook=orderbook,
+        task=task,
+        history_task=history_task,
+    )
+
+    try:
+        preloaded = session._take_preloaded_next(
+            "https://polymarket.com/event/doge-updown-5m-1300"
+        )
+
+        assert preloaded is not None
+        assert preloaded.history_stopped is False
+        assert preloaded.history_task is history_task
+        assert history_task.cancelled() is False
+    finally:
+        task.cancel()
+        history_task.cancel()
+        await asyncio.gather(task, history_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -950,6 +1090,308 @@ async def test_preloaded_switch_preserves_rollover_target_price(tmp_path):
     assert session.polymarket is orderbook
     assert session.state.quotes["next-token"].bid == 0.51
     assert session.finished_record(status="ended")["history"][0]["target_price"] == 123.45
+
+
+@pytest.mark.asyncio
+async def test_preloaded_switch_preserves_early_orderbook_timeline(tmp_path, monkeypatch):
+    current_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1000",
+        slug="eth-updown-5m-1000",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="current-token",
+                market_question="Current",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    next_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1300",
+        slug="eth-updown-5m-1300",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="next-token",
+                market_question="Next",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1300,
+        window_end_ts=1600,
+    )
+    session = LiveMonitorSession("session-1", "user-1", current_event, tmp_path)
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1300.01)
+    session.state.crypto_price = 1563.85
+    session.state.crypto_updated_at = 1300.0
+    session._remember_crypto_update()
+    early_quote = LiveQuote(
+        bid=0.47,
+        ask=0.48,
+        updated_at=1292.0,
+        event_at=1292.0,
+        event_count=1,
+        price_change_count=1,
+    )
+    latest_quote = LiveQuote(
+        bid=0.51,
+        ask=0.52,
+        updated_at=1299.7,
+        event_at=1299.7,
+        event_count=2,
+        price_change_count=2,
+    )
+    preload_state = LiveMonitorState(quotes={"next-token": latest_quote})
+
+    async def on_preload_update(_kind, _detail):
+        return None
+
+    orderbook = PolymarketLiveOrderBook(
+        ["next-token"],
+        preload_state,
+        on_preload_update,
+    )
+    task = asyncio.create_task(asyncio.sleep(60))
+    preloaded = PreloadedPolymarketOrderBook(
+        event=next_event,
+        state=preload_state,
+        orderbook=orderbook,
+        task=task,
+        quote_timeline={"next-token": [early_quote, latest_quote]},
+    )
+    try:
+        await session._switch_event(
+            next_event,
+            target_price=1563.85,
+            started_at_ts=1300.0,
+            preloaded=preloaded,
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert session._history[0]["t"] == 1300.0
+    assert session._history[0]["yes_bid"] == 51.0
+    assert session._history[0]["yes_ask"] == 52.0
+    assert session._history[0]["quote_event_at"] == 1299.7
+
+
+@pytest.mark.asyncio
+async def test_preloaded_switch_preserves_already_captured_history(tmp_path, monkeypatch):
+    current_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1000",
+        slug="doge-updown-5m-1000",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="current-token",
+                market_question="Current",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    next_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1300",
+        slug="doge-updown-5m-1300",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="next-token",
+                market_question="Next",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1300,
+        window_end_ts=1600,
+    )
+    session = LiveMonitorSession("session-1", "user-1", current_event, tmp_path)
+    session.state.crypto_price = 0.0719
+    session.state.crypto_updated_at = 1296.0
+    session._remember_crypto_update()
+    session.state.crypto_price = 0.072
+    session.state.crypto_updated_at = 1299.0
+    session._remember_crypto_update()
+    session.state.crypto_price = 0.07213
+    session.state.crypto_updated_at = 1300.0
+    session._remember_crypto_update()
+    quote = LiveQuote(
+        bid=0.5,
+        ask=0.53,
+        updated_at=1296.0,
+        event_at=1296.0,
+        event_count=1,
+        price_change_count=1,
+    )
+    preload_state = LiveMonitorState(quotes={"next-token": quote})
+
+    async def on_preload_update(_kind, _detail):
+        return None
+
+    orderbook = PolymarketLiveOrderBook(
+        ["next-token"],
+        preload_state,
+        on_preload_update,
+    )
+    task = asyncio.create_task(asyncio.sleep(60))
+    history_task = asyncio.create_task(asyncio.sleep(60))
+    preloaded = PreloadedPolymarketOrderBook(
+        event=next_event,
+        state=preload_state,
+        orderbook=orderbook,
+        task=task,
+        quote_timeline={"next-token": [quote]},
+        history_task=history_task,
+    )
+    session._capture_preloaded_history_row(
+        preloaded,
+        timestamp=1296.5,
+        captured_at=1296.51,
+    )
+    session._capture_preloaded_history_row(
+        preloaded,
+        timestamp=1297.0,
+        captured_at=1297.01,
+    )
+    session._capture_preloaded_history_row(
+        preloaded,
+        timestamp=1300.0,
+        captured_at=1300.01,
+    )
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1301.01)
+
+    try:
+        await session._switch_event(
+            next_event,
+            target_price=None,
+            started_at_ts=1300.0,
+            preloaded=preloaded,
+        )
+    finally:
+        task.cancel()
+        history_task.cancel()
+        await asyncio.gather(task, history_task, return_exceptions=True)
+
+    assert [row["t"] for row in preloaded.history] == [1296.5, 1297.0, 1300.0]
+    assert [row["t"] for row in session._history] == [1297.0, 1300.0, 1301.0]
+    assert session._history[0]["t"] == 1297.0
+    assert session._history[1]["t"] == 1300.0
+    assert session._history[1]["captured_at"] == 1300.01
+    assert session._history[1]["yes_bid"] == 50.0
+    assert session._history[1]["yes_ask"] == 53.0
+
+
+@pytest.mark.asyncio
+async def test_switch_event_does_not_wait_for_previous_orderbook_close(
+    tmp_path,
+    monkeypatch,
+):
+    current_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1000",
+        slug="eth-updown-5m-1000",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="current-token",
+                market_question="Current",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    next_event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/eth-updown-5m-1300",
+        slug="eth-updown-5m-1300",
+        title="Ethereum Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="next-token",
+                market_question="Next",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="eth/usd",
+        window_size_seconds=300,
+        window_start_ts=1300,
+        window_end_ts=1600,
+    )
+    session = LiveMonitorSession("session-1", "user-1", current_event, tmp_path)
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1300.01)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def slow_close():
+        close_started.set()
+        await release_close.wait()
+
+    session.polymarket.close = slow_close
+    preload_state = LiveMonitorState(
+        quotes={
+            "next-token": LiveQuote(
+                bid=0.51,
+                ask=0.52,
+                updated_at=1299.7,
+                event_at=1299.7,
+                event_count=1,
+                price_change_count=1,
+            )
+        },
+    )
+
+    async def on_preload_update(_kind, _detail):
+        return None
+
+    orderbook = PolymarketLiveOrderBook(
+        ["next-token"],
+        preload_state,
+        on_preload_update,
+    )
+    task = asyncio.create_task(asyncio.sleep(60))
+    preloaded = PreloadedPolymarketOrderBook(
+        event=next_event,
+        state=preload_state,
+        orderbook=orderbook,
+        task=task,
+        quote_timeline={"next-token": [preload_state.quotes["next-token"]]},
+    )
+    try:
+        await asyncio.wait_for(
+            session._switch_event(
+                next_event,
+                target_price=1563.85,
+                started_at_ts=1300.0,
+                preloaded=preloaded,
+            ),
+            timeout=0.5,
+        )
+
+        assert session.event.slug == "eth-updown-5m-1300"
+        assert session.polymarket is orderbook
+        await asyncio.wait_for(close_started.wait(), timeout=0.5)
+    finally:
+        release_close.set()
+        task.cancel()
+        await asyncio.gather(*session._tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

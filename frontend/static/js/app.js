@@ -234,7 +234,11 @@ function initLiveMonitor(){
   const closeController=controller=>{if(controller?.source){controller.source.close();controller.source=null}};
   const destroyController=controller=>{
     closeController(controller);
-    if(controller?.chart){controller.chart.destroy();controller.chart=null}
+    if(controller?.chart){
+      controller.chart.destroy();
+      chartInstances.delete(controller.chartElement);
+      controller.chart=null;
+    }
     if(controller?.card)controller.card.remove();
     if(controller?.id)sessionControllers.delete(controller.id);
   };
@@ -251,7 +255,7 @@ function initLiveMonitor(){
     card.innerHTML=[
       '<div class="section-title">',
       '<div><p class="eyebrow">Live monitor</p><h2 class="text-xl" data-live-event-title>Live session</h2><p class="muted" data-live-event-slug>-</p></div>',
-      '<button class="secondary" type="button" data-live-stop>Stop</button>',
+      '<div class="live-card-actions"><button class="secondary" type="button" data-live-chart-toggle>Show chart</button><button class="secondary" type="button" data-live-stop>Stop</button></div>',
       '</div>',
       '<div class="live-status-grid">',
       '<div class="metric-card"><p>Crypto price</p><strong data-live-crypto-price>-</strong><span class="muted"><span class="ws-dot" data-live-crypto-dot></span><span data-live-crypto-status>Waiting</span></span></div>',
@@ -259,7 +263,7 @@ function initLiveMonitor(){
       '<div class="metric-card"><p>Session</p><strong data-live-session-short>-</strong><span class="muted">Separate stream and console</span></div>',
       '</div>',
       '<div class="live-monitor-log" data-live-log><p class="muted">Live WebSocket events and errors will appear here.</p></div>',
-      '<div class="live-chart-wrap"><canvas data-live-chart height="120"></canvas></div>',
+      '<div class="live-chart-wrap hidden" data-live-chart-wrap><canvas data-live-chart height="120"></canvas></div>',
       '<div class="overflow-x-auto"><table class="live-monitor-table"><thead><tr><th>Market</th><th>Outcome</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Size</th><th>Updates</th><th>Token</th></tr></thead><tbody data-live-rows><tr><td colspan="8" class="empty">Waiting for live session.</td></tr></tbody></table></div>'
     ].join('');
     sessionsContainer.prepend(card);
@@ -269,6 +273,8 @@ function initLiveMonitor(){
       eventsUrl:payload.events_url,
       source:null,
       chart:null,
+      chartOpen:false,
+      latestPayload:null,
       card,
       lastPayloadAt:0,
       staleWarningShown:false,
@@ -283,10 +289,13 @@ function initLiveMonitor(){
       rows:card.querySelector('[data-live-rows]'),
       log:card.querySelector('[data-live-log]'),
       chartElement:card.querySelector('[data-live-chart]'),
+      chartWrap:card.querySelector('[data-live-chart-wrap]'),
+      chartToggle:card.querySelector('[data-live-chart-toggle]'),
       stopButton:card.querySelector('[data-live-stop]'),
       sessionShort:card.querySelector('[data-live-session-short]')
     };
     controller.sessionShort.textContent=shortToken(id);
+    controller.chartToggle.addEventListener('click',()=>toggleChart(controller));
     controller.stopButton.addEventListener('click',()=>stopSession(controller));
     sessionControllers.set(id,controller);
     return controller;
@@ -301,6 +310,7 @@ function initLiveMonitor(){
     return createSessionCard(payload);
   };
   const ensureChart=controller=>{
+    if(!controller.chartOpen)return null;
     if(controller.chart||!controller.chartElement)return controller.chart;
     controller.chart=replaceChart(controller.chartElement,{type:'line',data:{datasets:[
       {label:'Crypto',data:[],borderColor:neon,backgroundColor:'#29f19c12',yAxisID:'crypto',pointRadius:0,tension:.2,parsing:false},
@@ -310,7 +320,22 @@ function initLiveMonitor(){
     ]},options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):''}}},scales:{x:timeScale,crypto:{type:'linear',position:'left',ticks:{color:text,callback:v=>'$'+v.toLocaleString()},grid:{color:grid}},contract:{type:'linear',position:'right',min:0,max:100,ticks:{color:text,callback:v=>v.toFixed(0)+'c'},grid:{drawOnChartArea:false,color:grid}}}}});
     return controller.chart;
   };
+  const closeChart=controller=>{
+    if(controller.chart){
+      controller.chart.destroy();
+      chartInstances.delete(controller.chartElement);
+      controller.chart=null;
+    }
+  };
+  const toggleChart=controller=>{
+    controller.chartOpen=!controller.chartOpen;
+    controller.chartWrap.classList.toggle('hidden',!controller.chartOpen);
+    controller.chartToggle.textContent=controller.chartOpen?'Hide chart':'Show chart';
+    if(controller.chartOpen)updateChart(controller.latestPayload||{},controller);
+    else closeChart(controller);
+  };
   const updateChart=(payload,controller)=>{
+    if(!controller.chartOpen)return;
     const current=ensureChart(controller);if(!current)return;
     const history=(payload.history||[]).filter(row=>Number.isFinite(row.t));
     const series=key=>history.map(row=>({x:Number(row.t)*1000,y:Number.isFinite(row[key])?Number(row[key]):null}));
@@ -462,6 +487,7 @@ function initLiveMonitor(){
     }
   };
   const render=(payload,controller)=>{
+    controller.latestPayload=payload;
     controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;
     controller.eventTitle.textContent=payload.event?.title||'Live session';
     controller.eventSlug.textContent=payload.event?.slug||'-';

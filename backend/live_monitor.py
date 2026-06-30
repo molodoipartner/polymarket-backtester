@@ -34,11 +34,12 @@ WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
 CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 60.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
+PRE_WINDOW_HISTORY_SECONDS = 3.0
+PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
 LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
-HISTORY_MAX_CATCH_UP_SAMPLES = 20
+LIVE_SNAPSHOT_HISTORY_LIMIT = 180
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
-INITIAL_SOURCE_BACKFILL_SECONDS = 5.0
 SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
 SAMPLE_WRITE_QUEUE_SIZE = 5000
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
@@ -96,6 +97,12 @@ class PreloadedPolymarketOrderBook:
     state: LiveMonitorState
     orderbook: PolymarketLiveOrderBook
     task: asyncio.Task
+    quote_timeline: dict[str, list[LiveQuote]] = field(default_factory=dict)
+    history: list[dict] = field(default_factory=list)
+    target_price: float | None = None
+    target_price_ts: float | None = None
+    history_task: asyncio.Task | None = None
+    history_stopped: bool = False
 
 
 @dataclass
@@ -584,7 +591,12 @@ class PolymarketCryptoPriceFeed:
                 await self.on_update("status", {"source": "crypto"})
                 stable_for = self._connection_age()
                 retry = _next_reconnect_attempt(retry, stable_for)
-                await asyncio.sleep(_reconnect_delay(retry))
+                delay = (
+                    0.1
+                    if self.state.last_error == "Crypto price WebSocket stream ended"
+                    else _reconnect_delay(retry)
+                )
+                await asyncio.sleep(delay)
 
     async def _connect_and_listen(self) -> None:
         async with websockets.connect(
@@ -915,26 +927,17 @@ class LiveMonitorSession:
                 )
                 await asyncio.sleep(max(0, sample_ts - time.time()))
                 captured_at = time.time()
-                sample_ts = self._initial_history_sample_ts(sample_ts)
+                sample_ts = _floor_history_sample_time(captured_at)
                 self._tick_count += 1
                 self._last_tick_at = captured_at
-                catch_up_count = 0
-                while (
-                    sample_ts <= captured_at + 0.001
-                    and catch_up_count < HISTORY_MAX_CATCH_UP_SAMPLES
-                ):
-                    self._capture_history_row(
-                        timestamp=sample_ts,
-                        captured_at=captured_at,
-                    )
-                    sample_ts = round(
-                        sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
-                        3,
-                    )
-                    catch_up_count += 1
-                if catch_up_count >= HISTORY_MAX_CATCH_UP_SAMPLES:
-                    sample_ts = _ceil_history_sample_time(time.time())
-                self._next_history_sample_ts = sample_ts
+                self._capture_history_row(
+                    timestamp=sample_ts,
+                    captured_at=captured_at,
+                )
+                self._next_history_sample_ts = round(
+                    sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
+                    3,
+                )
                 await self._publish("tick", self.snapshot())
             except asyncio.CancelledError:
                 raise
@@ -1035,14 +1038,17 @@ class LiveMonitorSession:
                     return
                 if time.time() < self.event.window_end_ts:
                     await self._preload_next_event(next_url)
-            delay = max(0, self.event.window_end_ts - time.time())
+            switch_at = float(self.event.window_end_ts)
+            if self._preloaded_next is not None:
+                switch_at += PRELOADED_HISTORY_PRIORITY_SECONDS
+            delay = max(0, switch_at - time.time())
             await asyncio.sleep(delay)
             if self._stopped:
                 return
             rollover_at = float(self.event.window_end_ts)
-            saved = await self.save_finished_record(status="ended")
-            await self._publish("saved", {"record": saved, **self.snapshot()})
             if not next_url:
+                saved = await self.save_finished_record(status="ended")
+                await self._publish("saved", {"record": saved, **self.snapshot()})
                 await self._log(
                     "info",
                     "session",
@@ -1073,12 +1079,19 @@ class LiveMonitorSession:
                 await self._publish("status", self.snapshot())
                 await asyncio.sleep(3)
                 continue
+            saved = self._prepare_finished_record(status="ended")
+            self._saved = True
             await self._switch_event(
                 next_event,
                 target_price=None,
                 target_price_is_authoritative=False,
                 started_at_ts=next_event.window_start_ts or rollover_at,
                 preloaded=preloaded,
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._save_prepared_finished_record(saved, publish_saved=True)
+                )
             )
 
     def add_subscriber(self) -> asyncio.Queue:
@@ -1089,10 +1102,6 @@ class LiveMonitorSession:
 
     def remove_subscriber(self, queue: asyncio.Queue) -> None:
         self._subscribers.discard(queue)
-
-    async def _handle_preload_update(self, update_type: str, detail: dict) -> None:
-        if update_type == "log":
-            return
 
     async def _preload_next_event(self, next_url: str) -> None:
         if self._preloaded_next is not None:
@@ -1116,10 +1125,25 @@ class LiveMonitorSession:
         preload_state = LiveMonitorState(
             quotes={token.token_id: LiveQuote() for token in event.tokens}
         )
+        preload_quote_timeline: dict[str, list[LiveQuote]] = {
+            token.token_id: [] for token in event.tokens
+        }
+
+        async def handle_preload_update(update_type: str, detail: dict) -> None:
+            if update_type == "quote":
+                token_id = str(detail.get("token_id", ""))
+                self._remember_quote_update_from_state(
+                    preload_quote_timeline,
+                    preload_state,
+                    token_id,
+                )
+            elif update_type == "log":
+                return
+
         orderbook = PolymarketLiveOrderBook(
             list(preload_state.quotes),
             preload_state,
-            self._handle_preload_update,
+            handle_preload_update,
         )
         task = asyncio.create_task(orderbook.run())
         self._tasks.append(task)
@@ -1128,7 +1152,12 @@ class LiveMonitorSession:
             state=preload_state,
             orderbook=orderbook,
             task=task,
+            quote_timeline=preload_quote_timeline,
         )
+        self._preloaded_next.history_task = asyncio.create_task(
+            self._preloaded_history_loop(self._preloaded_next)
+        )
+        self._tasks.append(self._preloaded_next.history_task)
         await self._log(
             "info",
             "session",
@@ -1146,8 +1175,37 @@ class LiveMonitorSession:
         expected_slug = polymarket_slug_from_url(next_url)
         if preloaded.event.slug == expected_slug:
             return preloaded
+        preloaded.history_stopped = True
         preloaded.task.cancel()
+        if preloaded.history_task is not None:
+            preloaded.history_task.cancel()
         return None
+
+    async def _preloaded_history_loop(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+    ) -> None:
+        sample_ts = _ceil_history_sample_time(time.time())
+        while not self._stopped and not preloaded.history_stopped:
+            if (
+                preloaded.event.window_end_ts is not None
+                and sample_ts >= preloaded.event.window_end_ts
+            ):
+                return
+            await asyncio.sleep(max(0, sample_ts - time.time()))
+            if self._stopped or preloaded.history_stopped:
+                return
+            captured_at = time.time()
+            current_sample_ts = _floor_history_sample_time(captured_at)
+            self._capture_preloaded_history_row(
+                preloaded,
+                timestamp=current_sample_ts,
+                captured_at=captured_at,
+            )
+            sample_ts = round(
+                current_sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
+                3,
+            )
 
     async def _log(self, level: str, source: str, message: str) -> None:
         entry = {
@@ -1184,9 +1242,7 @@ class LiveMonitorSession:
         started_at_ts: float | None = None,
         preloaded: PreloadedPolymarketOrderBook | None = None,
     ) -> None:
-        await self._log("info", "session", f"Switching to next contract: {event.slug}.")
         previous_orderbook = self.polymarket
-        await previous_orderbook.close()
         self.event = event
         self.started_at_ts = started_at_ts or time.time()
         self.tokens_by_id = {token.token_id: token for token in event.tokens}
@@ -1204,9 +1260,27 @@ class LiveMonitorSession:
         self._next_history_sample_ts = None
         self._quote_timeline = {token.token_id: [] for token in event.tokens}
         self.crypto.reset_tracking_stats()
+        self._close_orderbook_soon(previous_orderbook)
         if preloaded is not None:
             self.state.quotes = preloaded.state.quotes
             self.state.quote_status = preloaded.state.quote_status
+            self._quote_timeline = {
+                token.token_id: list(preloaded.quote_timeline.get(token.token_id, []))
+                for token in event.tokens
+            }
+            if target_price is None and preloaded.target_price is not None:
+                self.state.target_price = preloaded.target_price
+                self._target_price_ts = preloaded.target_price_ts
+            if preloaded.history:
+                self._history = self._contract_window_history(
+                    preloaded.history,
+                    event,
+                )
+                self._last_history_sample_ts = _optional_float(
+                    self._history[-1].get("t")
+                    if self._history
+                    else None
+                )
             if preloaded.state.last_error:
                 self.state.last_error = preloaded.state.last_error
             self.polymarket = preloaded.orderbook
@@ -1214,6 +1288,9 @@ class LiveMonitorSession:
             self.polymarket.attach(self.state, self._handle_update)
             for token_id in self.state.quotes:
                 self._remember_quote_update(token_id)
+            preloaded.history_stopped = True
+            if preloaded.history_task is not None:
+                preloaded.history_task.cancel()
         else:
             self.state.quotes = {token.token_id: LiveQuote() for token in event.tokens}
             self.state.quote_status = "starting"
@@ -1223,9 +1300,18 @@ class LiveMonitorSession:
                 self._handle_update,
             )
             self._tasks.append(asyncio.create_task(self.polymarket.run()))
-        self._reset_history_schedule(self.started_at_ts)
-        self._capture_history_row(timestamp=self.started_at_ts)
+        captured_at = time.time()
+        start_sample_ts = _floor_history_sample_time(captured_at)
+        self._capture_history_row(
+            timestamp=start_sample_ts,
+            captured_at=captured_at,
+        )
+        self._next_history_sample_ts = round(
+            start_sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
+            3,
+        )
         self._write_meta()
+        await self._log("info", "session", f"Switched to next contract: {event.slug}.")
         await self._publish("rolled", self.snapshot())
 
     async def _handle_update(self, update_type: str, detail: dict) -> None:
@@ -1336,21 +1422,21 @@ class LiveMonitorSession:
         anchor = time.time() if anchor_ts is None else anchor_ts
         self._next_history_sample_ts = _ceil_history_sample_time(anchor)
 
-    def _initial_history_sample_ts(self, sample_ts: float) -> float:
-        if self._last_history_sample_ts is not None:
-            return sample_ts
-        lock_after = self._target_lock_after_ts()
-        if lock_after is None:
-            return sample_ts
-        initial_sample_ts = _ceil_history_sample_time(lock_after)
-        if sample_ts <= initial_sample_ts:
-            return sample_ts
-        if sample_ts - initial_sample_ts > INITIAL_SOURCE_BACKFILL_SECONDS:
-            return sample_ts
-        return initial_sample_ts
-
     def _remember_quote_update(self, token_id: str) -> None:
-        quote = self.state.quotes.get(token_id)
+        self._remember_quote_update_from_state(
+            self._quote_timeline,
+            self.state,
+            token_id,
+        )
+        self._trim_quote_timeline(token_id)
+
+    def _remember_quote_update_from_state(
+        self,
+        timelines: dict[str, list[LiveQuote]],
+        state: LiveMonitorState,
+        token_id: str,
+    ) -> None:
+        quote = state.quotes.get(token_id)
         if quote is None:
             return
         event_at = quote.event_at if quote.event_at is not None else time.time()
@@ -1365,12 +1451,11 @@ class LiveMonitorSession:
             event_count=quote.event_count,
             price_change_count=quote.price_change_count,
         )
-        timeline = self._quote_timeline.setdefault(token_id, [])
+        timeline = timelines.setdefault(token_id, [])
         if timeline and timeline[-1].event_at == event_at:
             timeline[-1] = snapshot
         else:
             timeline.append(snapshot)
-        self._trim_quote_timeline(token_id)
 
     def _remember_crypto_update(self) -> None:
         if self.state.crypto_price is None:
@@ -1406,23 +1491,28 @@ class LiveMonitorSession:
             self._crypto_timeline.pop(0)
 
     def _quote_at(self, token_id: str, sample_ts: float) -> LiveQuote | None:
-        timeline = self._quote_timeline.get(token_id) or []
+        return self._quote_at_from(
+            self._quote_timeline,
+            self.state,
+            token_id,
+            sample_ts,
+        )
+
+    def _quote_at_from(
+        self,
+        timelines: dict[str, list[LiveQuote]],
+        state: LiveMonitorState,
+        token_id: str,
+        sample_ts: float,
+    ) -> LiveQuote | None:
+        timeline = timelines.get(token_id) or []
         for quote in reversed(timeline):
             if quote.event_at is not None and quote.event_at <= sample_ts:
                 return quote
-        initial_quote = self._initial_quote_at(token_id, sample_ts, timeline)
-        if initial_quote is not None:
-            return initial_quote
-        quote = self.state.quotes.get(token_id)
+        quote = state.quotes.get(token_id)
         if quote is None:
             return None
         if quote.event_at is None or quote.event_at <= sample_ts:
-            return quote
-        if (
-            not timeline
-            and quote.event_count == 1
-            and self._is_initial_source_backfill_sample(sample_ts, quote.event_at)
-        ):
             return quote
         return None
 
@@ -1430,9 +1520,6 @@ class LiveMonitorSession:
         for updated_at, price in reversed(self._crypto_timeline):
             if updated_at <= sample_ts:
                 return price, updated_at
-        initial_crypto = self._initial_crypto_price_at(sample_ts)
-        if initial_crypto is not None:
-            return initial_crypto
         if self.state.crypto_price is None:
             return None, None
         updated_at = self.state.crypto_updated_at
@@ -1457,11 +1544,7 @@ class LiveMonitorSession:
         for updated_at, price in self._crypto_timeline:
             if lock_after is not None and updated_at + 1e-6 < lock_after:
                 continue
-            if updated_at <= max_ts or self._is_initial_source_backfill_sample(
-                timestamp,
-                updated_at,
-                lock_after=lock_after,
-            ):
+            if updated_at <= max_ts:
                 return price, updated_at
         if self._crypto_timeline:
             return None
@@ -1473,58 +1556,6 @@ class LiveMonitorSession:
         if updated_at > max_ts:
             return None
         return self.state.crypto_price, updated_at
-
-    def _initial_quote_at(
-        self,
-        token_id: str,
-        sample_ts: float,
-        timeline: list[LiveQuote] | None = None,
-    ) -> LiveQuote | None:
-        timeline = (
-            timeline if timeline is not None else self._quote_timeline.get(token_id)
-        )
-        if not timeline:
-            return None
-        quote = timeline[0]
-        if quote.event_count != 1 or quote.event_at is None:
-            return None
-        if self._is_initial_source_backfill_sample(sample_ts, quote.event_at):
-            return quote
-        return None
-
-    def _initial_crypto_price_at(
-        self,
-        sample_ts: float,
-    ) -> tuple[float, float] | None:
-        lock_after = self._target_lock_after_ts()
-        for updated_at, price in self._crypto_timeline:
-            if lock_after is not None and updated_at + 1e-6 < lock_after:
-                continue
-            if self._is_initial_source_backfill_sample(
-                sample_ts,
-                updated_at,
-                lock_after=lock_after,
-            ):
-                return price, updated_at
-            return None
-        return None
-
-    def _is_initial_source_backfill_sample(
-        self,
-        sample_ts: float,
-        source_ts: float | None,
-        lock_after: float | None = None,
-    ) -> bool:
-        if source_ts is None:
-            return False
-        lock_after = self._target_lock_after_ts() if lock_after is None else lock_after
-        if lock_after is None:
-            return False
-        if sample_ts + 1e-6 < lock_after:
-            return False
-        if source_ts <= sample_ts + 1e-6:
-            return False
-        return source_ts - lock_after <= INITIAL_SOURCE_BACKFILL_SECONDS + 1e-6
 
     def _maybe_lock_target_price(self, timestamp: float | None = None) -> bool:
         if self.state.target_price is not None:
@@ -1541,6 +1572,28 @@ class LiveMonitorSession:
         self._target_price_ts = price_ts
         return True
 
+    def _maybe_lock_preloaded_target_price(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+        timestamp: float,
+    ) -> bool:
+        if preloaded.target_price is not None:
+            return False
+        lock_after = (
+            float(preloaded.event.window_start_ts)
+            if preloaded.event.window_start_ts is not None
+            else timestamp
+        )
+        if timestamp < lock_after:
+            return False
+        candidate = self._target_price_candidate(timestamp, lock_after)
+        if candidate is None:
+            return False
+        price, price_ts = candidate
+        preloaded.target_price = _price_to_beat(price, preloaded.event.crypto_symbol)
+        preloaded.target_price_ts = price_ts
+        return True
+
     def _price_to_beat(self, price: float | None) -> float | None:
         return _price_to_beat(price, self.event.crypto_symbol)
 
@@ -1553,13 +1606,15 @@ class LiveMonitorSession:
         crypto_updated_at: float | None,
     ) -> None:
         if self._last_history_sample_ts == timestamp and self._history:
-            self._history[-1] = self._history_row(
-                timestamp,
-                quote,
-                crypto_price,
-                captured_at=captured_at,
-                crypto_updated_at=crypto_updated_at,
-            )
+            existing_captured_at = _optional_float(self._history[-1].get("captured_at"))
+            if existing_captured_at is None or captured_at <= existing_captured_at:
+                self._history[-1] = self._history_row(
+                    timestamp,
+                    quote,
+                    crypto_price,
+                    captured_at=captured_at,
+                    crypto_updated_at=crypto_updated_at,
+                )
             return
         if (
             self._last_history_sample_ts is not None
@@ -1578,6 +1633,108 @@ class LiveMonitorSession:
         )
         self._trim_quote_timeline(self.primary_token_id)
         self._trim_crypto_timeline()
+
+    def _append_preloaded_history_row(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+        timestamp: float,
+        quote: LiveQuote,
+        crypto_price: float,
+        captured_at: float,
+        crypto_updated_at: float | None,
+    ) -> None:
+        if preloaded.history and preloaded.history[-1].get("t") == timestamp:
+            existing_captured_at = _optional_float(
+                preloaded.history[-1].get("captured_at")
+            )
+            if existing_captured_at is None or captured_at <= existing_captured_at:
+                preloaded.history[-1] = self._history_row_for(
+                    preloaded.event,
+                    preloaded.target_price,
+                    preloaded.target_price_ts,
+                    timestamp,
+                    quote,
+                    crypto_price,
+                    captured_at=captured_at,
+                    crypto_updated_at=crypto_updated_at,
+                )
+            return
+        if preloaded.history and timestamp < float(preloaded.history[-1].get("t", 0)):
+            return
+        preloaded.history.append(
+            self._history_row_for(
+                preloaded.event,
+                preloaded.target_price,
+                preloaded.target_price_ts,
+                timestamp,
+                quote,
+                crypto_price,
+                captured_at=captured_at,
+                crypto_updated_at=crypto_updated_at,
+            )
+        )
+
+    def _capture_preloaded_history_row(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+        timestamp: float,
+        captured_at: float | None = None,
+    ) -> None:
+        captured_at = time.time() if captured_at is None else captured_at
+        sample_ts = round(timestamp, 3)
+        if self._is_connection_gap_sample(sample_ts):
+            return
+        self._maybe_lock_preloaded_target_price(preloaded, sample_ts)
+        quote = self._quote_at_from(
+            preloaded.quote_timeline,
+            preloaded.state,
+            preloaded.event.tokens[0].token_id,
+            sample_ts,
+        )
+        crypto_price, crypto_updated_at = self._crypto_price_at(sample_ts)
+        if (
+            quote is None
+            or crypto_price is None
+            or (quote.bid is None and quote.ask is None)
+        ):
+            return
+        if (
+            preloaded.event.window_start_ts is not None
+            and sample_ts >= float(preloaded.event.window_start_ts)
+            and preloaded.target_price is None
+        ):
+            return
+        self._append_preloaded_history_row(
+            preloaded,
+            sample_ts,
+            quote,
+            crypto_price,
+            captured_at=captured_at,
+            crypto_updated_at=crypto_updated_at,
+        )
+
+    def _contract_window_history(
+        self,
+        history: list[dict],
+        event: ResolvedPolymarketEvent,
+    ) -> list[dict]:
+        if event.window_start_ts is None:
+            return list(history)
+        window_start = float(event.window_start_ts) - PRE_WINDOW_HISTORY_SECONDS
+        window_end = (
+            float(event.window_end_ts)
+            if event.window_end_ts is not None
+            else None
+        )
+        filtered = []
+        for row in history:
+            timestamp = _optional_float(row.get("t"))
+            if timestamp is None or timestamp < window_start:
+                continue
+            if window_end is not None and timestamp >= window_end:
+                continue
+            filtered.append(row)
+        return filtered
 
     def _capture_history_row(
         self,
@@ -1672,7 +1829,28 @@ class LiveMonitorSession:
         captured_at: float | None = None,
         crypto_updated_at: float | None = None,
     ) -> dict:
-        target = self.state.target_price
+        return self._history_row_for(
+            self.event,
+            self.state.target_price,
+            self._target_price_ts,
+            timestamp,
+            quote,
+            crypto_price,
+            captured_at=captured_at,
+            crypto_updated_at=crypto_updated_at,
+        )
+
+    def _history_row_for(
+        self,
+        event: ResolvedPolymarketEvent,
+        target: float | None,
+        target_price_ts: float | None,
+        timestamp: float,
+        quote: LiveQuote,
+        crypto_price: float,
+        captured_at: float | None = None,
+        crypto_updated_at: float | None = None,
+    ) -> dict:
         yes_bid = round(quote.bid * 100, 4) if quote.bid is not None else None
         yes_ask = round(quote.ask * 100, 4) if quote.ask is not None else None
         no_bid = round(100 - yes_ask, 4) if yes_ask is not None else None
@@ -1704,8 +1882,8 @@ class LiveMonitorSession:
             ),
             "target_price": target,
             "target_price_ts": (
-                round(self._target_price_ts, 3)
-                if self._target_price_ts is not None
+                round(target_price_ts, 3)
+                if target_price_ts is not None
                 else None
             ),
             "deviation_pct": deviation,
@@ -1739,30 +1917,63 @@ class LiveMonitorSession:
                 else None
             ),
             "seconds_left": (
-                round(max(0, self.event.window_end_ts - timestamp), 3)
-                if self.event.window_end_ts
+                round(max(0, event.window_end_ts - timestamp), 3)
+                if event.window_end_ts
                 else None
             ),
         }
 
-    async def save_finished_record(self, status: str) -> dict:
-        if self._saved:
-            return self.finished_record(status=status)
+    def _prepare_finished_record(self, status: str) -> dict:
         final_sample_ts = (
             float(self.event.window_end_ts)
             if status == "ended" and self.event.window_end_ts is not None
             else None
         )
         self._capture_history_row(timestamp=final_sample_ts)
-        record = self.finished_record(status=status)
+        return self.finished_record(status=status)
+
+    async def _write_finished_record(self, record: dict) -> None:
         async with self._write_lock:
             await asyncio.to_thread(_write_saved_record, self.saved_dir, record)
-        self._saved = True
         await self._log(
             "info",
             "storage",
             f"Saved contract {record['slug']} with {len(record['history'])} history row(s).",
         )
+
+    async def _save_prepared_finished_record(
+        self,
+        record: dict,
+        publish_saved: bool = False,
+    ) -> None:
+        try:
+            await self._write_finished_record(record)
+            if publish_saved:
+                await self._publish("saved", {"record": record, **self.snapshot()})
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.state.last_error = _error_message(error)
+            logger.exception("Failed to save prepared live monitor record")
+            await self._log(
+                "error",
+                "storage",
+                f"Failed to save contract {record.get('slug', 'unknown')}: {self.state.last_error}",
+            )
+
+    def _close_orderbook_soon(self, orderbook: PolymarketLiveOrderBook) -> None:
+        async def ignore_update(_update_type: str, _detail: dict) -> None:
+            return None
+
+        orderbook.attach(orderbook.state, ignore_update)
+        self._tasks.append(asyncio.create_task(orderbook.close()))
+
+    async def save_finished_record(self, status: str) -> dict:
+        if self._saved:
+            return self.finished_record(status=status)
+        record = self._prepare_finished_record(status=status)
+        await self._write_finished_record(record)
+        self._saved = True
         return record
 
     def finished_record(self, status: str) -> dict:
@@ -1999,7 +2210,7 @@ class LiveMonitorSession:
                 }
                 for token_id, quote in self.state.quotes.items()
             ],
-            "history": list(self._history[-600:]),
+            "history": list(self._history[-LIVE_SNAPSHOT_HISTORY_LIMIT:]),
             "samples_path": str(self.samples_path),
             "saved_path": str(self.saved_dir),
             "logs": list(self._logs[-100:]),
