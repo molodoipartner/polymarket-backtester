@@ -205,7 +205,7 @@ function initLiveMonitor(){
   const shortToken=value=>value?value.slice(0,8)+'...'+value.slice(-6):'-';
   const categoryLabel=value=>{
     const base=String(value||'').split('/')[0].toLowerCase();
-    return ({btc:'Bitcoin',eth:'Ethereum',sol:'Solana',xrp:'XRP',doge:'Dogecoin'}[base])||base.toUpperCase()||'-';
+    return ({btc:'Bitcoin',eth:'Ethereum',sol:'Solana',xrp:'XRP',doge:'Dogecoin',bnb:'BNB',hype:'Hyperliquid'}[base])||base.toUpperCase()||'-';
   };
   const firstController=()=>sessionControllers.values().next().value||null;
   const appendLog=(entry,controller=null)=>{

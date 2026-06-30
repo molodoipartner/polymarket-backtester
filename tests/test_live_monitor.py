@@ -42,15 +42,23 @@ def test_polymarket_slug_from_event_url():
 def test_crypto_symbol_inference_and_normalization():
     assert infer_crypto_symbol("bitcoin up or down") == "btc/usd"
     assert infer_crypto_symbol("Will Ethereum go up?") == "eth/usd"
+    assert infer_crypto_symbol("bnb updown 5m") == "bnb/usd"
+    assert infer_crypto_symbol("Will Binance Coin go up?") == "bnb/usd"
+    assert infer_crypto_symbol("hype updown 5m") == "hype/usd"
+    assert infer_crypto_symbol("Will Hyperliquid go up?") == "hype/usd"
     assert normalize_crypto_symbol("ETH") == "eth/usd"
     assert normalize_crypto_symbol(" sol/usd ") == "sol/usd"
+    assert normalize_crypto_symbol("BNB") == "bnb/usd"
+    assert normalize_crypto_symbol(" hype ") == "hype/usd"
 
 
 def test_price_to_beat_uses_asset_specific_precision():
     assert _price_to_beat(63250.125, "btc/usd") == 63250.13
     assert _price_to_beat(101.005, "eth/usd") == 101.01
-    assert _price_to_beat(1.04284, "xrp/usd") == 1.0428
+    assert _price_to_beat(1.04284, "xrp/usd") == 1.04284
     assert _price_to_beat(0.0725164, "doge/usd") == 0.072516
+    assert _price_to_beat(546.5469, "bnb/usd") == 546.5469
+    assert _price_to_beat(65.6423, "hype/usd") == 65.6423
 
 
 def test_window_metadata_from_updown_slug():
@@ -186,7 +194,7 @@ async def test_price_change_prefers_exchange_best_bid_ask_over_local_book():
 
 
 @pytest.mark.asyncio
-async def test_crossed_polymarket_quote_is_ignored_without_disconnect():
+async def test_top_bid_polymarket_quote_clears_crossed_ask_without_disconnect():
     updates = []
 
     async def on_update(kind, detail):
@@ -220,10 +228,28 @@ async def test_crossed_polymarket_quote_is_ignored_without_disconnect():
         }
     )
 
-    assert state.quotes["token-1"].bid == 0.41
-    assert state.quotes["token-1"].ask == 0.44
-    assert state.quotes["token-1"].event_count == 1
+    assert state.quotes["token-1"].bid == 0.99
+    assert state.quotes["token-1"].ask is None
+    assert state.quotes["token-1"].ask_size is None
+    assert state.quotes["token-1"].event_count == 2
     assert client.disconnect_count == 0
+    assert updates == [("quote", {"token_id": "token-1"})]
+
+
+@pytest.mark.asyncio
+async def test_non_top_crossed_polymarket_quote_is_still_ignored():
+    updates = []
+
+    async def on_update(kind, detail):
+        updates.append((kind, detail))
+
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+
+    await client._store_quote("token-1", 0.97, 0.96, 123.0)
+
+    assert state.quotes["token-1"].bid is None
+    assert state.quotes["token-1"].ask is None
     assert updates == [
         (
             "log",
@@ -232,11 +258,57 @@ async def test_crossed_polymarket_quote_is_ignored_without_disconnect():
                 "source": "polymarket",
                 "message": (
                     "Ignored crossed Polymarket order book for "
-                    "token-1: bid=0.99, ask=0.98."
+                    "token-1: bid=0.97, ask=0.96."
                 ),
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_rest_poll_clears_crossed_ask_for_top_bid(tmp_path, monkeypatch):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=1782639600,
+        window_end_ts=1782639900,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+
+    class AsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def fetch_book(client, token_id):
+        assert token_id == "token-1"
+        return 0.99, 0.98, 3.0, 2.0
+
+    monkeypatch.setattr(live_monitor.httpx, "AsyncClient", AsyncClient)
+    monkeypatch.setattr(live_monitor, "_fetch_clob_book", fetch_book)
+
+    await session._poll_rest_quotes()
+
+    assert session.state.quotes["token-1"].bid == 0.99
+    assert session.state.quotes["token-1"].ask is None
+    assert session.state.quotes["token-1"].ask_size is None
+    assert session._logs == []
 
 
 @pytest.mark.asyncio
@@ -582,8 +654,8 @@ def test_live_snapshot_limits_history_payload(tmp_path):
         ],
         crypto_symbol="btc/usd",
         window_size_seconds=300,
-        window_start_ts=1782639600,
-        window_end_ts=1782639900,
+        window_start_ts=None,
+        window_end_ts=None,
     )
     session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
     session._history = [
@@ -746,11 +818,11 @@ def test_stale_crypto_price_age_is_recorded_on_grid(tmp_path, monkeypatch):
     session._capture_history_row()
 
     history = session.finished_record(status="ended")["history"]
-    assert len(history) == 2
+    assert len(history) == 8
     assert history[0]["t"] == 1782639601.0
     assert history[0]["crypto_age_seconds"] == 1.0
-    assert history[1]["t"] == 1782639604.5
-    assert history[1]["crypto_age_seconds"] == 4.5
+    assert history[-1]["t"] == 1782639604.5
+    assert history[-1]["crypto_age_seconds"] == 4.5
 
 
 @pytest.mark.asyncio
@@ -810,17 +882,20 @@ def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path
     session._capture_history_row(timestamp=1000.0, captured_at=1000.0)
 
     assert session.state.target_price is None
-    assert session._history == []
+    assert [row["t"] for row in session._history] == [1000.0]
+    assert session._history[0]["target_price"] is None
 
     session.state.crypto_price = 101.005
     session.state.crypto_updated_at = 1000.2
     session._remember_crypto_update()
     session._capture_history_row(timestamp=1000.5, captured_at=1000.5)
 
-    assert [row["t"] for row in session._history] == [1000.5]
+    assert [row["t"] for row in session._history] == [1000.0, 1000.5]
     assert session.state.target_price == 101.01
     assert session._history[0]["target_price"] == 101.01
     assert session._history[0]["target_price_ts"] == 1000.2
+    assert session._history[1]["target_price"] == 101.01
+    assert session._history[1]["target_price_ts"] == 1000.2
 
 
 def test_target_price_uses_dogecoin_precision(tmp_path):
@@ -1074,7 +1149,9 @@ async def test_preloaded_switch_preserves_rollover_target_price(tmp_path):
         orderbook=orderbook,
         task=task,
     )
+    original_time = live_monitor.time.time
     try:
+        live_monitor.time.time = lambda: 1782639900.01
         await session._switch_event(
             next_event,
             target_price=123.45,
@@ -1082,6 +1159,7 @@ async def test_preloaded_switch_preserves_rollover_target_price(tmp_path):
             preloaded=preloaded,
         )
     finally:
+        live_monitor.time.time = original_time
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
@@ -1288,12 +1366,12 @@ async def test_preloaded_switch_preserves_already_captured_history(tmp_path, mon
         await asyncio.gather(task, history_task, return_exceptions=True)
 
     assert [row["t"] for row in preloaded.history] == [1296.5, 1297.0, 1300.0]
-    assert [row["t"] for row in session._history] == [1297.0, 1300.0, 1301.0]
-    assert session._history[0]["t"] == 1297.0
-    assert session._history[1]["t"] == 1300.0
-    assert session._history[1]["captured_at"] == 1300.01
-    assert session._history[1]["yes_bid"] == 50.0
-    assert session._history[1]["yes_ask"] == 53.0
+    assert [row["t"] for row in session._history] == [1296.5, 1297.0, 1300.0, 1301.0]
+    assert session._history[0]["t"] == 1296.5
+    assert session._history[2]["t"] == 1300.0
+    assert session._history[2]["captured_at"] == 1300.01
+    assert session._history[2]["yes_bid"] == 50.0
+    assert session._history[2]["yes_ask"] == 53.0
 
 
 @pytest.mark.asyncio
@@ -1474,7 +1552,7 @@ def test_legacy_saved_record_partial_fields_detect_early_end():
     assert fields["unsuitable_reason"] == "Tracking stopped before the contract window ended."
 
 
-def test_history_preserves_missing_ask_price(tmp_path):
+def test_history_preserves_missing_ask_price(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
         slug="btc-updown-5m-1782639600",
@@ -1498,6 +1576,7 @@ def test_history_preserves_missing_ask_price(tmp_path):
     session.state.crypto_price = 101.0
     session.state.quotes["token-1"] = LiveQuote(bid=0.99, ask=None)
 
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1782639600.0)
     session._capture_history_row()
 
     row = session.finished_record(status="ended")["history"][0]
@@ -1547,6 +1626,54 @@ def test_history_records_at_half_second_resolution(tmp_path, monkeypatch):
     assert history[1]["time"].endswith(".500")
     assert history[1]["captured_at"] == 1000.51
     assert history[1]["sample_delay_ms"] == 10.0
+
+
+def test_finished_record_completes_full_five_minute_half_second_grid(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1000",
+        slug="btc-updown-5m-1000",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session.state.target_price = 100.0
+    session._target_price_ts = 1000.0
+    quote = LiveQuote(bid=0.4, ask=0.45, event_at=990.0, updated_at=990.0)
+    session._history = [
+        session._history_row(
+            timestamp,
+            quote,
+            101.0,
+            captured_at=timestamp,
+            crypto_updated_at=timestamp,
+        )
+        for timestamp in (990.0, 990.5, 999.5, 1001.5, 1300.0)
+    ]
+
+    history = session.finished_record(status="ended")["history"]
+    times = [row["t"] for row in history]
+
+    assert len(history) == 621
+    assert times[0] == 990.0
+    assert times[-1] == 1300.0
+    assert all(
+        round(right - left, 3) == 0.5
+        for left, right in zip(times, times[1:])
+    )
+    assert {1000.0, 1000.5, 1001.0}.issubset(times)
+    assert history[times.index(1000.0)]["target_price"] == 100.0
+    assert history[times.index(999.5)]["target_price"] is None
 
 
 def test_history_sample_does_not_use_future_quote_update(tmp_path):
@@ -1682,6 +1809,41 @@ def test_saved_records_are_paginated_newest_first_without_history(tmp_path):
     assert [record["id"] for record in btc_page["records"][:2]] == [
         "record-24",
         "record-22",
+    ]
+
+
+def test_saved_record_page_reads_metadata_without_full_history_parse(tmp_path):
+    manager = LiveMonitorManager(tmp_path)
+    saved_dir = tmp_path / "users" / "user-1" / "saved_contracts"
+    saved_dir.mkdir(parents=True)
+    (saved_dir / "20260101-000000Z__btc-updown__record-1.json").write_text(
+        "\n".join(
+            [
+                "{",
+                '  "id": "record-1",',
+                '  "question": "Bitcoin Up or Down",',
+                '  "crypto_symbol": "btc/usd",',
+                '  "saved_at": "2026-01-01T00:00:00Z",',
+                '  "window_start_ts": 1000,',
+                '  "window_end_ts": 1300,',
+                '  "history": [',
+                "    this is intentionally not valid json",
+                "  ]",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    page = manager.list_saved_page("user-1", page=1, page_size=20)
+    categories = manager.saved_categories("user-1")
+
+    assert page["total"] == 1
+    assert page["records"][0]["id"] == "record-1"
+    assert "history" not in page["records"][0]
+    assert page["records"][0]["history_count"] == 0
+    assert categories == [
+        {"id": "btc", "symbol": "btc/usd", "label": "Bitcoin", "count": 1},
     ]
 
 

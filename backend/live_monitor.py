@@ -27,6 +27,8 @@ from config.settings import settings
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 POLYMARKET_CRYPTO_WS_URL = "wss://ws-live-data.polymarket.com"
 POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
+POLYMARKET_TOP_BID = 0.99
+POLYMARKET_PRICE_EPSILON = 1e-9
 RECONNECT_STABLE_RESET_SECONDS = 60
 RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
@@ -34,11 +36,12 @@ WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
 CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 60.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
-PRE_WINDOW_HISTORY_SECONDS = 3.0
+PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
 LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
 LIVE_SNAPSHOT_HISTORY_LIMIT = 180
+SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES = 2 * 1024 * 1024
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
 SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
 SAMPLE_WRITE_QUEUE_SIZE = 5000
@@ -49,8 +52,10 @@ TARGET_PRICE_DECIMALS_BY_ASSET = {
     "btc": 2,
     "eth": 2,
     "sol": 2,
-    "xrp": 4,
+    "xrp": 5,
     "doge": 6,
+    "bnb": 4,
+    "hype": 4,
 }
 
 logger = logging.getLogger(__name__)
@@ -402,6 +407,12 @@ class PolymarketLiveOrderBook:
         bid_size: float | None = None,
         ask_size: float | None = None,
     ) -> None:
+        bid, ask, bid_size, ask_size = _normalize_polymarket_quote(
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+        )
         previous = self.state.quotes[token_id]
         if bid is not None and ask is not None and bid > ask:
             await self.on_update(
@@ -927,7 +938,6 @@ class LiveMonitorSession:
                 )
                 await asyncio.sleep(max(0, sample_ts - time.time()))
                 captured_at = time.time()
-                sample_ts = _floor_history_sample_time(captured_at)
                 self._tick_count += 1
                 self._last_tick_at = captured_at
                 self._capture_history_row(
@@ -986,6 +996,12 @@ class LiveMonitorSession:
                     bid, ask, bid_size, ask_size = await _fetch_clob_book(client, token_id)
                     if self.polymarket is not orderbook or token_id not in self.state.quotes:
                         return
+                    bid, ask, bid_size, ask_size = _normalize_polymarket_quote(
+                        bid,
+                        ask,
+                        bid_size,
+                        ask_size,
+                    )
                     if bid is None and ask is None:
                         continue
                     if bid is not None and ask is not None and bid > ask:
@@ -1185,25 +1201,30 @@ class LiveMonitorSession:
         self,
         preloaded: PreloadedPolymarketOrderBook,
     ) -> None:
-        sample_ts = _ceil_history_sample_time(time.time())
+        start_ts = self._history_window_start_ts(preloaded.event)
+        now = time.time()
+        sample_ts = (
+            start_ts
+            if start_ts is not None and now <= start_ts
+            else _ceil_history_sample_time(now)
+        )
         while not self._stopped and not preloaded.history_stopped:
             if (
                 preloaded.event.window_end_ts is not None
-                and sample_ts >= preloaded.event.window_end_ts
+                and sample_ts > preloaded.event.window_end_ts
             ):
                 return
             await asyncio.sleep(max(0, sample_ts - time.time()))
             if self._stopped or preloaded.history_stopped:
                 return
             captured_at = time.time()
-            current_sample_ts = _floor_history_sample_time(captured_at)
             self._capture_preloaded_history_row(
                 preloaded,
-                timestamp=current_sample_ts,
+                timestamp=sample_ts,
                 captured_at=captured_at,
             )
             sample_ts = round(
-                current_sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
+                sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
                 3,
             )
 
@@ -1300,6 +1321,8 @@ class LiveMonitorSession:
                 self._handle_update,
             )
             self._tasks.append(asyncio.create_task(self.polymarket.run()))
+        if self.state.target_price is not None:
+            self._refresh_history_targets()
         captured_at = time.time()
         start_sample_ts = _floor_history_sample_time(captured_at)
         self._capture_history_row(
@@ -1329,6 +1352,8 @@ class LiveMonitorSession:
         elif update_type == "crypto":
             self._remember_crypto_update()
             target_locked = self._maybe_lock_target_price(self.state.crypto_updated_at)
+            if target_locked:
+                self._refresh_history_targets()
         if update_type in {"quote", "crypto"}:
             self._pending_live_update_count += 1
             now = time.time()
@@ -1420,6 +1445,10 @@ class LiveMonitorSession:
 
     def _reset_history_schedule(self, anchor_ts: float | None = None) -> None:
         anchor = time.time() if anchor_ts is None else anchor_ts
+        window_start = self._history_window_start_ts(self.event)
+        if window_start is not None and anchor <= window_start:
+            self._next_history_sample_ts = window_start
+            return
         self._next_history_sample_ts = _ceil_history_sample_time(anchor)
 
     def _remember_quote_update(self, token_id: str) -> None:
@@ -1594,6 +1623,59 @@ class LiveMonitorSession:
         preloaded.target_price_ts = price_ts
         return True
 
+    def _refresh_history_targets(self) -> None:
+        self._refresh_history_targets_for(
+            self._history,
+            self.event,
+            self.state.target_price,
+            self._target_price_ts,
+        )
+
+    def _refresh_preloaded_history_targets(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+    ) -> None:
+        self._refresh_history_targets_for(
+            preloaded.history,
+            preloaded.event,
+            preloaded.target_price,
+            preloaded.target_price_ts,
+        )
+
+    def _refresh_history_targets_for(
+        self,
+        history: list[dict],
+        event: ResolvedPolymarketEvent,
+        target: float | None,
+        target_price_ts: float | None,
+    ) -> None:
+        window_start = _optional_float(event.window_start_ts)
+        for row in history:
+            timestamp = _optional_float(row.get("t"))
+            if timestamp is None:
+                continue
+            crypto_price = _optional_float(row.get("crypto_price"))
+            if (
+                target is None
+                or crypto_price is None
+                or (window_start is not None and timestamp + 1e-9 < window_start)
+            ):
+                row["target_price"] = None
+                row["target_price_ts"] = None
+                row["deviation_pct"] = None
+                continue
+            row["target_price"] = target
+            row["target_price_ts"] = (
+                round(target_price_ts, 3)
+                if target_price_ts is not None
+                else None
+            )
+            row["deviation_pct"] = (
+                round((crypto_price - target) / target * 100, 4)
+                if target
+                else None
+            )
+
     def _price_to_beat(self, price: float | None) -> float | None:
         return _price_to_beat(price, self.event.crypto_symbol)
 
@@ -1682,9 +1764,12 @@ class LiveMonitorSession:
     ) -> None:
         captured_at = time.time() if captured_at is None else captured_at
         sample_ts = round(timestamp, 3)
+        if not self._is_history_sample_in_window(sample_ts, preloaded.event):
+            return
         if self._is_connection_gap_sample(sample_ts):
             return
-        self._maybe_lock_preloaded_target_price(preloaded, sample_ts)
+        if self._maybe_lock_preloaded_target_price(preloaded, sample_ts):
+            self._refresh_preloaded_history_targets(preloaded)
         quote = self._quote_at_from(
             preloaded.quote_timeline,
             preloaded.state,
@@ -1698,12 +1783,6 @@ class LiveMonitorSession:
             or (quote.bid is None and quote.ask is None)
         ):
             return
-        if (
-            preloaded.event.window_start_ts is not None
-            and sample_ts >= float(preloaded.event.window_start_ts)
-            and preloaded.target_price is None
-        ):
-            return
         self._append_preloaded_history_row(
             preloaded,
             sample_ts,
@@ -1713,28 +1792,144 @@ class LiveMonitorSession:
             crypto_updated_at=crypto_updated_at,
         )
 
+    @staticmethod
+    def _history_window_start_ts(event: ResolvedPolymarketEvent) -> float | None:
+        if event.window_start_ts is None:
+            return None
+        return round(float(event.window_start_ts) - PRE_WINDOW_HISTORY_SECONDS, 3)
+
+    @staticmethod
+    def _history_window_end_ts(event: ResolvedPolymarketEvent) -> float | None:
+        if event.window_end_ts is None:
+            return None
+        return round(float(event.window_end_ts), 3)
+
+    def _is_history_sample_in_window(
+        self,
+        timestamp: float,
+        event: ResolvedPolymarketEvent | None = None,
+    ) -> bool:
+        event = event or self.event
+        window_start = self._history_window_start_ts(event)
+        if window_start is not None and timestamp + 1e-9 < window_start:
+            return False
+        window_end = self._history_window_end_ts(event)
+        if window_end is not None and timestamp > window_end + 1e-9:
+            return False
+        return True
+
     def _contract_window_history(
         self,
         history: list[dict],
         event: ResolvedPolymarketEvent,
     ) -> list[dict]:
-        if event.window_start_ts is None:
+        window_start = self._history_window_start_ts(event)
+        if window_start is None:
             return list(history)
-        window_start = float(event.window_start_ts) - PRE_WINDOW_HISTORY_SECONDS
-        window_end = (
-            float(event.window_end_ts)
-            if event.window_end_ts is not None
-            else None
-        )
+        window_end = self._history_window_end_ts(event)
         filtered = []
         for row in history:
             timestamp = _optional_float(row.get("t"))
             if timestamp is None or timestamp < window_start:
                 continue
-            if window_end is not None and timestamp >= window_end:
+            if window_end is not None and timestamp > window_end:
                 continue
             filtered.append(row)
         return filtered
+
+    def _complete_history_grid(self, history: list[dict]) -> list[dict]:
+        window_start = self._history_window_start_ts(self.event)
+        window_end = self._history_window_end_ts(self.event)
+        if window_start is None or window_end is None or window_end < window_start:
+            return history
+        rows_by_ts = {
+            round(timestamp, 3): row
+            for row in history
+            if (timestamp := _optional_float(row.get("t"))) is not None
+        }
+        if not rows_by_ts:
+            return []
+        first_ts = min(rows_by_ts)
+        last_ts = max(rows_by_ts)
+        interval = HISTORY_CAPTURE_INTERVAL_SECONDS
+        grid_start = (
+            window_start
+            if first_ts <= window_start + interval + 1e-9
+            else first_ts
+        )
+        grid_end = (
+            window_end
+            if last_ts >= window_end - interval - 1e-9
+            else last_ts
+        )
+        sorted_rows = [
+            rows_by_ts[timestamp]
+            for timestamp in sorted(rows_by_ts)
+        ]
+        completed = []
+        previous: dict | None = None
+        for timestamp in _history_sample_timestamps(grid_start, grid_end):
+            row = rows_by_ts.get(timestamp)
+            if row is None:
+                row = self._filled_history_row(timestamp, previous, sorted_rows)
+            if row is None:
+                continue
+            completed.append(row)
+            previous = row
+        self._refresh_history_targets_for(
+            completed,
+            self.event,
+            self.state.target_price,
+            self._target_price_ts,
+        )
+        return completed
+
+    def _filled_history_row(
+        self,
+        timestamp: float,
+        previous: dict | None,
+        sorted_rows: list[dict],
+    ) -> dict | None:
+        source = previous
+        if source is None:
+            source = next(
+                (
+                    row
+                    for row in sorted_rows
+                    if (_optional_float(row.get("t")) or 0) > timestamp
+                ),
+                None,
+            )
+        if source is None:
+            return None
+        row = dict(source)
+        captured_at = _optional_float(row.get("captured_at"))
+        if captured_at is None:
+            captured_at = timestamp
+        captured_at = max(captured_at, timestamp)
+        row["t"] = timestamp
+        row["time"] = _format_history_time(timestamp)
+        row["captured_at"] = round(captured_at, 3)
+        row["captured_time"] = _format_history_time(captured_at)
+        row["sample_delay_ms"] = round(max(0, captured_at - timestamp) * 1000, 1)
+        crypto_updated_at = _optional_float(row.get("crypto_updated_at"))
+        row["crypto_age_seconds"] = (
+            round(max(0, timestamp - crypto_updated_at), 3)
+            if crypto_updated_at is not None
+            else None
+        )
+        quote_event_at = _optional_float(row.get("quote_event_at"))
+        row["quote_age_seconds"] = (
+            round(max(0, timestamp - quote_event_at), 3)
+            if quote_event_at is not None
+            else None
+        )
+        row["seconds_left"] = (
+            round(max(0, self.event.window_end_ts - timestamp), 3)
+            if self.event.window_end_ts
+            else None
+        )
+        return row
 
     def _capture_history_row(
         self,
@@ -1747,9 +1942,12 @@ class LiveMonitorSession:
             if timestamp is None
             else round(timestamp, 3)
         )
+        if not self._is_history_sample_in_window(sample_ts):
+            return
         if self._is_connection_gap_sample(sample_ts):
             return
-        self._maybe_lock_target_price(sample_ts)
+        if self._maybe_lock_target_price(sample_ts):
+            self._refresh_history_targets()
         quote = self._quote_at(self.primary_token_id, sample_ts)
         crypto_price, crypto_updated_at = self._crypto_price_at(sample_ts)
         if (
@@ -1757,8 +1955,6 @@ class LiveMonitorSession:
             or crypto_price is None
             or (quote.bid is None and quote.ask is None)
         ):
-            return
-        if self.state.target_price is None:
             return
         self._append_history_row(
             sample_ts,
@@ -1983,10 +2179,11 @@ class LiveMonitorSession:
             connection_stats,
             crypto_connection_stats,
         )
-        history = self._history_without_connection_gaps(
-            list(self._history),
-            connection_gap_periods,
+        self._refresh_history_targets()
+        history = self._complete_history_grid(
+            self._contract_window_history(list(self._history), self.event),
         )
+        history = self._history_without_connection_gaps(history, connection_gap_periods)
         target = self.state.target_price
         final_crypto = (
             history[-1]["crypto_price"]
@@ -2326,7 +2523,9 @@ class LiveMonitorManager:
         page: int = 1,
         page_size: int = 20,
     ) -> dict:
-        records = _read_saved_records(_saved_records_dir(self.data_root, user_id))
+        records = _read_saved_record_previews(
+            _saved_records_dir(self.data_root, user_id)
+        )
         normalized_category = _normalize_saved_category(category)
         if normalized_category:
             records = [
@@ -2356,7 +2555,9 @@ class LiveMonitorManager:
 
     def saved_categories(self, user_id: str) -> list[dict]:
         counts: dict[str, dict] = {}
-        for record in _read_saved_records(_saved_records_dir(self.data_root, user_id)):
+        for record in _read_saved_record_previews(
+            _saved_records_dir(self.data_root, user_id)
+        ):
             category = _record_saved_category(record)
             bucket = counts.setdefault(
                 category["id"],
@@ -2388,16 +2589,11 @@ class LiveMonitorManager:
             return 0
         deleted = 0
         directory = _saved_records_dir(self.data_root, user_id)
-        for record in _read_saved_records(directory):
+        for path, record in _read_saved_record_preview_paths(directory):
             if _record_saved_category(record)["id"] != normalized_category:
                 continue
-            record_id = str(record.get("id") or "")
-            if not record_id:
-                continue
-            path = _find_saved_record_path(self.data_root, user_id, record_id)
-            if path is not None:
-                path.unlink()
-                deleted += 1
+            path.unlink()
+            deleted += 1
         return deleted
 
     async def close(self) -> None:
@@ -2504,6 +2700,11 @@ def infer_crypto_symbol(text: str) -> str:
         ("xrp", "xrp/usd"),
         ("dogecoin", "doge/usd"),
         ("doge", "doge/usd"),
+        ("binance coin", "bnb/usd"),
+        ("binance", "bnb/usd"),
+        ("bnb", "bnb/usd"),
+        ("hyperliquid", "hype/usd"),
+        ("hype", "hype/usd"),
     ]
     for needle, symbol in aliases:
         if re.search(rf"(^|[^a-z0-9]){re.escape(needle)}([^a-z0-9]|$)", normalized):
@@ -2583,6 +2784,14 @@ def _ceil_history_sample_time(timestamp: float) -> float:
 def _floor_history_sample_time(timestamp: float) -> float:
     interval = HISTORY_CAPTURE_INTERVAL_SECONDS
     return round(math.floor((timestamp + 1e-9) / interval) * interval, 3)
+
+
+def _history_sample_timestamps(start: float, end: float) -> list[float]:
+    if end < start:
+        return []
+    interval = HISTORY_CAPTURE_INTERVAL_SECONDS
+    count = int(round((end - start) / interval)) + 1
+    return [round(start + index * interval, 3) for index in range(count)]
 
 
 def _iso_from_ts(timestamp: float) -> str:
@@ -2746,6 +2955,21 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
+def _normalize_polymarket_quote(
+    bid: float | None,
+    ask: float | None,
+    bid_size: float | None = None,
+    ask_size: float | None = None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    if bid is not None and (
+        POLYMARKET_TOP_BID - POLYMARKET_PRICE_EPSILON
+        <= bid
+        <= 1 + POLYMARKET_PRICE_EPSILON
+    ):
+        return bid, None, bid_size, None
+    return bid, ask, bid_size, ask_size
+
+
 def _polymarket_bid(value: Any) -> float | None:
     price = _optional_float(value)
     if price is None or price <= 0:
@@ -2818,9 +3042,12 @@ def _find_saved_record_path(
     legacy_path = directory / f"{safe_record_id}.json"
     if legacy_path.exists():
         return legacy_path
+    matches = sorted(directory.glob(f"*__{safe_record_id}.json"))
+    if matches:
+        return matches[-1]
     for path in directory.glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = _read_saved_record_metadata(path)
         except (OSError, ValueError):
             continue
         if isinstance(payload, dict) and str(payload.get("id") or "") == record_id:
@@ -2840,6 +3067,166 @@ def _read_saved_records(directory: Path) -> list[dict]:
         if isinstance(payload, dict):
             records.append(payload)
     return sorted(records, key=lambda item: str(item.get("saved_at", "")))
+
+
+def _read_saved_record_previews(directory: Path) -> list[dict]:
+    return [
+        record
+        for _path, record in _read_saved_record_preview_paths(directory)
+    ]
+
+
+def _read_saved_record_preview_paths(directory: Path) -> list[tuple[Path, dict]]:
+    if not directory.exists():
+        return []
+    records: list[tuple[Path, dict]] = []
+    for path in directory.glob("*.json"):
+        record = _read_saved_record_preview(path)
+        if record is not None:
+            records.append((path, record))
+    return sorted(records, key=lambda item: str(item[1].get("saved_at", "")))
+
+
+def _read_saved_record_preview(path: Path) -> dict | None:
+    metadata = _read_saved_record_metadata(path)
+    if not isinstance(metadata, dict):
+        return None
+    history_stats = _saved_record_history_stats(path, metadata)
+    preview = {
+        **metadata,
+        **{
+            key: value
+            for key, value in history_stats.items()
+            if value is not None or key == "history_count"
+        },
+    }
+    if "id" not in preview:
+        preview["id"] = _saved_record_id_from_filename(path)
+    return preview
+
+
+def _read_saved_record_metadata(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    prefix_lines: list[str] = []
+    found_history = False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if '"history"' in line:
+                    found_history = True
+                    before_history = line.split('"history"', 1)[0].rstrip()
+                    if before_history and before_history not in {"{", ","}:
+                        prefix_lines.append(before_history)
+                    break
+                prefix_lines.append(line)
+    except OSError:
+        return None
+
+    if found_history:
+        prefix = "".join(prefix_lines).rstrip()
+        if prefix.endswith(","):
+            prefix = prefix[:-1].rstrip()
+        try:
+            payload = json.loads(f"{prefix}\n}}")
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            payload.pop("history", None)
+            return payload
+
+    try:
+        if path.stat().st_size > SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES:
+            return _minimal_saved_record_from_filename(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload.pop("history", None)
+    return payload
+
+
+def _saved_record_history_stats(
+    path: Path,
+    metadata: dict | None = None,
+) -> dict[str, float | int | None]:
+    fallback_metadata = metadata or {}
+    stats = {
+        "history_count": _optional_int(fallback_metadata.get("history_count")) or 0,
+        "first_history_ts": _optional_float(fallback_metadata.get("first_history_ts")),
+        "last_history_ts": _optional_float(fallback_metadata.get("last_history_ts")),
+    }
+    if stats["history_count"] or stats["first_history_ts"] is not None:
+        return stats
+
+    in_history = False
+    found_history = False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not in_history:
+                    if '"history"' not in line:
+                        continue
+                    in_history = True
+                    found_history = True
+                    if "[" not in line:
+                        continue
+                if in_history and line.lstrip().startswith("]"):
+                    break
+                match = re.search(r'"t"\s*:\s*(-?\d+(?:\.\d+)?)', line)
+                if not match:
+                    continue
+                try:
+                    timestamp = float(match.group(1))
+                except ValueError:
+                    continue
+                if stats["first_history_ts"] is None:
+                    stats["first_history_ts"] = timestamp
+                stats["last_history_ts"] = timestamp
+                stats["history_count"] += 1
+    except OSError:
+        return stats
+
+    if found_history and stats["history_count"]:
+        return stats
+
+    try:
+        if path.stat().st_size > SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES:
+            return stats
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return stats
+    history = payload.get("history") if isinstance(payload, dict) else None
+    if not isinstance(history, list):
+        return stats
+    timestamps = [
+        timestamp
+        for timestamp in (
+            _optional_float(row.get("t")) if isinstance(row, dict) else None
+            for row in history
+        )
+        if timestamp is not None
+    ]
+    stats["history_count"] = len(history)
+    stats["first_history_ts"] = timestamps[0] if timestamps else None
+    stats["last_history_ts"] = timestamps[-1] if timestamps else None
+    return stats
+
+
+def _saved_record_id_from_filename(path: Path) -> str:
+    stem = path.stem
+    if "__" in stem:
+        return stem.rsplit("__", 1)[-1]
+    return stem
+
+
+def _minimal_saved_record_from_filename(path: Path) -> dict:
+    return {
+        "id": _saved_record_id_from_filename(path),
+        "saved_at": "",
+        "question": path.stem,
+    }
 
 
 def _write_saved_record(directory: Path, record: dict) -> None:
@@ -2900,6 +3287,8 @@ def _record_saved_category(record: dict) -> dict:
         "sol": "Solana",
         "xrp": "XRP",
         "doge": "Dogecoin",
+        "bnb": "BNB",
+        "hype": "Hyperliquid",
     }
     return {
         "id": base,
@@ -2919,9 +3308,15 @@ def _with_saved_category(record: dict) -> dict:
 
 
 def _saved_list_record(record: dict) -> dict:
-    full_record = _with_saved_category(record)
+    full_record = {
+        **record,
+        **_record_partial_fields(record),
+        **_record_connection_fields(record),
+        "category": _record_saved_category(record),
+    }
     history = full_record.pop("history", [])
-    full_record["history_count"] = len(history) if isinstance(history, list) else 0
+    if "history_count" not in full_record:
+        full_record["history_count"] = len(history) if isinstance(history, list) else 0
     return full_record
 
 
@@ -3105,6 +3500,9 @@ def _average(values: list[float]) -> float | None:
 
 
 def _first_history_ts(record: dict) -> float | None:
+    value = _optional_float(record.get("first_history_ts"))
+    if value is not None:
+        return value
     for row in record.get("history") or []:
         if isinstance(row, dict):
             value = _optional_float(row.get("t"))
@@ -3114,6 +3512,9 @@ def _first_history_ts(record: dict) -> float | None:
 
 
 def _last_history_ts(record: dict) -> float | None:
+    value = _optional_float(record.get("last_history_ts"))
+    if value is not None:
+        return value
     for row in reversed(record.get("history") or []):
         if isinstance(row, dict):
             value = _optional_float(row.get("t"))
