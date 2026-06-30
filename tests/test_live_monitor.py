@@ -744,6 +744,116 @@ def test_crypto_connection_stats_preserve_disconnect_reason(monkeypatch):
     }]
 
 
+def test_short_crypto_stream_reconnect_is_ignored(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState()
+    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
+    feed._ever_connected = True
+    clock = {"monotonic": 100.0, "time": 1000.0}
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(live_monitor.time, "time", lambda: clock["time"])
+
+    feed._mark_stream_disconnected("Crypto price WebSocket stream ended")
+    clock["monotonic"] = 102.2
+    clock["time"] = 1002.2
+    assert feed.connection_stats() == {
+        "disconnect_count": 0,
+        "disconnected_seconds": 0.0,
+        "disconnect_periods": [],
+    }
+
+    feed._mark_connected()
+
+    assert feed.disconnect_count == 0
+    assert feed.disconnected_seconds == 0.0
+    assert feed.disconnect_periods == []
+
+
+def test_long_crypto_stream_reconnect_is_recorded(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState()
+    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
+    feed._ever_connected = True
+    clock = {"monotonic": 100.0, "time": 1000.0}
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(live_monitor.time, "time", lambda: clock["time"])
+
+    feed._mark_stream_disconnected("Crypto price WebSocket stream ended")
+    clock["monotonic"] = 104.0
+    clock["time"] = 1004.0
+    feed._mark_connected()
+
+    assert feed.disconnect_count == 1
+    assert feed.disconnected_seconds == 4.0
+    assert feed.disconnect_periods == [{
+        "start_ts": 1000.0,
+        "end_ts": 1004.0,
+        "duration_seconds": 4.0,
+        "reason": "Crypto price WebSocket stream ended",
+    }]
+
+
+def test_crypto_stream_end_does_not_backdate_to_last_price(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState(crypto_updated_at=1000.0)
+    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
+    feed._ever_connected = True
+    feed._connected_at = 90.0
+    feed._last_price_at = 100.0
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 102.0)
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1002.0)
+
+    feed._mark_stream_disconnected("Crypto price WebSocket stream ended")
+
+    assert feed._disconnected_since == 102.0
+    assert feed._disconnected_wall_since == 1002.0
+
+
+def test_crypto_stale_disconnect_keeps_last_price_start(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState(crypto_updated_at=1000.0)
+    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
+    feed._ever_connected = True
+    feed._connected_at = 90.0
+    feed._last_price_at = 100.0
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 162.0)
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 1062.0)
+
+    feed._mark_stream_disconnected("Crypto price feed stale for 62.0s")
+
+    assert feed._disconnected_since == 100.0
+    assert feed._disconnected_wall_since == 1000.0
+
+
+def test_short_polymarket_transport_reconnect_is_ignored(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    state = LiveMonitorState()
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+    client._ever_connected = True
+    clock = {"monotonic": 200.0, "time": 2000.0}
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(live_monitor.time, "time", lambda: clock["time"])
+
+    client._mark_disconnected("transport ended without a WebSocket close frame")
+    clock["monotonic"] = 201.0
+    clock["time"] = 2001.0
+    client._mark_connected()
+
+    assert client.disconnect_count == 0
+    assert client.disconnected_seconds == 0.0
+    assert client.disconnect_periods == []
+
+
 def test_disconnect_period_is_clipped_to_contract_window(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/eth-updown-5m-1782658800",
@@ -1773,6 +1883,7 @@ def test_saved_records_are_paginated_newest_first_without_history(tmp_path):
             "question": f"Contract {index:02d}",
             "crypto_symbol": symbol,
             "saved_at": f"2026-01-01T00:{index:02d}:00Z",
+            "history_count": 1,
             "history": [{"t": index, "crypto_price": 100 + index}],
         }
         (saved_dir / f"record-{index:02d}.json").write_text(
@@ -1782,6 +1893,7 @@ def test_saved_records_are_paginated_newest_first_without_history(tmp_path):
 
     first_page = manager.list_saved_page("user-1", page=1, page_size=20)
     second_page = manager.list_saved_page("user-1", page=2, page_size=20)
+    oversized_page = manager.list_saved_page("user-1", page=99, page_size=20)
     btc_page = manager.list_saved_page(
         "user-1",
         category="btc",
@@ -1799,6 +1911,16 @@ def test_saved_records_are_paginated_newest_first_without_history(tmp_path):
     assert "history" not in first_page["records"][0]
     assert first_page["records"][0]["history_count"] == 1
     assert [record["id"] for record in second_page["records"]] == [
+        "record-04",
+        "record-03",
+        "record-02",
+        "record-01",
+        "record-00",
+    ]
+    assert oversized_page["page"] == 2
+    assert oversized_page["has_previous"] is True
+    assert oversized_page["has_next"] is False
+    assert [record["id"] for record in oversized_page["records"]] == [
         "record-04",
         "record-03",
         "record-02",
@@ -1841,7 +1963,7 @@ def test_saved_record_page_reads_metadata_without_full_history_parse(tmp_path):
     assert page["total"] == 1
     assert page["records"][0]["id"] == "record-1"
     assert "history" not in page["records"][0]
-    assert page["records"][0]["history_count"] == 0
+    assert "history_count" not in page["records"][0]
     assert categories == [
         {"id": "btc", "symbol": "btc/usd", "label": "Bitcoin", "count": 1},
     ]

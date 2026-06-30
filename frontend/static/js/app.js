@@ -547,6 +547,7 @@ function initLiveMonitor(){
       const response=await fetch(url,{headers:{Accept:'application/json'}});
       if(!response.ok)throw new Error('Unable to load saved contracts');
       const payload=await response.json(),records=payload.records||[];
+      savedPage=Number(payload.page)||savedPage;
       if(!records.length&&Number(payload.total)>0&&savedPage>1){savedPage-=1;loadSaved();return}
       renderSavedCategories(payload.categories||[]);
       renderSavedPagination(payload);
@@ -564,7 +565,7 @@ function initLiveMonitor(){
         if(record.unsuitable_contract)tags.push('Unsuitable');
         if(record.partial_contract)tags.push('Partial');
         tr.children[5].textContent=(record.winning_outcome||'-')+(tags.length?' - '+tags.join(', '):'');
-        tr.children[6].textContent=String(record.history_count??(record.history||[]).length);
+        tr.children[6].textContent=record.history_count==null?'-':String(record.history_count);
         tr.children[7].textContent=fmtSavedDate(record.saved_at);
         tr.children[8].querySelector('[data-action="open"]').addEventListener('click',()=>openSaved(record.id));
         tr.children[8].querySelector('[data-action="delete"]').addEventListener('click',async()=>{

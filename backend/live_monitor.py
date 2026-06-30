@@ -35,6 +35,7 @@ REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
 CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 60.0
+TRANSIENT_DISCONNECT_GRACE_SECONDS = 3.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
@@ -59,6 +60,7 @@ TARGET_PRICE_DECIMALS_BY_ASSET = {
 }
 
 logger = logging.getLogger(__name__)
+_SAVED_RECORD_PREVIEW_CACHE: dict[Path, dict[str, Any]] = {}
 
 
 @dataclass
@@ -127,6 +129,26 @@ class EmptyOrderBookError(RuntimeError):
 
 class TransientWebSocketDisconnect(ConnectionError):
     pass
+
+
+def _disconnect_period(
+    start_ts: float,
+    end_ts: float,
+    duration: float,
+    reason: str | None,
+) -> dict:
+    period = {
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration_seconds": round(duration, 3),
+    }
+    if reason:
+        period["reason"] = reason
+    return period
+
+
+def _is_recordable_disconnect(duration: float) -> bool:
+    return duration >= TRANSIENT_DISCONNECT_GRACE_SECONDS
 
 
 class PolymarketLiveOrderBook:
@@ -472,15 +494,18 @@ class PolymarketLiveOrderBook:
         if self._disconnected_since is not None:
             now = time.monotonic()
             wall_now = time.time()
-            self.disconnected_seconds += now - self._disconnected_since
-            period = {
-                "start_ts": self._disconnected_wall_since or wall_now,
-                "end_ts": wall_now,
-                "duration_seconds": round(now - self._disconnected_since, 3),
-            }
-            if self._disconnected_reason:
-                period["reason"] = self._disconnected_reason
-            self.disconnect_periods.append(period)
+            duration = now - self._disconnected_since
+            if _is_recordable_disconnect(duration):
+                self.disconnect_count += 1
+                self.disconnected_seconds += duration
+                self.disconnect_periods.append(_disconnect_period(
+                    self._disconnected_wall_since
+                    if self._disconnected_wall_since is not None
+                    else wall_now,
+                    wall_now,
+                    duration,
+                    self._disconnected_reason,
+                ))
             self._disconnected_since = None
             self._disconnected_wall_since = None
             self._disconnected_reason = None
@@ -496,29 +521,31 @@ class PolymarketLiveOrderBook:
             or not self._ever_connected
         ):
             return
-        self.disconnect_count += 1
         self._disconnected_since = time.monotonic()
         self._disconnected_wall_since = time.time()
         self._disconnected_reason = reason
 
     def connection_stats(self) -> dict:
         disconnected_seconds = self.disconnected_seconds
+        disconnect_count = self.disconnect_count
         periods = list(self.disconnect_periods)
         if self._disconnected_since is not None:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            disconnected_seconds += duration
-            period = {
-                "start_ts": self._disconnected_wall_since or wall_now,
-                "end_ts": wall_now,
-                "duration_seconds": round(duration, 3),
-            }
-            if self._disconnected_reason:
-                period["reason"] = self._disconnected_reason
-            periods.append(period)
+            if _is_recordable_disconnect(duration):
+                disconnect_count += 1
+                disconnected_seconds += duration
+                periods.append(_disconnect_period(
+                    self._disconnected_wall_since
+                    if self._disconnected_wall_since is not None
+                    else wall_now,
+                    wall_now,
+                    duration,
+                    self._disconnected_reason,
+                ))
         return {
-            "disconnect_count": self.disconnect_count,
+            "disconnect_count": disconnect_count,
             "disconnected_seconds": round(disconnected_seconds, 3),
             "disconnect_periods": periods,
         }
@@ -529,7 +556,7 @@ class PolymarketLiveOrderBook:
 
     def reset_tracking_stats(self) -> None:
         connected = self._ws is not None and not self._closed
-        self.disconnect_count = 0 if connected else 1
+        self.disconnect_count = 0
         self.disconnected_seconds = 0.0
         self._disconnected_since = None if connected else time.monotonic()
         self._disconnected_wall_since = None if connected else time.time()
@@ -659,11 +686,7 @@ class PolymarketCryptoPriceFeed:
                 raise
             finally:
                 if not self._closed:
-                    self._mark_disconnected(
-                        since=self._last_price_at or self._connected_at,
-                        wall_since=self.state.crypto_updated_at,
-                        reason=disconnect_reason,
-                    )
+                    self._mark_stream_disconnected(disconnect_reason)
                 for task in (listener, watchdog):
                     task.cancel()
                 await asyncio.gather(listener, watchdog, return_exceptions=True)
@@ -717,19 +740,36 @@ class PolymarketCryptoPriceFeed:
         if self._disconnected_since is not None:
             now = time.monotonic()
             wall_now = time.time()
-            self.disconnected_seconds += now - self._disconnected_since
-            period = {
-                "start_ts": self._disconnected_wall_since or wall_now,
-                "end_ts": wall_now,
-                "duration_seconds": round(now - self._disconnected_since, 3),
-            }
-            if self._disconnected_reason:
-                period["reason"] = self._disconnected_reason
-            self.disconnect_periods.append(period)
+            duration = now - self._disconnected_since
+            if _is_recordable_disconnect(duration):
+                self.disconnect_count += 1
+                self.disconnected_seconds += duration
+                self.disconnect_periods.append(_disconnect_period(
+                    self._disconnected_wall_since
+                    if self._disconnected_wall_since is not None
+                    else wall_now,
+                    wall_now,
+                    duration,
+                    self._disconnected_reason,
+                ))
             self._disconnected_since = None
             self._disconnected_wall_since = None
             self._disconnected_reason = None
         self._ever_connected = True
+
+    def _mark_stream_disconnected(self, reason: str | None) -> None:
+        if reason and reason.startswith("Crypto price feed stale"):
+            self._mark_disconnected(
+                since=(
+                    self._last_price_at
+                    if self._last_price_at is not None
+                    else self._connected_at
+                ),
+                wall_since=self.state.crypto_updated_at,
+                reason=reason,
+            )
+            return
+        self._mark_disconnected(reason=reason)
 
     def _mark_disconnected(
         self,
@@ -746,36 +786,40 @@ class PolymarketCryptoPriceFeed:
             or not self._ever_connected
         ):
             return
-        self.disconnect_count += 1
-        self._disconnected_since = since or time.monotonic()
-        self._disconnected_wall_since = wall_since or time.time()
+        self._disconnected_since = since if since is not None else time.monotonic()
+        self._disconnected_wall_since = (
+            wall_since if wall_since is not None else time.time()
+        )
         self._disconnected_reason = reason
 
     def connection_stats(self) -> dict:
         disconnected_seconds = self.disconnected_seconds
+        disconnect_count = self.disconnect_count
         periods = list(self.disconnect_periods)
         if self._disconnected_since is not None:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            disconnected_seconds += duration
-            period = {
-                "start_ts": self._disconnected_wall_since or wall_now,
-                "end_ts": wall_now,
-                "duration_seconds": round(duration, 3),
-            }
-            if self._disconnected_reason:
-                period["reason"] = self._disconnected_reason
-            periods.append(period)
+            if _is_recordable_disconnect(duration):
+                disconnect_count += 1
+                disconnected_seconds += duration
+                periods.append(_disconnect_period(
+                    self._disconnected_wall_since
+                    if self._disconnected_wall_since is not None
+                    else wall_now,
+                    wall_now,
+                    duration,
+                    self._disconnected_reason,
+                ))
         return {
-            "disconnect_count": self.disconnect_count,
+            "disconnect_count": disconnect_count,
             "disconnected_seconds": round(disconnected_seconds, 3),
             "disconnect_periods": periods,
         }
 
     def reset_tracking_stats(self) -> None:
         connected = self._ws is not None and not self._closed
-        self.disconnect_count = 0 if connected else 1
+        self.disconnect_count = 0
         self.disconnected_seconds = 0.0
         self._disconnected_since = None if connected else time.monotonic()
         self._disconnected_wall_since = None if connected else time.time()
@@ -2190,6 +2234,8 @@ class LiveMonitorSession:
             if history
             else self.state.crypto_price
         )
+        first_history_ts = _optional_float(history[0].get("t")) if history else None
+        last_history_ts = _optional_float(history[-1].get("t")) if history else None
         winning_outcome = _winning_outcome(target, final_crypto)
         quality = self._contract_quality(connection_stats, crypto_connection_stats)
         primary = self.tokens_by_id[self.primary_token_id]
@@ -2244,6 +2290,9 @@ class LiveMonitorSession:
             "unsuitable_reason": quality["unsuitable_reason"],
             "partial_contract": quality["partial_contract"],
             "partial_reason": quality["partial_reason"],
+            "history_count": len(history),
+            "first_history_ts": first_history_ts,
+            "last_history_ts": last_history_ts,
             "history": history,
         }
 
@@ -2523,40 +2572,43 @@ class LiveMonitorManager:
         page: int = 1,
         page_size: int = 20,
     ) -> dict:
-        records = _read_saved_record_previews(
-            _saved_records_dir(self.data_root, user_id)
+        record_paths = _read_saved_record_preview_paths(
+            _saved_records_dir(self.data_root, user_id),
+            include_history_stats=False,
         )
         normalized_category = _normalize_saved_category(category)
         if normalized_category:
-            records = [
-                record
-                for record in records
+            record_paths = [
+                (path, record)
+                for path, record in record_paths
                 if _record_saved_category(record)["id"] == normalized_category
             ]
-        newest_first = list(reversed(records))
+        newest_first = list(reversed(record_paths))
         page = max(1, int(page))
         page_size = min(100, max(1, int(page_size)))
         total = len(newest_first)
         total_pages = max(1, (total + page_size - 1) // page_size)
-        start = (page - 1) * page_size
+        current_page = min(page, total_pages)
+        start = (current_page - 1) * page_size
         end = start + page_size
         return {
             "records": [
                 _saved_list_record(record)
-                for record in newest_first[start:end]
+                for _path, record in newest_first[start:end]
             ],
-            "page": page,
+            "page": current_page,
             "page_size": page_size,
             "total": total,
             "total_pages": total_pages,
-            "has_previous": page > 1,
+            "has_previous": current_page > 1,
             "has_next": end < total,
         }
 
     def saved_categories(self, user_id: str) -> list[dict]:
         counts: dict[str, dict] = {}
         for record in _read_saved_record_previews(
-            _saved_records_dir(self.data_root, user_id)
+            _saved_records_dir(self.data_root, user_id),
+            include_history_stats=False,
         ):
             category = _record_saved_category(record)
             bucket = counts.setdefault(
@@ -2589,7 +2641,10 @@ class LiveMonitorManager:
             return 0
         deleted = 0
         directory = _saved_records_dir(self.data_root, user_id)
-        for path, record in _read_saved_record_preview_paths(directory):
+        for path, record in _read_saved_record_preview_paths(
+            directory,
+            include_history_stats=False,
+        ):
             if _record_saved_category(record)["id"] != normalized_category:
                 continue
             path.unlink()
@@ -3069,40 +3124,98 @@ def _read_saved_records(directory: Path) -> list[dict]:
     return sorted(records, key=lambda item: str(item.get("saved_at", "")))
 
 
-def _read_saved_record_previews(directory: Path) -> list[dict]:
+def _read_saved_record_previews(
+    directory: Path,
+    include_history_stats: bool = True,
+) -> list[dict]:
     return [
         record
-        for _path, record in _read_saved_record_preview_paths(directory)
+        for _path, record in _read_saved_record_preview_paths(
+            directory,
+            include_history_stats=include_history_stats,
+        )
     ]
 
 
-def _read_saved_record_preview_paths(directory: Path) -> list[tuple[Path, dict]]:
+def _read_saved_record_preview_paths(
+    directory: Path,
+    include_history_stats: bool = True,
+) -> list[tuple[Path, dict]]:
     if not directory.exists():
         return []
+    if not include_history_stats:
+        return _read_saved_record_metadata_preview_paths(directory)
     records: list[tuple[Path, dict]] = []
     for path in directory.glob("*.json"):
-        record = _read_saved_record_preview(path)
+        record = _read_saved_record_preview(
+            path,
+            include_history_stats=include_history_stats,
+        )
         if record is not None:
             records.append((path, record))
     return sorted(records, key=lambda item: str(item[1].get("saved_at", "")))
 
 
-def _read_saved_record_preview(path: Path) -> dict | None:
+def _read_saved_record_preview(
+    path: Path,
+    include_history_stats: bool = True,
+) -> dict | None:
     metadata = _read_saved_record_metadata(path)
     if not isinstance(metadata, dict):
         return None
-    history_stats = _saved_record_history_stats(path, metadata)
-    preview = {
-        **metadata,
+    preview = dict(metadata)
+    if include_history_stats:
+        preview = _saved_record_with_history_stats(path, preview)
+    if "id" not in preview:
+        preview["id"] = _saved_record_id_from_filename(path)
+    return preview
+
+
+def _read_saved_record_metadata_preview_paths(directory: Path) -> list[tuple[Path, dict]]:
+    signature = _saved_record_directory_signature(directory)
+    cached = _SAVED_RECORD_PREVIEW_CACHE.get(directory)
+    if cached and cached.get("signature") == signature:
+        return [
+            (path, dict(record))
+            for path, record in cached["records"]
+        ]
+
+    records: list[tuple[Path, dict]] = []
+    for path, _mtime_ns, _size in signature:
+        record = _read_saved_record_preview(path, include_history_stats=False)
+        if record is not None:
+            records.append((path, record))
+    records.sort(key=lambda item: str(item[1].get("saved_at", "")))
+    _SAVED_RECORD_PREVIEW_CACHE[directory] = {
+        "signature": signature,
+        "records": [(path, dict(record)) for path, record in records],
+    }
+    return records
+
+
+def _saved_record_directory_signature(directory: Path) -> tuple[tuple[Path, int, int], ...]:
+    if not directory.exists():
+        return ()
+    result = []
+    for path in directory.glob("*.json"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        result.append((path, stat.st_mtime_ns, stat.st_size))
+    return tuple(sorted(result, key=lambda item: item[0].name))
+
+
+def _saved_record_with_history_stats(path: Path, record: dict) -> dict:
+    history_stats = _saved_record_history_stats(path, record)
+    return {
+        **record,
         **{
             key: value
             for key, value in history_stats.items()
             if value is not None or key == "history_count"
         },
     }
-    if "id" not in preview:
-        preview["id"] = _saved_record_id_from_filename(path)
-    return preview
 
 
 def _read_saved_record_metadata(path: Path) -> dict | None:
@@ -3315,7 +3428,7 @@ def _saved_list_record(record: dict) -> dict:
         "category": _record_saved_category(record),
     }
     history = full_record.pop("history", [])
-    if "history_count" not in full_record:
+    if "history_count" not in full_record and isinstance(history, list) and history:
         full_record["history_count"] = len(history) if isinstance(history, list) else 0
     return full_record
 
