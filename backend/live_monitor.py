@@ -46,7 +46,6 @@ LIVE_SNAPSHOT_HISTORY_LIMIT = 180
 SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES = 2 * 1024 * 1024
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
 SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
-SAMPLE_WRITE_QUEUE_SIZE = 5000
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
 PARTIAL_CONTRACT_GRACE_SECONDS = 10
 MAX_ACTIVE_LIVE_MONITORS_PER_USER = 5
@@ -74,6 +73,8 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 LIVE_HISTORY_MEMORY_LIMIT = _env_int("LIVE_MONITOR_HISTORY_MEMORY_LIMIT", 7200)
 LIVE_DISCONNECT_PERIOD_LIMIT = _env_int("LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT", 500)
 LIVE_SUBSCRIBER_QUEUE_SIZE = _env_int("LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE", 50, 1)
+LIVE_STREAM_HISTORY_LIMIT = _env_int("LIVE_MONITOR_STREAM_HISTORY_LIMIT", 60)
+SAMPLE_WRITE_QUEUE_SIZE = _env_int("LIVE_MONITOR_SAMPLE_WRITE_QUEUE_SIZE", 1000, 1)
 SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
     "LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT",
     32,
@@ -956,7 +957,7 @@ class LiveMonitorSession:
             "session",
             f"Started live monitor for {self.event.slug}.",
         )
-        await self._publish("snapshot", self.snapshot())
+        await self._publish_snapshot("snapshot")
 
     async def close(self) -> None:
         self._stopped = True
@@ -982,7 +983,7 @@ class LiveMonitorSession:
             self._sample_writer_task.cancel()
             await asyncio.gather(self._sample_writer_task, return_exceptions=True)
             self._sample_writer_task = None
-        payload = self.snapshot()
+        payload = self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT)
         payload["saved_record"] = saved_record
         await self._publish("status", payload)
 
@@ -1028,7 +1029,7 @@ class LiveMonitorSession:
                     sample_ts + HISTORY_CAPTURE_INTERVAL_SECONDS,
                     3,
                 )
-                await self._publish("tick", self.snapshot())
+                await self._publish_snapshot("tick")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1143,14 +1144,14 @@ class LiveMonitorSession:
             rollover_at = float(self.event.window_end_ts)
             if not next_url:
                 saved = await self.save_finished_record(status="ended")
-                await self._publish("saved", {"record": saved, **self.snapshot()})
+                await self._publish_saved_record(saved)
                 await self._log(
                     "info",
                     "session",
                     "Window ended and no next timestamp could be inferred.",
                 )
                 self.state.quote_status = "ended"
-                await self._publish("ended", self.snapshot())
+                await self._publish_snapshot("ended")
                 self._stopped = True
                 await asyncio.gather(
                     self.polymarket.close(),
@@ -1178,7 +1179,7 @@ class LiveMonitorSession:
                     "session",
                     f"Could not resolve next contract: {self.state.last_error}",
                 )
-                await self._publish("status", self.snapshot())
+                await self._publish_snapshot("status")
                 await asyncio.sleep(3)
                 continue
             saved = self._prepare_finished_record(status="ended")
@@ -1200,7 +1201,10 @@ class LiveMonitorSession:
     def add_subscriber(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=LIVE_SUBSCRIBER_QUEUE_SIZE)
         self._subscribers.add(queue)
-        queue.put_nowait({"event": "snapshot", "data": self.snapshot()})
+        queue.put_nowait({
+            "event": "snapshot",
+            "data": self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
+        })
         return queue
 
     def remove_subscriber(self, queue: asyncio.Queue) -> None:
@@ -1332,7 +1336,14 @@ class LiveMonitorSession:
             logger.warning("[%s] %s", source, message)
         else:
             logger.info("[%s] %s", source, message)
-        await self._publish("log", {"log": entry, **self.snapshot()})
+        if self._subscribers:
+            await self._publish(
+                "log",
+                {
+                    "log": entry,
+                    **self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
+                },
+            )
 
     def _next_window_url(self) -> str | None:
         if self.event.window_start_ts is None or self.event.window_size_seconds is None:
@@ -1430,7 +1441,7 @@ class LiveMonitorSession:
         )
         self._write_meta()
         await self._log("info", "session", f"Switched to next contract: {event.slug}.")
-        await self._publish("rolled", self.snapshot())
+        await self._publish_snapshot("rolled")
 
     async def _handle_update(self, update_type: str, detail: dict) -> None:
         if update_type == "log":
@@ -1462,7 +1473,13 @@ class LiveMonitorSession:
             )
             if not should_publish and not should_sample:
                 return
-            payload = self.snapshot()
+            payload = self.snapshot(
+                history_limit=(
+                    LIVE_STREAM_HISTORY_LIMIT
+                    if should_publish and self._subscribers
+                    else 0
+                )
+            )
             payload["update"] = {
                 "type": update_type,
                 **detail,
@@ -1476,21 +1493,52 @@ class LiveMonitorSession:
                 self._pending_live_update_count = 0
                 await self._publish(update_type, payload)
             return
-        payload = self.snapshot()
+        payload = self.snapshot(
+            history_limit=LIVE_STREAM_HISTORY_LIMIT if self._subscribers else 0
+        )
         payload["update"] = {"type": update_type, **detail}
         self._queue_sample(update_type, detail, payload)
         await self._publish(update_type, payload)
 
     async def _publish(self, event: str, data: dict) -> None:
+        if not self._subscribers:
+            return
         message = {"event": event, "data": data}
-        stale = []
         for queue in self._subscribers:
+            self._put_latest(queue, message)
+
+    @staticmethod
+    def _put_latest(queue: asyncio.Queue, message: dict) -> None:
+        while True:
             try:
                 queue.put_nowait(message)
+                return
             except asyncio.QueueFull:
-                stale.append(queue)
-        for queue in stale:
-            self._subscribers.discard(queue)
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+    async def _publish_snapshot(self, event: str) -> None:
+        if not self._subscribers:
+            return
+        await self._publish(
+            event,
+            self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
+        )
+
+    async def _publish_saved_record(self, record: dict) -> None:
+        if not self._subscribers:
+            return
+        saved_preview = dict(record)
+        saved_preview.pop("history", None)
+        await self._publish(
+            "saved",
+            {
+                "record": saved_preview,
+                **self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
+            },
+        )
 
     def _queue_sample(self, update_type: str, detail: dict, payload: dict) -> None:
         row = {
@@ -2273,7 +2321,7 @@ class LiveMonitorSession:
         try:
             await self._write_finished_record(record)
             if publish_saved:
-                await self._publish("saved", {"record": record, **self.snapshot()})
+                await self._publish_saved_record(record)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2506,7 +2554,13 @@ class LiveMonitorSession:
             ],
         }
 
-    def snapshot(self) -> dict:
+    def snapshot(self, history_limit: int | None = LIVE_SNAPSHOT_HISTORY_LIMIT) -> dict:
+        if history_limit is None:
+            history = list(self._history)
+        elif history_limit <= 0:
+            history = []
+        else:
+            history = list(self._history[-history_limit:])
         return {
             "id": self.id,
             "created_at": self.created_at,
@@ -2544,7 +2598,7 @@ class LiveMonitorSession:
                 }
                 for token_id, quote in self.state.quotes.items()
             ],
-            "history": list(self._history[-LIVE_SNAPSHOT_HISTORY_LIMIT:]),
+            "history": history,
             "history_truncated_count": self._history_truncated_count,
             "history_truncated_before_ts": self._history_truncated_before_ts,
             "history_retention_limit": LIVE_HISTORY_MEMORY_LIMIT,

@@ -30,7 +30,7 @@ from backend.fixed_time import (
     parse_utc_datetime,
     validate_selection,
 )
-from backend.live_monitor import LiveMonitorManager
+from backend.live_monitor import LIVE_STREAM_HISTORY_LIMIT, LiveMonitorManager
 from backend.storage import FileStore
 from backend.strategy_generator import LiveMonitorStrategyGenerator, StrategyGroupGenerator
 from config.settings import ROOT_DIR, settings
@@ -45,7 +45,7 @@ def _live_monitor_session_payload(session) -> dict:
         "session_id": session.id,
         "events_url": f"/api/live-monitors/{session.id}/events",
         "stop_url": f"/api/live-monitors/{session.id}/stop",
-        "snapshot": session.snapshot(),
+        "snapshot": session.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
     }
 
 

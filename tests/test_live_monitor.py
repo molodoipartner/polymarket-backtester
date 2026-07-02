@@ -729,6 +729,88 @@ def test_live_snapshot_limits_history_payload(tmp_path):
     assert session.finished_record(status="ended")["history"][0]["t"] == 0
 
 
+def test_live_snapshot_can_use_smaller_stream_history_limit(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=None,
+        window_end_ts=None,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session._history = [
+        {"t": index, "crypto_price": 100 + index}
+        for index in range(10)
+    ]
+
+    snapshot = session.snapshot(history_limit=3)
+
+    assert [row["t"] for row in snapshot["history"]] == [7, 8, 9]
+
+
+def test_live_stream_queue_keeps_latest_message():
+    queue = asyncio.Queue(maxsize=2)
+
+    LiveMonitorSession._put_latest(queue, {"event": "tick", "data": {"index": 1}})
+    LiveMonitorSession._put_latest(queue, {"event": "tick", "data": {"index": 2}})
+    LiveMonitorSession._put_latest(queue, {"event": "tick", "data": {"index": 3}})
+
+    messages = [queue.get_nowait(), queue.get_nowait()]
+
+    assert [message["data"]["index"] for message in messages] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_saved_stream_event_omits_full_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_monitor, "LIVE_STREAM_HISTORY_LIMIT", 2)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=None,
+        window_end_ts=None,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session._history = [
+        {"t": index, "crypto_price": 100 + index}
+        for index in range(5)
+    ]
+    queue = session.add_subscriber()
+    queue.get_nowait()
+
+    await session._publish_saved_record({
+        "id": "record-1",
+        "slug": "btc-updown-5m-1782639600",
+        "history": [{"t": index} for index in range(100)],
+    })
+
+    message = queue.get_nowait()
+
+    assert message["event"] == "saved"
+    assert "history" not in message["data"]["record"]
+    assert [row["t"] for row in message["data"]["history"]] == [3, 4]
+
+
 def test_crypto_disconnect_metrics_mark_record_partial(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
