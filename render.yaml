@@ -23,6 +23,8 @@ services:
         value: 25
       - key: LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT
         value: 200
+      - key: LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT
+        value: 16
       - key: ALLOWED_HOSTS
         value: "*.onrender.com"
       - key: SESSION_COOKIE_SECURE

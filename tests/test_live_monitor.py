@@ -237,7 +237,7 @@ async def test_top_bid_polymarket_quote_clears_crossed_ask_without_disconnect():
 
 
 @pytest.mark.asyncio
-async def test_non_top_crossed_polymarket_quote_is_still_ignored():
+async def test_high_half_crossed_polymarket_quote_clears_ask_without_disconnect():
     updates = []
 
     async def on_update(kind, detail):
@@ -246,10 +246,67 @@ async def test_non_top_crossed_polymarket_quote_is_still_ignored():
     state = LiveMonitorState(quotes={"token-1": LiveQuote()})
     client = PolymarketLiveOrderBook(["token-1"], state, on_update)
 
-    await client._store_quote("token-1", 0.97, 0.96, 123.0)
+    await client._store_quote(
+        "token-1",
+        0.70,
+        0.69,
+        123.0,
+        bid_size=3.0,
+        ask_size=4.0,
+    )
 
-    assert state.quotes["token-1"].bid is None
+    assert state.quotes["token-1"].bid == 0.70
     assert state.quotes["token-1"].ask is None
+    assert state.quotes["token-1"].bid_size == 3.0
+    assert state.quotes["token-1"].ask_size is None
+    assert state.quotes["token-1"].updated_at == 123.0
+    assert client.disconnect_count == 0
+    assert updates == [("quote", {"token_id": "token-1"})]
+
+
+@pytest.mark.asyncio
+async def test_low_half_crossed_polymarket_quote_clears_bid_without_disconnect():
+    updates = []
+
+    async def on_update(kind, detail):
+        updates.append((kind, detail))
+
+    state = LiveMonitorState(quotes={"no-token": LiveQuote()})
+    client = PolymarketLiveOrderBook(["no-token"], state, on_update)
+
+    await client._store_quote(
+        "no-token",
+        0.31,
+        0.30,
+        123.0,
+        bid_size=3.0,
+        ask_size=4.0,
+    )
+
+    assert state.quotes["no-token"].bid is None
+    assert state.quotes["no-token"].ask == 0.30
+    assert state.quotes["no-token"].bid_size is None
+    assert state.quotes["no-token"].ask_size == 4.0
+    assert state.quotes["no-token"].updated_at == 123.0
+    assert client.disconnect_count == 0
+    assert updates == [("quote", {"token_id": "no-token"})]
+
+
+@pytest.mark.asyncio
+async def test_midpoint_crossed_polymarket_quote_is_recorded():
+    updates = []
+
+    async def on_update(kind, detail):
+        updates.append((kind, detail))
+
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+
+    await client._store_quote("token-1", 0.60, 0.40, 123.0)
+
+    assert state.quotes["token-1"].bid == 0.60
+    assert state.quotes["token-1"].ask == 0.40
+    assert state.quotes["token-1"].updated_at == 123.0
     assert updates == [
         (
             "log",
@@ -257,11 +314,12 @@ async def test_non_top_crossed_polymarket_quote_is_still_ignored():
                 "level": "warning",
                 "source": "polymarket",
                 "message": (
-                    "Ignored crossed Polymarket order book for "
-                    "token-1: bid=0.97, ask=0.96."
+                    "Recorded crossed Polymarket order book for "
+                    "token-1: bid=0.6, ask=0.4."
                 ),
             },
-        )
+        ),
+        ("quote", {"token_id": "token-1"}),
     ]
 
 
@@ -936,28 +994,8 @@ def test_stale_crypto_price_age_is_recorded_on_grid(tmp_path, monkeypatch):
     assert history[-1]["crypto_age_seconds"] == 4.5
 
 
-@pytest.mark.asyncio
-async def test_crypto_watchdog_raises_when_price_feed_goes_stale(monkeypatch):
-    async def on_update(_kind, _detail):
-        return None
-
-    async def immediate_sleep(_seconds):
-        return None
-
-    state = LiveMonitorState()
-    feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
-    feed._last_price_at = live_monitor.time.monotonic() - (
-        live_monitor.CRYPTO_RECONNECT_STALE_AFTER_SECONDS + 1
-    )
-    monkeypatch.setattr(live_monitor.asyncio, "sleep", immediate_sleep)
-
-    with pytest.raises(TimeoutError, match="Crypto price feed stale"):
-        await feed._watchdog()
-
-
-def test_crypto_stale_uses_fast_reconnect_delay():
-    assert live_monitor.CRYPTO_RECONNECT_STALE_AFTER_SECONDS == 3.0
-    assert live_monitor._is_fast_crypto_reconnect(
+def test_crypto_stale_does_not_trigger_fast_reconnect():
+    assert not live_monitor._is_fast_crypto_reconnect(
         "Crypto price feed stale for 3.2s"
     )
     assert live_monitor._is_fast_crypto_reconnect(
@@ -1832,6 +1870,80 @@ def test_live_history_memory_limit_trims_long_running_session(tmp_path, monkeypa
     record = session.finished_record(status="ended")
     assert record["history_truncated_count"] == 2
     assert record["history_truncated_before_ts"] == 1000.5
+
+
+@pytest.mark.asyncio
+async def test_preloaded_history_memory_limit_trims_long_running_preload(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(live_monitor, "LIVE_HISTORY_MEMORY_LIMIT", 3)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/custom-long-contract",
+        slug="custom-long-contract",
+        title="Custom Long Contract",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Custom Long Contract",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    orderbook = PolymarketLiveOrderBook(["token-1"], state, session._handle_update)
+    task = asyncio.create_task(asyncio.sleep(60))
+    preloaded = PreloadedPolymarketOrderBook(event, state, orderbook, task)
+    quote = LiveQuote(bid=0.4, ask=0.45, event_at=1000.0, updated_at=1000.0)
+
+    try:
+        for index in range(5):
+            timestamp = 1000.0 + index * live_monitor.HISTORY_CAPTURE_INTERVAL_SECONDS
+            session._append_preloaded_history_row(
+                preloaded,
+                timestamp,
+                quote,
+                101.0 + index,
+                captured_at=timestamp,
+                crypto_updated_at=timestamp,
+            )
+
+        assert [row["t"] for row in preloaded.history] == [1001.0, 1001.5, 1002.0]
+        assert preloaded.history_truncated_count == 2
+        assert preloaded.history_truncated_before_ts == 1000.5
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_saved_record_preview_cache_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_monitor, "SAVED_RECORD_PREVIEW_CACHE_LIMIT", 2)
+    live_monitor._SAVED_RECORD_PREVIEW_CACHE.clear()
+
+    try:
+        directories = []
+        for index in range(3):
+            directory = tmp_path / f"user-{index}"
+            directory.mkdir()
+            directories.append(directory)
+            (directory / "record.json").write_text(
+                json.dumps({
+                    "id": f"record-{index}",
+                    "saved_at": f"2026-07-02T00:00:0{index}+00:00",
+                }),
+                encoding="utf-8",
+            )
+            live_monitor._read_saved_record_metadata_preview_paths(directory)
+
+        assert len(live_monitor._SAVED_RECORD_PREVIEW_CACHE) == 2
+        assert directories[0] not in live_monitor._SAVED_RECORD_PREVIEW_CACHE
+        assert directories[1] in live_monitor._SAVED_RECORD_PREVIEW_CACHE
+        assert directories[2] in live_monitor._SAVED_RECORD_PREVIEW_CACHE
+    finally:
+        live_monitor._SAVED_RECORD_PREVIEW_CACHE.clear()
 
 
 def test_disconnect_periods_are_bounded(monkeypatch):

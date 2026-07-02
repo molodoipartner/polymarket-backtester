@@ -28,13 +28,13 @@ POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 POLYMARKET_CRYPTO_WS_URL = "wss://ws-live-data.polymarket.com"
 POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
 POLYMARKET_TOP_BID = 0.99
+POLYMARKET_PRICE_MIDPOINT = 0.5
 POLYMARKET_PRICE_EPSILON = 1e-9
 RECONNECT_STABLE_RESET_SECONDS = 60
 RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
-CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 3.0
 CRYPTO_FAST_RECONNECT_DELAY_SECONDS = 0.1
 TRANSIENT_DISCONNECT_GRACE_SECONDS = 3.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
@@ -74,6 +74,11 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 LIVE_HISTORY_MEMORY_LIMIT = _env_int("LIVE_MONITOR_HISTORY_MEMORY_LIMIT", 7200)
 LIVE_DISCONNECT_PERIOD_LIMIT = _env_int("LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT", 500)
 LIVE_SUBSCRIBER_QUEUE_SIZE = _env_int("LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE", 50, 1)
+SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
+    "LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT",
+    32,
+    1,
+)
 
 
 @dataclass
@@ -123,6 +128,8 @@ class PreloadedPolymarketOrderBook:
     target_price_ts: float | None = None
     history_task: asyncio.Task | None = None
     history_stopped: bool = False
+    history_truncated_count: int = 0
+    history_truncated_before_ts: float | None = None
 
 
 @dataclass
@@ -165,10 +172,7 @@ def _is_recordable_disconnect(duration: float) -> bool:
 
 
 def _is_fast_crypto_reconnect(reason: str | None) -> bool:
-    return (
-        reason == "Crypto price WebSocket stream ended"
-        or bool(reason and reason.startswith("Crypto price feed stale"))
-    )
+    return reason == "Crypto price WebSocket stream ended"
 
 
 def _append_limited(items: list, item: Any, limit: int) -> None:
@@ -469,12 +473,11 @@ class PolymarketLiveOrderBook:
                     "level": "warning",
                     "source": "polymarket",
                     "message": (
-                        "Ignored crossed Polymarket order book for "
+                        "Recorded crossed Polymarket order book for "
                         f"{token_id}: bid={bid}, ask={ask}."
                     ),
                 },
             )
-            return
         price_changed = previous.bid != bid or previous.ask != ask
         self.state.quotes[token_id] = LiveQuote(
             bid=bid,
@@ -698,16 +701,9 @@ class PolymarketCryptoPriceFeed:
                     "message": f"Connected to crypto price feed: {self.symbol}.",
                 },
             )
-            listener = asyncio.create_task(self._listen(ws))
-            watchdog = asyncio.create_task(self._watchdog())
             disconnect_reason = "Crypto price WebSocket stream ended"
             try:
-                done, _pending = await asyncio.wait(
-                    (listener, watchdog),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    task.result()
+                await self._listen(ws)
                 raise TransientWebSocketDisconnect(
                     disconnect_reason
                 )
@@ -717,9 +713,6 @@ class PolymarketCryptoPriceFeed:
             finally:
                 if not self._closed:
                     self._mark_stream_disconnected(disconnect_reason)
-                for task in (listener, watchdog):
-                    task.cancel()
-                await asyncio.gather(listener, watchdog, return_exceptions=True)
                 self._ws = None
 
     async def _listen(self, ws) -> None:
@@ -749,17 +742,6 @@ class PolymarketCryptoPriceFeed:
                 "crypto",
                 {"symbol": self.symbol, "price_ts": self.state.crypto_updated_at},
             )
-
-    async def _watchdog(self) -> None:
-        while True:
-            await asyncio.sleep(1)
-            if self._last_price_at is None:
-                continue
-            stale_for = time.monotonic() - self._last_price_at
-            if stale_for > CRYPTO_RECONNECT_STALE_AFTER_SECONDS:
-                raise TimeoutError(
-                    f"Crypto price feed stale for {stale_for:.1f}s"
-                )
 
     def _connection_age(self) -> float:
         if self._connected_at is None:
@@ -1110,11 +1092,10 @@ class LiveMonitorSession:
                                 "warning",
                                 "rest",
                                 (
-                                    "Ignored crossed REST book for "
+                                    "Recorded crossed REST book for "
                                     f"{token_id}: bid={bid}, ask={ask}"
                                 ),
                             )
-                        continue
                     await orderbook._store_quote(
                         token_id,
                         bid,
@@ -1405,6 +1386,10 @@ class LiveMonitorSession:
                 self._history = self._contract_window_history(
                     preloaded.history,
                     event,
+                )
+                self._history_truncated_count = preloaded.history_truncated_count
+                self._history_truncated_before_ts = (
+                    preloaded.history_truncated_before_ts
                 )
                 self._last_history_sample_ts = _optional_float(
                     self._history[-1].get("t")
@@ -1880,6 +1865,24 @@ class LiveMonitorSession:
                 crypto_updated_at=crypto_updated_at,
             )
         )
+        self._trim_preloaded_history_memory(preloaded)
+
+    def _trim_preloaded_history_memory(
+        self,
+        preloaded: PreloadedPolymarketOrderBook,
+    ) -> None:
+        if LIVE_HISTORY_MEMORY_LIMIT <= 0:
+            return
+        overflow = len(preloaded.history) - LIVE_HISTORY_MEMORY_LIMIT
+        if overflow <= 0:
+            return
+        removed = preloaded.history[:overflow]
+        last_removed = removed[-1] if removed else None
+        preloaded.history_truncated_count += overflow
+        preloaded.history_truncated_before_ts = _optional_float(
+            last_removed.get("t") if last_removed else None
+        )
+        del preloaded.history[:overflow]
 
     def _capture_preloaded_history_row(
         self,
@@ -3105,6 +3108,17 @@ def _normalize_polymarket_quote(
     bid_size: float | None = None,
     ask_size: float | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
+    if bid is not None and ask is not None and bid > ask:
+        if (
+            bid > POLYMARKET_PRICE_MIDPOINT + POLYMARKET_PRICE_EPSILON
+            and ask > POLYMARKET_PRICE_MIDPOINT + POLYMARKET_PRICE_EPSILON
+        ):
+            return bid, None, bid_size, None
+        if (
+            bid < POLYMARKET_PRICE_MIDPOINT - POLYMARKET_PRICE_EPSILON
+            and ask < POLYMARKET_PRICE_MIDPOINT - POLYMARKET_PRICE_EPSILON
+        ):
+            return None, ask, None, ask_size
     if bid is not None and (
         POLYMARKET_TOP_BID - POLYMARKET_PRICE_EPSILON
         <= bid
@@ -3279,6 +3293,8 @@ def _read_saved_record_metadata_preview_paths(directory: Path) -> list[tuple[Pat
         "signature": signature,
         "records": [(path, dict(record)) for path, record in records],
     }
+    while len(_SAVED_RECORD_PREVIEW_CACHE) > SAVED_RECORD_PREVIEW_CACHE_LIMIT:
+        _SAVED_RECORD_PREVIEW_CACHE.pop(next(iter(_SAVED_RECORD_PREVIEW_CACHE)))
     return records
 
 
