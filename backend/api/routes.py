@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import math
 import queue
 import shutil
 import tarfile
@@ -22,10 +23,16 @@ from backend.auth import FileSessionStore, hash_password, verify_password
 from backend.backtester import FileBacktester
 from backend.core.jobs import GenerationJobStore
 from backend.data import DataCollector
-from backend.fixed_time import ASSETS, TIMEFRAMES, parse_period, validate_selection
+from backend.fixed_time import (
+    ASSETS,
+    TIMEFRAMES,
+    parse_period,
+    parse_utc_datetime,
+    validate_selection,
+)
 from backend.live_monitor import LiveMonitorManager
 from backend.storage import FileStore
-from backend.strategy_generator import StrategyGroupGenerator
+from backend.strategy_generator import LiveMonitorStrategyGenerator, StrategyGroupGenerator
 from config.settings import ROOT_DIR, settings
 
 router = APIRouter()
@@ -162,6 +169,14 @@ def _trade_summary_from_metrics(metrics: dict) -> dict[str, int]:
         "up": int(metrics.get("up_trade_count", 0)),
         "down": int(metrics.get("down_trade_count", 0)),
     }
+
+
+def _number_or_none(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _reconstructed_strategy_transactions(
@@ -322,6 +337,145 @@ def live_monitor_page(request: Request):
         request,
         "live_monitor.html",
         _context(request),
+    )
+
+
+@router.get("/live-monitor/analysis", response_class=HTMLResponse)
+def live_monitor_analysis_page(
+    request: Request,
+    asset_symbol: str = Query("BTC"),
+    timeframe: str = Query("5m"),
+    include_partial_contracts: bool = Query(False),
+    start_ts: float | None = Query(None),
+    end_ts: float | None = Query(None),
+):
+    _require_user(request)
+    selected_asset = asset_symbol.upper() if asset_symbol.upper() in ASSETS else "BTC"
+    selected_timeframe = timeframe if timeframe in TIMEFRAMES else "5m"
+    return templates.TemplateResponse(
+        request,
+        "live_monitor_analysis.html",
+        _context(
+            request,
+            assets=ASSETS,
+            timeframes={"5m": TIMEFRAMES["5m"]},
+            selected_asset=selected_asset,
+            selected_timeframe=selected_timeframe,
+            include_partial_contracts=include_partial_contracts,
+            selected_start_ts=start_ts,
+            selected_end_ts=end_ts,
+            default_balance=100.0,
+        ),
+    )
+
+
+@router.get("/api/live-monitor/analysis/summary")
+def live_monitor_analysis_summary(
+    request: Request,
+    asset_symbol: str = Query("BTC"),
+    timeframe: str = Query("5m"),
+    include_partial_contracts: bool = Query(False),
+    start_ts: float | None = Query(None),
+    end_ts: float | None = Query(None),
+):
+    user = _require_user(request)
+    generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
+    try:
+        summary = generator.saved_contract_summary(
+            user["id"],
+            asset_symbol,
+            timeframe,
+            include_partial_contracts,
+            start_ts,
+            end_ts,
+        )
+    except ValueError as error:
+        raise HTTPException(422, _error_message(error)) from error
+    return {
+        "summary": summary,
+        "selected_contract_count": summary["selected_contracts"],
+    }
+
+
+@router.post("/live-monitor/analysis")
+def create_live_monitor_analysis_group(
+    request: Request,
+    group_name: Annotated[str, Form()],
+    asset_symbol: Annotated[str, Form()],
+    timeframe: Annotated[str, Form()],
+    strategy_count: Annotated[int, Form()],
+    starting_balance: Annotated[float, Form()],
+    include_partial_contracts: Annotated[bool, Form()] = False,
+    start_ts: Annotated[float | None, Form()] = None,
+    end_ts: Annotated[float | None, Form()] = None,
+):
+    user = _require_user(request)
+    generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
+    try:
+        group = generator.generate(
+            user["id"],
+            group_name,
+            asset_symbol,
+            timeframe,
+            bool(include_partial_contracts),
+            strategy_count,
+            starting_balance,
+            start_ts,
+            end_ts,
+        )
+        request.session["message"] = (
+            f"Created {group['strategy_count']} live-monitor strategies from "
+            f"{group['event_count']} saved contract(s)."
+        )
+        return RedirectResponse(f"/groups/{group['id']}", status_code=303)
+    except (ValueError, OSError) as error:
+        request.session["error"] = str(error)
+    params = {
+        "asset_symbol": asset_symbol,
+        "timeframe": timeframe,
+        "include_partial_contracts": "true" if include_partial_contracts else "false",
+    }
+    if start_ts is not None:
+        params["start_ts"] = str(start_ts)
+    if end_ts is not None:
+        params["end_ts"] = str(end_ts)
+    params = urlencode(params)
+    return RedirectResponse(f"/live-monitor/analysis?{params}", status_code=303)
+
+
+@router.post("/api/live-monitor/analysis/jobs")
+async def start_live_monitor_analysis_job(
+    request: Request,
+    group_name: Annotated[str, Form()],
+    asset_symbol: Annotated[str, Form()],
+    timeframe: Annotated[str, Form()],
+    strategy_count: Annotated[int, Form()],
+    starting_balance: Annotated[float, Form()],
+    include_partial_contracts: Annotated[bool, Form()] = False,
+    start_ts: Annotated[float | None, Form()] = None,
+    end_ts: Annotated[float | None, Form()] = None,
+):
+    user = _require_user(request)
+    job = request.app.state.job_store.create(user["id"])
+    task = asyncio.create_task(
+        _run_live_monitor_analysis_job(
+            request.app,
+            job["id"],
+            user["id"],
+            group_name,
+            asset_symbol,
+            timeframe,
+            bool(include_partial_contracts),
+            strategy_count,
+            starting_balance,
+            start_ts,
+            end_ts,
+        )
+    )
+    _track_job_task(request.app, job["id"], task)
+    return JSONResponse(
+        {"job_id": job["id"], "events_url": f"/api/group-jobs/{job['id']}/events"},
+        status_code=202,
     )
 
 
@@ -689,6 +843,100 @@ async def _run_generation_job(
         report({"stage": "error", "message": f"Group generation failed: {message}"})
 
 
+async def _run_live_monitor_analysis_job(
+    app,
+    job_id: str,
+    user_id: str,
+    group_name: str,
+    asset_symbol: str,
+    timeframe: str,
+    include_partial_contracts: bool,
+    strategy_count: int,
+    starting_balance: float,
+    start_ts: float | None,
+    end_ts: float | None,
+) -> None:
+    def ensure_not_cancelled() -> None:
+        current = app.state.job_store.get(job_id)
+        if current and current.get("status") == "cancelled":
+            raise asyncio.CancelledError
+
+    def report(payload: dict) -> dict:
+        ensure_not_cancelled()
+        return app.state.job_store.append(job_id, payload)
+
+    try:
+        report({
+            "stage": "validation",
+            "message": "Loading saved live-monitor contracts...",
+        })
+        generator = LiveMonitorStrategyGenerator(app.state.store, app.state.live_monitor)
+        summary = await asyncio.to_thread(
+            generator.saved_contract_summary,
+            user_id,
+            asset_symbol,
+            timeframe,
+            include_partial_contracts,
+            start_ts,
+            end_ts,
+        )
+        ensure_not_cancelled()
+        report({
+            "stage": "backtest",
+            "message": (
+                "Starting live-monitor strategy backtests "
+                f"(strategy 0 of {strategy_count}) on "
+                f"{summary['selected_contracts']} contract(s)..."
+            ),
+            "current": 0,
+            "total": strategy_count,
+            "event_count": summary["selected_contracts"],
+        })
+        group = await asyncio.to_thread(
+            generator.generate,
+            user_id,
+            group_name,
+            asset_symbol,
+            timeframe,
+            include_partial_contracts,
+            strategy_count,
+            starting_balance,
+            start_ts,
+            end_ts,
+            report,
+            ensure_not_cancelled,
+        )
+        report({
+            "stage": "complete",
+            "message": "Live-monitor strategy group saved successfully.",
+            "result_url": f"/groups/{group['id']}",
+        })
+    except asyncio.CancelledError:
+        app.state.job_store.append(
+            job_id,
+            {
+                "stage": "cancelled",
+                "message": "Live-monitor analysis generation cancelled by user.",
+            },
+        )
+        raise
+    except Exception as error:
+        message = _error_message(error)
+        app.state.store.log_system(
+            "live_monitor_analysis_generation_failed",
+            {
+                "job_id": job_id,
+                "error": message,
+                "error_type": error.__class__.__name__,
+                "traceback": traceback.format_exc(limit=8),
+            },
+        )
+        report({
+            "stage": "error",
+            "message": f"Live-monitor analysis generation failed: {message}",
+        })
+
+
 @router.get("/groups/{group_id}", response_class=HTMLResponse)
 def group_detail(
     request: Request,
@@ -846,6 +1094,21 @@ def strategy_detail(
         ).days + 1
     except (KeyError, TypeError, ValueError):
         period_days = None
+    live_retest_summary = None
+    if group.get("source") == "live_monitor_saved_contracts":
+        try:
+            live_retest_summary = LiveMonitorStrategyGenerator(
+                store, request.app.state.live_monitor
+            ).saved_contract_summary(
+                user["id"],
+                group["assets"][0],
+                group["timeframe"],
+                bool(group.get("include_partial_contracts", False)),
+                parse_utc_datetime(group["period"]["start_time"]).timestamp(),
+                parse_utc_datetime(group["period"]["end_time_exclusive"]).timestamp(),
+            )
+        except (KeyError, TypeError, ValueError):
+            live_retest_summary = None
     return templates.TemplateResponse(
         request,
         "file_strategy_detail.html",
@@ -857,8 +1120,85 @@ def strategy_detail(
             reconstructed_transactions=reconstructed_transactions,
             test_period_days=period_days,
             chart_equity_curve=_sample_series(strategy.get("equity_curve", [])),
+            live_retest_summary=live_retest_summary,
         ),
     )
+
+
+@router.get("/api/groups/{group_id}/strategies/{strategy_id}/trades/{transaction_id}/contract-chart")
+def strategy_trade_contract_chart(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    transaction_id: str,
+):
+    user = _require_user(request)
+    store = _store(request)
+    group = store.get_user_record(user["id"], "groups", group_id)
+    strategy = store.get_user_record(user["id"], "strategies", strategy_id)
+    transaction = store.get_user_record(user["id"], "transactions", transaction_id)
+    if (
+        not group
+        or not strategy
+        or not transaction
+        or strategy.get("group_id") != group_id
+        or transaction.get("group_id") != group_id
+        or transaction.get("strategy_id") != strategy_id
+        or group.get("source") != "live_monitor_saved_contracts"
+    ):
+        raise HTTPException(404, "Trade contract chart not found")
+    saved_record_id = str(transaction.get("saved_record_id") or "").strip()
+    if not saved_record_id:
+        raise HTTPException(404, "This trade is not linked to a saved live contract")
+    record = request.app.state.live_monitor.get_saved(user["id"], saved_record_id)
+    if not record:
+        raise HTTPException(404, "Saved live contract not found")
+    history = _sample_series(record.get("history") or [], limit=1600)
+    side = str(transaction.get("side") or "").upper()
+    entry_price = _number_or_none(transaction.get("ask_price"))
+    exit_price = _number_or_none(transaction.get("exit_price"))
+    entry_price_cents = round(entry_price * 100, 4) if entry_price is not None else None
+    exit_price_cents = round(exit_price * 100, 4) if exit_price is not None else None
+    entry_yes_axis_cents = (
+        round(100 - entry_price_cents, 4)
+        if side == "DOWN" and entry_price_cents is not None
+        else entry_price_cents
+    )
+    exit_yes_axis_cents = (
+        round(100 - exit_price_cents, 4)
+        if side == "DOWN" and exit_price_cents is not None
+        else exit_price_cents
+    )
+    return {
+        "record": {
+            "id": record.get("id"),
+            "slug": record.get("slug"),
+            "question": record.get("question"),
+            "event_title": record.get("event_title"),
+            "crypto_symbol": record.get("crypto_symbol"),
+            "target_price": record.get("target_price"),
+            "final_crypto_price": record.get("final_crypto_price"),
+            "winning_outcome": record.get("winning_outcome"),
+            "window_start_ts": record.get("window_start_ts"),
+            "window_end_ts": record.get("window_end_ts"),
+            "history": history,
+            "summary": record.get("summary") or {},
+        },
+        "trade": {
+            "id": transaction.get("id"),
+            "side": side,
+            "opened_at": transaction.get("opened_at"),
+            "closed_at": transaction.get("closed_at"),
+            "entry_price": entry_price,
+            "entry_price_cents": entry_price_cents,
+            "entry_yes_axis_cents": entry_yes_axis_cents,
+            "exit_price": exit_price,
+            "exit_price_cents": exit_price_cents,
+            "exit_yes_axis_cents": exit_yes_axis_cents,
+            "pnl": transaction.get("pnl"),
+            "resolved_outcome": transaction.get("resolved_outcome"),
+        },
+    }
 
 
 @router.post("/groups/{group_id}/strategies/{strategy_id}/favorite")
@@ -927,6 +1267,38 @@ async def retest_strategy(
     )
     _track_job_task(request.app, job["id"], task)
     return RedirectResponse(f"/retest-jobs/{job['id']}", status_code=303)
+
+
+@router.post("/groups/{group_id}/strategies/{strategy_id}/live-retest")
+def live_retest_strategy(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    start_ts: Annotated[float, Form()],
+    end_ts: Annotated[float, Form()],
+):
+    user = _require_user(request)
+    store = _store(request)
+    group = store.get_user_record(user["id"], "groups", group_id)
+    strategy = store.get_user_record(user["id"], "strategies", strategy_id)
+    if (
+        not group
+        or not strategy
+        or strategy.get("group_id") != group_id
+        or group.get("source") != "live_monitor_saved_contracts"
+    ):
+        raise HTTPException(404, "Live monitor strategy not found")
+    try:
+        result_group, _result_strategy = LiveMonitorStrategyGenerator(
+            store, request.app.state.live_monitor
+        ).retest(user["id"], group, strategy, start_ts, end_ts)
+        request.session["message"] = (
+            f"Retested live-monitor strategy on {result_group['event_count']} saved contract(s)."
+        )
+        return RedirectResponse(f"/groups/{result_group['id']}", status_code=303)
+    except (ValueError, OSError) as error:
+        request.session["error"] = str(error)
+        return RedirectResponse(f"/groups/{group_id}/strategies/{strategy_id}", status_code=303)
 
 
 @router.get("/retest-jobs/{job_id}", response_class=HTMLResponse)

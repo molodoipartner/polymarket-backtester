@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import tarfile
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -64,6 +65,54 @@ def generate_group(store: FileStore, user: dict, name: str = "Research Pack", co
     return StrategyGroupGenerator(store).generate(
         user["id"], name, ["BTC"], "5m", "2025-01-01", "2025-01-01", count, 10_000,
     )
+
+
+def write_live_monitor_record(
+    store: FileStore,
+    user: dict,
+    record_id: str,
+    index: int,
+    outcome: str = "Up",
+    partial: bool = False,
+    unsuitable: bool = False,
+) -> None:
+    start_ts = 1782639600 + index * 300
+    end_ts = start_ts + 300
+    base_price = 100 + index
+    history = []
+    for second, yes_mid in ((10, 54), (60, 58), (120, 62)):
+        yes_bid = yes_mid - 1
+        yes_ask = yes_mid + 1
+        history.append({
+            "t": start_ts + second,
+            "crypto_price": base_price + (0.08 if outcome == "Up" else -0.08),
+            "target_price": base_price,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "yes_mid": yes_mid,
+            "no_bid": 100 - yes_ask,
+            "no_ask": 100 - yes_bid,
+        })
+    record = {
+        "id": record_id,
+        "question": f"Bitcoin Up or Down {index}",
+        "crypto_symbol": "btc/usd",
+        "slug": f"btc-updown-5m-{start_ts}",
+        "condition_id": f"condition-{record_id}",
+        "saved_at": datetime.fromtimestamp(end_ts, timezone.utc).isoformat(),
+        "window_start_ts": start_ts,
+        "window_end_ts": end_ts,
+        "target_price": base_price,
+        "final_crypto_price": base_price + (0.08 if outcome == "Up" else -0.08),
+        "winning_outcome": outcome,
+        "partial_contract": partial,
+        "unsuitable_contract": unsuitable,
+        "history_count": len(history),
+        "history": history,
+    }
+    saved_dir = store.root / "live_monitor" / "users" / user["id"] / "saved_contracts"
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    (saved_dir / f"{record_id}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
 def test_passwords_users_and_initial_group_state_are_isolated(tmp_path: Path):
@@ -586,6 +635,122 @@ def test_group_creation_post_parses_typed_inputs_and_redirects_to_dashboard(tmp_
     assert group["starting_balance"] == 12500.5
     assert group["assumed_ask_price_cents"] == 42
     assert group["strategy_count"] == 7
+
+
+def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkeypatch):
+    store, user = populated_store(tmp_path)
+    write_live_monitor_record(store, user, "full-up", 0, outcome="Up")
+    write_live_monitor_record(store, user, "partial-down", 1, outcome="Down", partial=True)
+    write_live_monitor_record(store, user, "unsuitable-up", 2, outcome="Up", unsuitable=True)
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        page = client.get("/live-monitor/analysis?asset_symbol=BTC&timeframe=5m")
+        assert page.status_code == 200
+        assert "Saved matching" in page.text
+        assert "Loading saved contracts" in page.text
+        assert 'data-live-analysis-metric="saved_matching">...</strong>' in page.text
+
+        summary = client.get("/api/live-monitor/analysis/summary?asset_symbol=BTC&timeframe=5m")
+        assert summary.status_code == 200
+        assert summary.json()["summary"]["saved_matching"] == 3
+        assert summary.json()["summary"]["selected_contracts"] == 1
+
+        mixed_summary = client.get(
+            "/api/live-monitor/analysis/summary?asset_symbol=BTC&timeframe=5m&include_partial_contracts=true"
+        )
+        assert mixed_summary.status_code == 200
+        assert mixed_summary.json()["summary"]["selected_contracts"] == 2
+
+        started = client.post(
+            "/api/live-monitor/analysis/jobs",
+            data={
+                "group_name": "Live BTC checks",
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "include_partial_contracts": "true",
+                "strategy_count": "4",
+                "starting_balance": "500",
+            },
+        )
+        assert started.status_code == 202
+        stream = client.get(started.json()["events_url"])
+        assert stream.status_code == 200
+        assert '"stage": "validation"' in stream.text
+        assert '"stage": "backtest"' in stream.text
+        assert '"stage": "finalization"' in stream.text
+        assert '"stage": "complete"' in stream.text
+
+        group = store.list_user_records(user["id"], "groups")[-1]
+        assert group["source"] == "live_monitor_saved_contracts"
+        assert group["contracts_available"] == 2
+        assert group["saved_contract_summary"]["unsuitable_contracts"] == 1
+        group_page = client.get(f"/groups/{group['id']}")
+        assert group_page.status_code == 200
+        assert "Live BTC checks" in group_page.text
+        assert "Entry +" in group_page.text
+        strategies = store.list_user_records_filtered(
+            user["id"], "strategies", {"group_id": group["id"]}
+        )
+        assert len(strategies) == 4
+        detail = client.get(f"/groups/{group['id']}/strategies/{strategies[0]['id']}")
+        assert detail.status_code == 200
+        assert "Entry Ask" in detail.text
+        assert "Run live retest" in detail.text
+        assert "data-live-retest-loading" in detail.text
+        assert "data-trade-contract-toggle" in detail.text
+        trades = store.list_user_records_filtered(
+            user["id"], "transactions", {"strategy_id": strategies[0]["id"]}
+        )
+        assert trades
+        chart = client.get(
+            f"/api/groups/{group['id']}/strategies/{strategies[0]['id']}/trades/{trades[0]['id']}/contract-chart"
+        )
+        assert chart.status_code == 200
+        chart_payload = chart.json()
+        assert chart_payload["record"]["id"] == trades[0]["saved_record_id"]
+        assert chart_payload["record"]["history"]
+        assert chart_payload["trade"]["entry_price_cents"] == round(trades[0]["ask_price"] * 100, 4)
+        expected_axis = (
+            round(100 - chart_payload["trade"]["entry_price_cents"], 4)
+            if chart_payload["trade"]["side"] == "DOWN"
+            else chart_payload["trade"]["entry_price_cents"]
+        )
+        assert chart_payload["trade"]["entry_yes_axis_cents"] == expected_axis
+        assert chart_payload["trade"]["exit_price_cents"] in {0.0, 100.0}
+
+        live_retest = client.post(
+            f"/groups/{group['id']}/strategies/{strategies[0]['id']}/live-retest",
+            data={
+                "start_ts": "1782639600",
+                "end_ts": "1782639900",
+            },
+            follow_redirects=True,
+        )
+        assert live_retest.status_code == 200
+        assert "Retest:" in live_retest.text
+        result_group = store.list_user_records(user["id"], "groups")[-1]
+        assert result_group["retest_of_group_id"] == group["id"]
+        assert result_group["event_count"] == 1
+        result_strategy = store.list_user_records_filtered(
+            user["id"], "strategies", {"group_id": result_group["id"]}
+        )[0]
+        assert result_strategy["metrics"]["trade_count"] == 1
+        assert result_strategy["metrics"]["final_capital"] > result_group["starting_balance"]
+        result_trades = store.list_user_records_filtered(
+            user["id"], "transactions", {"strategy_id": result_strategy["id"]}
+        )
+        assert len(result_trades) == 1
+        assert result_trades[0]["saved_record_id"] == "full-up"
 
 
 def test_favorite_and_retest_routes_persist_results(tmp_path: Path, monkeypatch):

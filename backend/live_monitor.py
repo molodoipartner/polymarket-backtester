@@ -34,7 +34,8 @@ RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 2.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
-CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 60.0
+CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 3.0
+CRYPTO_FAST_RECONNECT_DELAY_SECONDS = 0.1
 TRANSIENT_DISCONNECT_GRACE_SECONDS = 3.0
 NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
@@ -61,6 +62,18 @@ TARGET_PRICE_DECIMALS_BY_ASSET = {
 
 logger = logging.getLogger(__name__)
 _SAVED_RECORD_PREVIEW_CACHE: dict[Path, dict[str, Any]] = {}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+LIVE_HISTORY_MEMORY_LIMIT = _env_int("LIVE_MONITOR_HISTORY_MEMORY_LIMIT", 7200)
+LIVE_DISCONNECT_PERIOD_LIMIT = _env_int("LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT", 500)
+LIVE_SUBSCRIBER_QUEUE_SIZE = _env_int("LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE", 50, 1)
 
 
 @dataclass
@@ -149,6 +162,19 @@ def _disconnect_period(
 
 def _is_recordable_disconnect(duration: float) -> bool:
     return duration >= TRANSIENT_DISCONNECT_GRACE_SECONDS
+
+
+def _is_fast_crypto_reconnect(reason: str | None) -> bool:
+    return (
+        reason == "Crypto price WebSocket stream ended"
+        or bool(reason and reason.startswith("Crypto price feed stale"))
+    )
+
+
+def _append_limited(items: list, item: Any, limit: int) -> None:
+    items.append(item)
+    if limit > 0 and len(items) > limit:
+        del items[:len(items) - limit]
 
 
 class PolymarketLiveOrderBook:
@@ -498,14 +524,18 @@ class PolymarketLiveOrderBook:
             if _is_recordable_disconnect(duration):
                 self.disconnect_count += 1
                 self.disconnected_seconds += duration
-                self.disconnect_periods.append(_disconnect_period(
-                    self._disconnected_wall_since
-                    if self._disconnected_wall_since is not None
-                    else wall_now,
-                    wall_now,
-                    duration,
-                    self._disconnected_reason,
-                ))
+                _append_limited(
+                    self.disconnect_periods,
+                    _disconnect_period(
+                        self._disconnected_wall_since
+                        if self._disconnected_wall_since is not None
+                        else wall_now,
+                        wall_now,
+                        duration,
+                        self._disconnected_reason,
+                    ),
+                    LIVE_DISCONNECT_PERIOD_LIMIT,
+                )
             self._disconnected_since = None
             self._disconnected_wall_since = None
             self._disconnected_reason = None
@@ -630,8 +660,8 @@ class PolymarketCryptoPriceFeed:
                 stable_for = self._connection_age()
                 retry = _next_reconnect_attempt(retry, stable_for)
                 delay = (
-                    0.1
-                    if self.state.last_error == "Crypto price WebSocket stream ended"
+                    CRYPTO_FAST_RECONNECT_DELAY_SECONDS
+                    if _is_fast_crypto_reconnect(self.state.last_error)
                     else _reconnect_delay(retry)
                 )
                 await asyncio.sleep(delay)
@@ -744,14 +774,18 @@ class PolymarketCryptoPriceFeed:
             if _is_recordable_disconnect(duration):
                 self.disconnect_count += 1
                 self.disconnected_seconds += duration
-                self.disconnect_periods.append(_disconnect_period(
-                    self._disconnected_wall_since
-                    if self._disconnected_wall_since is not None
-                    else wall_now,
-                    wall_now,
-                    duration,
-                    self._disconnected_reason,
-                ))
+                _append_limited(
+                    self.disconnect_periods,
+                    _disconnect_period(
+                        self._disconnected_wall_since
+                        if self._disconnected_wall_since is not None
+                        else wall_now,
+                        wall_now,
+                        duration,
+                        self._disconnected_reason,
+                    ),
+                    LIVE_DISCONNECT_PERIOD_LIMIT,
+                )
             self._disconnected_since = None
             self._disconnected_wall_since = None
             self._disconnected_reason = None
@@ -893,6 +927,8 @@ class LiveMonitorSession:
         self._subscribers: set[asyncio.Queue] = set()
         self._write_lock = asyncio.Lock()
         self._history: list[dict] = []
+        self._history_truncated_count = 0
+        self._history_truncated_before_ts: float | None = None
         self._quote_timeline: dict[str, list[LiveQuote]] = {
             token.token_id: [] for token in event.tokens
         }
@@ -949,11 +985,7 @@ class LiveMonitorSession:
         if preloaded is not None:
             close_tasks.append(preloaded.orderbook.close())
         await asyncio.gather(*close_tasks, return_exceptions=True)
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks = []
+        await self._cancel_runtime_tasks()
         if self._sample_writer_task:
             try:
                 await asyncio.wait_for(
@@ -971,6 +1003,28 @@ class LiveMonitorSession:
         payload = self.snapshot()
         payload["saved_record"] = saved_record
         await self._publish("status", payload)
+
+    def _prune_tasks(self) -> None:
+        self._tasks = [task for task in self._tasks if not task.done()]
+
+    async def _cancel_runtime_tasks(
+        self,
+        exclude: asyncio.Task | None = None,
+    ) -> None:
+        tasks = [
+            task
+            for task in self._tasks
+            if task is not exclude and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks = [
+            task
+            for task in self._tasks
+            if task is exclude and not task.done()
+        ]
 
     async def _sampler_loop(self) -> None:
         while not self._stopped:
@@ -1116,6 +1170,13 @@ class LiveMonitorSession:
                 )
                 self.state.quote_status = "ended"
                 await self._publish("ended", self.snapshot())
+                self._stopped = True
+                await asyncio.gather(
+                    self.polymarket.close(),
+                    self.crypto.close(),
+                    return_exceptions=True,
+                )
+                await self._cancel_runtime_tasks(exclude=asyncio.current_task())
                 return
             preloaded = self._take_preloaded_next(next_url)
             try:
@@ -1153,9 +1214,10 @@ class LiveMonitorSession:
                     self._save_prepared_finished_record(saved, publish_saved=True)
                 )
             )
+            self._prune_tasks()
 
     def add_subscriber(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=LIVE_SUBSCRIBER_QUEUE_SIZE)
         self._subscribers.add(queue)
         queue.put_nowait({"event": "snapshot", "data": self.snapshot()})
         return queue
@@ -1205,6 +1267,7 @@ class LiveMonitorSession:
             preload_state,
             handle_preload_update,
         )
+        self._prune_tasks()
         task = asyncio.create_task(orderbook.run())
         self._tasks.append(task)
         self._preloaded_next = PreloadedPolymarketOrderBook(
@@ -1320,6 +1383,8 @@ class LiveMonitorSession:
         if target_price is not None:
             self._target_price_ts = started_at_ts or event.window_start_ts or time.time()
         self._history = []
+        self._history_truncated_count = 0
+        self._history_truncated_before_ts = None
         self._saved = False
         self._last_history_sample_ts = None
         self._next_history_sample_ts = None
@@ -1364,6 +1429,7 @@ class LiveMonitorSession:
                 self.state,
                 self._handle_update,
             )
+            self._prune_tasks()
             self._tasks.append(asyncio.create_task(self.polymarket.run()))
         if self.state.target_price is not None:
             self._refresh_history_targets()
@@ -1757,8 +1823,23 @@ class LiveMonitorSession:
                 crypto_updated_at=crypto_updated_at,
             )
         )
+        self._trim_history_memory()
         self._trim_quote_timeline(self.primary_token_id)
         self._trim_crypto_timeline()
+
+    def _trim_history_memory(self) -> None:
+        if LIVE_HISTORY_MEMORY_LIMIT <= 0:
+            return
+        overflow = len(self._history) - LIVE_HISTORY_MEMORY_LIMIT
+        if overflow <= 0:
+            return
+        removed = self._history[:overflow]
+        last_removed = removed[-1] if removed else None
+        self._history_truncated_count += overflow
+        self._history_truncated_before_ts = _optional_float(
+            last_removed.get("t") if last_removed else None
+        )
+        del self._history[:overflow]
 
     def _append_preloaded_history_row(
         self,
@@ -2206,6 +2287,7 @@ class LiveMonitorSession:
             return None
 
         orderbook.attach(orderbook.state, ignore_update)
+        self._prune_tasks()
         self._tasks.append(asyncio.create_task(orderbook.close()))
 
     async def save_finished_record(self, status: str) -> dict:
@@ -2293,6 +2375,9 @@ class LiveMonitorSession:
             "history_count": len(history),
             "first_history_ts": first_history_ts,
             "last_history_ts": last_history_ts,
+            "history_truncated_count": self._history_truncated_count,
+            "history_truncated_before_ts": self._history_truncated_before_ts,
+            "history_retention_limit": LIVE_HISTORY_MEMORY_LIMIT,
             "history": history,
         }
 
@@ -2457,6 +2542,9 @@ class LiveMonitorSession:
                 for token_id, quote in self.state.quotes.items()
             ],
             "history": list(self._history[-LIVE_SNAPSHOT_HISTORY_LIMIT:]),
+            "history_truncated_count": self._history_truncated_count,
+            "history_truncated_before_ts": self._history_truncated_before_ts,
+            "history_retention_limit": LIVE_HISTORY_MEMORY_LIMIT,
             "samples_path": str(self.samples_path),
             "saved_path": str(self.saved_dir),
             "logs": list(self._logs[-100:]),
@@ -2532,6 +2620,7 @@ class LiveMonitorManager:
         for session_id in session_ids:
             session = self.sessions.get(session_id)
             if session is None or session.user_id != user_id or session.is_finished:
+                self.sessions.pop(session_id, None)
                 continue
             active.append(session)
             kept_ids.append(session_id)

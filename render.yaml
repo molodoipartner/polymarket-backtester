@@ -17,6 +17,12 @@ services:
         value: /var/data/polymarket-backtester
       - key: WORKERS
         value: 1
+      - key: LIVE_MONITOR_HISTORY_MEMORY_LIMIT
+        value: 1800
+      - key: LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE
+        value: 25
+      - key: LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT
+        value: 200
       - key: ALLOWED_HOSTS
         value: "*.onrender.com"
       - key: SESSION_COOKIE_SECURE

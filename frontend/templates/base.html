@@ -14,7 +14,7 @@
       <a href="{{ '/admin' if is_admin else '/' }}" class="font-semibold tracking-wide"><span class="text-neon">POLY</span> LAB</a>
       {% if user %}
       <nav class="flex items-center gap-4 text-sm text-slate-300">
-        {% if is_admin %}<a href="/admin" class="hover:text-neon">Admin</a>{% else %}<a href="/" class="hover:text-neon">Groups</a><a href="/saved-strategies" class="hover:text-neon">Favorites</a><a href="/groups/new" class="hover:text-neon">New group</a><a href="/live-monitor" class="hover:text-neon">Live monitor</a>{% endif %}
+        {% if is_admin %}<a href="/admin" class="hover:text-neon">Admin</a>{% else %}<a href="/" class="hover:text-neon">Groups</a><a href="/saved-strategies" class="hover:text-neon">Favorites</a><a href="/groups/new" class="hover:text-neon">New group</a><a href="/live-monitor" class="hover:text-neon">Live monitor</a><a href="/live-monitor/analysis" class="hover:text-neon">Live analysis</a>{% endif %}
         <span class="hidden text-slate-500 sm:inline">{{ user.display_name }}</span>
         <form method="post" action="/logout"><button class="text-slate-400 hover:text-white">Log out</button></form>
       </nav>

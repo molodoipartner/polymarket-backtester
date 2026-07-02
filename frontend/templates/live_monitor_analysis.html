@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Live monitor analysis - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="mb-8 flex flex-wrap items-end justify-between gap-5">
+  <div>
+    <p class="eyebrow">Saved live contracts</p>
+    <h1>Live monitor strategy analysis</h1>
+    <p class="mt-3 max-w-3xl text-slate-300">Generate simple strategy families from saved 5m monitor records. Contracts marked unsuitable are always excluded.</p>
+  </div>
+  <a class="secondary" href="/live-monitor">Live monitor</a>
+</div>
+
+<form id="live-analysis-filter-form" method="get" action="/live-monitor/analysis" class="panel mb-6" data-summary-url="/api/live-monitor/analysis/summary">
+  <div class="section-title"><div><p class="eyebrow">Data scope</p><h2>Saved contract filter</h2></div><div class="flex items-center gap-3"><span id="live-analysis-summary-status" class="badge">Loading</span><button class="secondary" type="submit">Update counts</button></div></div>
+  <div class="grid gap-4 md:grid-cols-3">
+    <label>Crypto
+      <select name="asset_symbol">
+        {% for symbol,label in assets.items() %}<option value="{{ symbol }}" {{ 'selected' if selected_asset == symbol }}>{{ symbol }} - {{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Timeframe
+      <select name="timeframe">
+        {% for value,label in timeframes.items() %}<option value="{{ value }}" {{ 'selected' if selected_timeframe == value }}>{{ value }} - {{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="market-choice self-end"><input type="checkbox" name="include_partial_contracts" value="true" {{ 'checked' if include_partial_contracts }}><span><strong>Include partial</strong><small>Full and partial suitable contracts</small></span></label>
+  </div>
+</form>
+
+<section id="live-analysis-summary-loading" class="panel mb-6" aria-live="polite">
+  <div class="section-title"><div><p class="eyebrow">Live analysis</p><h2>Loading saved contracts</h2></div><span class="badge">Working</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:35%"></div></div>
+  <div class="live-log mt-5"><p>Scanning saved live-monitor records...</p></div>
+</section>
+
+<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5" aria-live="polite">
+  {% for label,key in [('Saved matching','saved_matching'),('Available','available_contracts'),('Full contracts','full_contracts'),('Partial','partial_contracts'),('Unsuitable skipped','unsuitable_contracts')] %}<div class="metric-card"><p>{{ label }}</p><strong data-live-analysis-metric="{{ key }}">...</strong></div>{% endfor %}
+</section>
+
+<form id="live-analysis-generation-form" method="post" action="/live-monitor/analysis" class="panel mt-6" data-job-url="/api/live-monitor/analysis/jobs">
+  <div class="mb-5 flex gap-4"><span class="builder-step">1</span><div><p class="eyebrow">Generation</p><h2>Strategy setup</h2><p class="mt-2 muted"><span data-live-range-count data-live-range-count-format="number">...</span> contract(s) will be used with the current filter.</p></div></div>
+  <input type="hidden" name="asset_symbol" value="{{ selected_asset }}">
+  <input type="hidden" name="timeframe" value="{{ selected_timeframe }}">
+  {% if include_partial_contracts %}<input type="hidden" name="include_partial_contracts" value="true">{% endif %}
+  <div id="live-analysis-range" class="live-range mb-6 hidden" data-live-time-range data-contracts="[]" data-min-ts="" data-max-ts="" data-selected-start-ts="{{ selected_start_ts or '' }}" data-selected-end-ts="{{ selected_end_ts or '' }}">
+    <div class="section-title"><div><h2>Contract time window</h2><p class="muted">Drag both handles to choose the saved-contract interval.</p></div><span class="badge" data-live-range-count>...</span></div>
+    <input type="hidden" name="start_ts" data-live-range-start-hidden>
+    <input type="hidden" name="end_ts" data-live-range-end-hidden>
+    <div class="live-range-values"><strong data-live-range-start-label></strong><span>{{ selected_timeframe }}</span><strong data-live-range-end-label></strong></div>
+    <div class="live-range-slider">
+      <div class="live-range-fill" data-live-range-fill></div>
+      <input type="range" min="0" max="1" step="1" data-live-range-start>
+      <input type="range" min="0" max="1" step="1" data-live-range-end>
+    </div>
+  </div>
+  <div class="grid gap-4 md:grid-cols-2">
+    <label>Group name<input name="group_name" maxlength="80" value="Live_{{ selected_asset }}_5m" required></label>
+    <label>Starting balance<input type="number" name="starting_balance" min="1" step="0.01" value="{{ '%.2f'|format(default_balance) }}" required></label>
+    <label>Number of strategies<input type="number" name="strategy_count" min="1" max="300" value="12" required><small class="muted">Quote momentum/reversal and crypto breakout/reversion families</small></label>
+    <label>Contract mode<input data-live-analysis-contract-mode value="{{ 'Full + partial suitable contracts' if include_partial_contracts else 'Full suitable contracts only' }}" disabled><small class="muted">Unsuitable contracts are never used.</small></label>
+  </div>
+  <button class="primary mt-6" type="submit" disabled>Generate live-monitor strategies</button>
+</form>
+
+<section id="live-analysis-progress" class="panel mt-6 hidden" aria-live="polite">
+  <div class="section-title"><div><p class="eyebrow">Live generation</p><h2>Backend progress</h2></div><div class="flex items-center gap-3"><button id="live-analysis-cancel" class="danger hidden" type="button">Stop / Cancel</button><span id="live-analysis-progress-status" class="badge">Starting</span></div></div>
+  <div class="progress-track"><div id="live-analysis-progress-bar" class="progress-fill" style="width:0%"></div></div>
+  <div class="mt-5 grid gap-3 md:grid-cols-3">
+    <div class="progress-step" data-live-analysis-stage="validation"><span>1</span><p>Loading saved live-monitor contracts...</p></div>
+    <div class="progress-step" data-live-analysis-stage="backtest"><span>2</span><p>Running strategy backtests...</p></div>
+    <div class="progress-step" data-live-analysis-stage="finalization"><span>3</span><p>Calculating balances and saving the group...</p></div>
+  </div>
+  <div id="live-analysis-live-log" class="live-log mt-5"></div>
+</section>
+{% endblock %}

@@ -429,6 +429,7 @@ def test_manager_tracks_active_sessions_per_user(tmp_path):
     session_1._stopped = True
     assert manager.active_sessions("user-1") == [session_2]
     assert manager.active_by_user["user-1"] == ["session-2"]
+    assert "session-1" not in manager.sessions
 
 
 @pytest.mark.asyncio
@@ -952,6 +953,17 @@ async def test_crypto_watchdog_raises_when_price_feed_goes_stale(monkeypatch):
 
     with pytest.raises(TimeoutError, match="Crypto price feed stale"):
         await feed._watchdog()
+
+
+def test_crypto_stale_uses_fast_reconnect_delay():
+    assert live_monitor.CRYPTO_RECONNECT_STALE_AFTER_SECONDS == 3.0
+    assert live_monitor._is_fast_crypto_reconnect(
+        "Crypto price feed stale for 3.2s"
+    )
+    assert live_monitor._is_fast_crypto_reconnect(
+        "Crypto price WebSocket stream ended"
+    )
+    assert not live_monitor._is_fast_crypto_reconnect("temporary DNS failure")
 
 
 def test_crypto_price_payload_reads_nested_timestamp():
@@ -1784,6 +1796,59 @@ def test_finished_record_completes_full_five_minute_half_second_grid(tmp_path):
     assert {1000.0, 1000.5, 1001.0}.issubset(times)
     assert history[times.index(1000.0)]["target_price"] == 100.0
     assert history[times.index(999.5)]["target_price"] is None
+
+
+def test_live_history_memory_limit_trims_long_running_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_monitor, "LIVE_HISTORY_MEMORY_LIMIT", 3)
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/custom-long-contract",
+        slug="custom-long-contract",
+        title="Custom Long Contract",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Custom Long Contract",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    quote = LiveQuote(bid=0.4, ask=0.45, event_at=1000.0, updated_at=1000.0)
+
+    for index in range(5):
+        timestamp = 1000.0 + index * live_monitor.HISTORY_CAPTURE_INTERVAL_SECONDS
+        session._append_history_row(
+            timestamp,
+            quote,
+            101.0 + index,
+            captured_at=timestamp,
+            crypto_updated_at=timestamp,
+        )
+
+    assert [row["t"] for row in session._history] == [1001.0, 1001.5, 1002.0]
+    assert session._history_truncated_count == 2
+    record = session.finished_record(status="ended")
+    assert record["history_truncated_count"] == 2
+    assert record["history_truncated_before_ts"] == 1000.5
+
+
+def test_disconnect_periods_are_bounded(monkeypatch):
+    monkeypatch.setattr(live_monitor, "LIVE_DISCONNECT_PERIOD_LIMIT", 2)
+    periods = []
+
+    for index in range(4):
+        live_monitor._append_limited(
+            periods,
+            {"start_ts": index, "end_ts": index + 1},
+            live_monitor.LIVE_DISCONNECT_PERIOD_LIMIT,
+        )
+
+    assert periods == [
+        {"start_ts": 2, "end_ts": 3},
+        {"start_ts": 3, "end_ts": 4},
+    ]
 
 
 def test_history_sample_does_not_use_future_quote_update(tmp_path):

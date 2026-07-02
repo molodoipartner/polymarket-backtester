@@ -31,6 +31,37 @@ const timeTick=value=>{
   return date.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'.'+String(ms).padStart(3,'0');
 };
 const timeScale={type:'linear',ticks:{color:text,maxTicksLimit:8,callback:timeTick},grid:{color:grid}};
+const finiteNumber=value=>{
+  if(value===null||value===undefined||value==='')return null;
+  const number=Number(value);
+  return Number.isFinite(number)?number:null;
+};
+const liveContractSeries=(history,key)=>history.map(row=>{
+  const timestamp=finiteNumber(row.t),value=finiteNumber(row[key]);
+  return timestamp===null?null:{x:timestamp*1000,y:value};
+}).filter(Boolean);
+const hasLiveContractValues=(history,key)=>history.some(row=>finiteNumber(row[key])!==null);
+const liveCryptoScale=history=>{
+  const values=history.map(row=>finiteNumber(row.crypto_price)).filter(value=>value!==null);
+  const min=Math.min(...values),max=Math.max(...values);
+  const scale={type:'linear',position:'left',ticks:{color:text,callback:v=>'$'+v.toLocaleString()},grid:{color:grid}};
+  if(Number.isFinite(min)&&Number.isFinite(max)){
+    const padding=Math.max((max-min)*0.2,Math.abs(max||min)*0.00002,0.000001);
+    scale.min=min-padding;
+    scale.max=max+padding;
+  }
+  return scale;
+};
+const liveContractChartDatasets=(history,extra=[])=>{
+  const datasets=[
+    {label:'Crypto',data:liveContractSeries(history,'crypto_price'),borderColor:neon,backgroundColor:'#29f19c12',yAxisID:'crypto',pointRadius:0,tension:.2,parsing:false}
+  ];
+  if(hasLiveContractValues(history,'target_price'))datasets.push({label:'Target',data:liveContractSeries(history,'target_price'),borderColor:'#8293aa',borderDash:[5,5],yAxisID:'crypto',pointRadius:0,tension:0,parsing:false});
+  if(hasLiveContractValues(history,'yes_bid'))datasets.push({label:'YES bid',data:liveContractSeries(history,'yes_bid'),borderColor:'#60a5fa',backgroundColor:'#60a5fa12',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false});
+  if(hasLiveContractValues(history,'yes_ask'))datasets.push({label:'YES ask',data:liveContractSeries(history,'yes_ask'),borderColor:'#fbbf24',backgroundColor:'#fbbf2412',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false});
+  return datasets.concat(extra);
+};
+const liveContractChartOptions=history=>({animation:false,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):''}}},scales:{x:timeScale,crypto:liveCryptoScale(history),contract:{type:'linear',position:'right',min:0,max:100,ticks:{color:text,callback:v=>v.toFixed(0)+'c'},grid:{drawOnChartArea:false,color:grid}}}});
 function createEquityChart(rows,elementId,trades=[]){
   const element=document.getElementById(elementId);if(!element)return;
   const values=sampleLTTB(rows.map(row=>({x:new Date(row.t).getTime(),y:Number(row.value)})).filter(point=>Number.isFinite(point.x)&&Number.isFinite(point.y)));
@@ -50,6 +81,64 @@ function createAdvancedCharts(rows,trades,tradeSummary=null){
   const drawdownElement=document.getElementById('strategy-drawdown'),outcomesElement=document.getElementById('strategy-outcomes');
   if(drawdownElement){let peak=0;const values=sampleLTTB(rows.map(row=>{peak=Math.max(peak,row.value);return{x:new Date(row.t).getTime(),y:peak?-(peak-row.value)/peak*100:0}}));replaceChart(drawdownElement,{type:'line',data:{datasets:[{label:'Drawdown %',data:values,borderColor:'#ff647c',backgroundColor:'#ff647c18',fill:true,pointRadius:0,tension:.15,parsing:false}]},options:{animation:false,normalized:true,responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:timeScale,y:{ticks:{color:text,callback:value=>value.toFixed(1)+'%'},grid:{color:grid}}}}})}
   if(outcomesElement){const wins=tradeSummary?tradeSummary.wins:trades.filter(trade=>trade.pnl>0).length,losses=tradeSummary?tradeSummary.losses:trades.filter(trade=>trade.pnl<0).length,flat=tradeSummary?tradeSummary.flat:trades.length-wins-losses;replaceChart(outcomesElement,{type:'doughnut',data:{labels:['Profitable','Losing','Flat'],datasets:[{data:[wins,losses,flat],backgroundColor:[neon,'#ff647c','#8293aa'],borderColor:'#0d1b2d',borderWidth:3}]},options:{animation:false,responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:text}}}}})}
+}
+function drawTradeContractChart(canvas,payload){
+  if(!canvas)return null;
+  const record=payload.record||{},trade=payload.trade||{},history=(record.history||[]).filter(row=>Number.isFinite(Number(row.t)));
+  const point=(timestamp,value)=>({x:Date.parse(timestamp),y:Number(value)});
+  const side=String(trade.side||'').toUpperCase();
+  const entryY=Number.isFinite(Number(trade.entry_yes_axis_cents))?Number(trade.entry_yes_axis_cents):null;
+  const exitY=Number.isFinite(Number(trade.exit_yes_axis_cents))?Number(trade.exit_yes_axis_cents):null;
+  const entry=Number.isFinite(entryY)?[point(trade.opened_at,entryY)]:[];
+  const exit=Number.isFinite(exitY)?[point(trade.closed_at,exitY)]:[];
+  const entryColor=side==='DOWN'?'#ff647c':neon;
+  return replaceChart(canvas,{type:'line',data:{datasets:liveContractChartDatasets(history,[
+    {label:side+' entry',type:'scatter',data:entry,backgroundColor:entryColor,borderColor:'#07111f',borderWidth:3,yAxisID:'contract',pointStyle:'triangle',rotation:side==='DOWN'?180:0,pointRotation:side==='DOWN'?180:0,pointRadius:13,pointHoverRadius:15,order:-20,parsing:false},
+    {label:'Expiration exit',type:'scatter',data:exit,backgroundColor:Number(trade.pnl)>=0?neon:'#ff647c',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointRadius:8,pointHoverRadius:10,order:-10,parsing:false}
+  ])},options:liveContractChartOptions(history)});
+}
+function initStrategyTradeContractCharts(){
+  document.querySelectorAll('[data-trade-contract-toggle]').forEach(button=>{
+    button.addEventListener('click',async()=>{
+      const detailRow=button.closest('tr')?.nextElementSibling;
+      if(!detailRow||!detailRow.matches('[data-trade-contract-row]'))return;
+      const isOpen=!detailRow.classList.contains('hidden');
+      if(isOpen){detailRow.classList.add('hidden');button.textContent='Open';return}
+      detailRow.classList.remove('hidden');button.textContent='Hide';
+      const status=detailRow.querySelector('[data-trade-contract-status]'),wrap=detailRow.querySelector('[data-trade-contract-chart-wrap]'),canvas=detailRow.querySelector('[data-trade-contract-chart]');
+      if(detailRow.dataset.loaded==='true'){if(wrap)wrap.classList.remove('hidden');return}
+      if(status)status.textContent='Loading';
+      try{
+        const response=await fetch(button.dataset.chartUrl,{headers:{Accept:'application/json'}});
+        const payload=await response.json();
+        if(!response.ok)throw new Error(payload.detail||'Unable to load contract chart');
+        const record=payload.record||{},trade=payload.trade||{};
+        const title=detailRow.querySelector('[data-trade-contract-title]'),symbol=detailRow.querySelector('[data-trade-contract-symbol]'),meta=detailRow.querySelector('[data-trade-contract-meta]');
+        if(title)title.textContent=record.question||record.slug||'Saved contract';
+        if(symbol)symbol.textContent=(record.crypto_symbol||'Live contract')+' / '+(trade.side||'trade');
+        const entryCents=Number(trade.entry_price_cents);
+        const axisCents=Number(trade.entry_yes_axis_cents);
+        if(meta)meta.textContent='Entry '+new Date(trade.opened_at).toLocaleString()+' at '+(Number.isFinite(entryCents)?entryCents.toFixed(2):'-')+'c ('+(Number.isFinite(axisCents)?axisCents.toFixed(2):'-')+'c on YES axis); exit at expiration '+new Date(trade.closed_at).toLocaleString()+'.';
+        if(wrap)wrap.classList.remove('hidden');
+        drawTradeContractChart(canvas,payload);
+        detailRow.dataset.loaded='true';
+        if(status)status.textContent='Loaded';
+      }catch(error){
+        if(status)status.textContent='Failed';
+        const meta=detailRow.querySelector('[data-trade-contract-meta]');
+        if(meta)meta.textContent=error.message;
+      }
+    });
+  });
+}
+function initLiveRetestLoading(){
+  document.querySelectorAll('[data-live-retest-form]').forEach(form=>{
+    form.addEventListener('submit',()=>{
+      const button=form.querySelector('button[type="submit"]'),loading=form.querySelector('[data-live-retest-loading]');
+      if(button){button.disabled=true;button.textContent='Retest running...'}
+      if(loading)loading.classList.remove('hidden');
+    });
+  });
 }
 
 function initGroupGeneration(){
@@ -176,6 +265,194 @@ function initFavoriteForms(){
       }
     });
   });
+}
+function setupLiveTimeRange(panel){
+  if(!panel)return false;
+  const startInput=panel.querySelector('[data-live-range-start]'),endInput=panel.querySelector('[data-live-range-end]');
+  const startHidden=panel.querySelector('[data-live-range-start-hidden]'),endHidden=panel.querySelector('[data-live-range-end-hidden]');
+  const startLabel=panel.querySelector('[data-live-range-start-label]'),endLabel=panel.querySelector('[data-live-range-end-label]');
+  const fill=panel.querySelector('[data-live-range-fill]');
+  if(!startInput||!endInput)return false;
+  let contracts=[];
+  try{contracts=JSON.parse(panel.dataset.contracts||'[]')}catch(error){contracts=[]}
+  const min=Number(panel.dataset.minTs),max=Number(panel.dataset.maxTs);
+  if(!Number.isFinite(min)||!Number.isFinite(max)||max<=min)return false;
+  const clamp=value=>Math.min(max,Math.max(min,Number(value)));
+  const initialStart=Number.isFinite(Number(panel.dataset.selectedStartTs))?Number(panel.dataset.selectedStartTs):min;
+  const initialEnd=Number.isFinite(Number(panel.dataset.selectedEndTs))?Number(panel.dataset.selectedEndTs):max;
+  startInput.min=String(Math.floor(min));startInput.max=String(Math.ceil(max));
+  endInput.min=String(Math.floor(min));endInput.max=String(Math.ceil(max));
+  startInput.value=Math.floor(clamp(initialStart));
+  endInput.value=Math.ceil(clamp(initialEnd));
+  const formatTs=value=>{
+    const date=new Date(Number(value)*1000);
+    return Number.isFinite(date.getTime())?date.toLocaleString():'-';
+  };
+  const setCount=count=>{
+    document.querySelectorAll('[data-live-range-count]').forEach(element=>{
+      element.textContent=element.dataset.liveRangeCountFormat==='number'?String(count):count+' selected';
+    });
+  };
+  const selectedCount=(start,end)=>contracts.filter(contract=>{
+    const contractStart=Number(contract.start_ts),contractEnd=Number(contract.end_ts);
+    return Number.isFinite(contractStart)&&Number.isFinite(contractEnd)&&contractStart>=start&&contractEnd<=end;
+  }).length;
+  const render=changed=>{
+    let start=clamp(startInput.value),end=clamp(endInput.value);
+    if(start>end){
+      if(changed===startInput)end=start;
+      else start=end;
+    }
+    startInput.value=Math.floor(start);endInput.value=Math.ceil(end);
+    if(startHidden)startHidden.value=String(startInput.value);
+    if(endHidden)endHidden.value=String(endInput.value);
+    if(startLabel)startLabel.textContent=formatTs(startInput.value);
+    if(endLabel)endLabel.textContent=formatTs(endInput.value);
+    if(fill){
+      const left=(Number(startInput.value)-min)/(max-min)*100,right=(Number(endInput.value)-min)/(max-min)*100;
+      fill.style.left=Math.max(0,Math.min(100,left))+'%';
+      fill.style.width=Math.max(0,Math.min(100,right)-Math.max(0,Math.min(100,left)))+'%';
+    }
+    setCount(selectedCount(Number(startInput.value),Number(endInput.value)));
+  };
+  panel._liveRangeRender=render;
+  if(!panel._liveRangeBound){
+    startInput.addEventListener('input',()=>panel._liveRangeRender&&panel._liveRangeRender(startInput));
+    endInput.addEventListener('input',()=>panel._liveRangeRender&&panel._liveRangeRender(endInput));
+    panel._liveRangeBound=true;
+  }
+  render(null);
+  return true;
+}
+function initLiveTimeRanges(){
+  document.querySelectorAll('[data-live-time-range]').forEach(setupLiveTimeRange);
+}
+function initLiveAnalysis(){
+  const filterForm=document.getElementById('live-analysis-filter-form'),generationForm=document.getElementById('live-analysis-generation-form');
+  if(!filterForm||!generationForm)return;
+  const summaryStatus=document.getElementById('live-analysis-summary-status'),loadingPanel=document.getElementById('live-analysis-summary-loading');
+  const rangePanel=document.getElementById('live-analysis-range'),submitButton=generationForm.querySelector('button[type="submit"]');
+  const progressPanel=document.getElementById('live-analysis-progress'),progressStatus=document.getElementById('live-analysis-progress-status'),progressBar=document.getElementById('live-analysis-progress-bar'),progressLog=document.getElementById('live-analysis-live-log'),cancelButton=document.getElementById('live-analysis-cancel');
+  let summaryController=null,activeSource=null,activeJobId=null;
+  const setSummaryStatus=(text,mode='')=>{if(summaryStatus){summaryStatus.textContent=text;summaryStatus.className='badge '+mode}};
+  const appendProgress=message=>{if(!progressLog||!message)return;const row=document.createElement('p');row.textContent=new Date().toLocaleTimeString()+'  '+message;progressLog.appendChild(row);while(progressLog.childElementCount>250)progressLog.firstElementChild.remove();progressLog.scrollTop=progressLog.scrollHeight};
+  const closeSource=()=>{if(activeSource){activeSource.close();activeSource=null}};
+  const syncGenerationFields=()=>{
+    const asset=filterForm.querySelector('[name="asset_symbol"]')?.value||'BTC';
+    const timeframe=filterForm.querySelector('[name="timeframe"]')?.value||'5m';
+    generationForm.querySelector('input[name="asset_symbol"]').value=asset;
+    generationForm.querySelector('input[name="timeframe"]').value=timeframe;
+    const groupName=generationForm.querySelector('input[name="group_name"]');
+    if(groupName&&!groupName.dataset.touched)groupName.value='Live_'+asset+'_5m';
+    const include=!!filterForm.querySelector('[name="include_partial_contracts"]')?.checked;
+    let hidden=generationForm.querySelector('input[name="include_partial_contracts"]');
+    if(include&&!hidden){hidden=document.createElement('input');hidden.type='hidden';hidden.name='include_partial_contracts';hidden.value='true';generationForm.appendChild(hidden)}
+    else if(!include&&hidden)hidden.remove();
+    const mode=generationForm.querySelector('[data-live-analysis-contract-mode]');
+    if(mode)mode.value=include?'Full + partial suitable contracts':'Full suitable contracts only';
+  };
+  const summaryParams=()=>{
+    const params=new URLSearchParams(new FormData(filterForm));
+    if(!filterForm.querySelector('[name="include_partial_contracts"]')?.checked)params.delete('include_partial_contracts');
+    return params;
+  };
+  const renderSummary=payload=>{
+    const summary=payload.summary||{};
+    document.querySelectorAll('[data-live-analysis-metric]').forEach(element=>{
+      const value=summary[element.dataset.liveAnalysisMetric];
+      element.textContent=Number.isFinite(Number(value))?Number(value).toLocaleString():String(value??'-');
+      element.classList.toggle('loss',element.dataset.liveAnalysisMetric==='partial_contracts'&&Number(value)>0||element.dataset.liveAnalysisMetric==='unsuitable_contracts'&&Number(value)>0);
+    });
+    document.querySelectorAll('[data-live-range-count]').forEach(element=>{
+      const count=Number(summary.selected_contracts)||0;
+      element.textContent=element.dataset.liveRangeCountFormat==='number'?String(count):count+' selected';
+    });
+    if(rangePanel&&summary.range_start_ts&&summary.range_end_ts){
+      rangePanel.classList.remove('hidden');
+      rangePanel.dataset.contracts=JSON.stringify(summary.contracts||[]);
+      rangePanel.dataset.minTs=String(summary.range_start_ts);
+      rangePanel.dataset.maxTs=String(summary.range_end_ts);
+      rangePanel.dataset.selectedStartTs=String(summary.selected_start_ts||summary.range_start_ts);
+      rangePanel.dataset.selectedEndTs=String(summary.selected_end_ts||summary.range_end_ts);
+      setupLiveTimeRange(rangePanel);
+    }else if(rangePanel){
+      rangePanel.classList.add('hidden');
+    }
+    if(submitButton)submitButton.disabled=(Number(summary.selected_contracts)||0)<=0;
+  };
+  const loadSummary=async(updateUrl=false)=>{
+    syncGenerationFields();
+    if(summaryController)summaryController.abort();
+    summaryController=new AbortController();
+    setSummaryStatus('Loading');
+    if(loadingPanel)loadingPanel.classList.remove('hidden');
+    if(submitButton)submitButton.disabled=true;
+    const params=summaryParams();
+    try{
+      const response=await fetch((filterForm.dataset.summaryUrl||'/api/live-monitor/analysis/summary')+'?'+params.toString(),{headers:{Accept:'application/json'},signal:summaryController.signal});
+      const payload=await response.json();
+      if(!response.ok)throw new Error(payload.detail||'Unable to load live analysis summary');
+      renderSummary(payload);
+      setSummaryStatus('Ready');
+      if(loadingPanel)loadingPanel.classList.add('hidden');
+      if(updateUrl)history.replaceState(null,'',filterForm.action+'?'+params.toString());
+    }catch(error){
+      if(error.name==='AbortError')return;
+      setSummaryStatus('Failed','loss');
+      if(loadingPanel){loadingPanel.classList.remove('hidden');const log=loadingPanel.querySelector('.live-log');if(log)log.innerHTML='<p>Summary failed: '+error.message+'</p>'}
+    }
+  };
+  const renderProgress=payload=>{
+    const stages=['validation','backtest','finalization'],index=stages.indexOf(payload.stage);
+    progressPanel?.querySelectorAll('[data-live-analysis-stage]').forEach((element,position)=>{
+      element.classList.toggle('complete',payload.stage==='complete'||position<index);
+      element.classList.toggle('active',position===index);
+      element.classList.toggle('failed',payload.stage==='error'||payload.stage==='cancelled');
+    });
+    if(payload.stage==='validation'){progressBar.style.width='20%';progressStatus.textContent='Step 1 / 3'}
+    else if(payload.stage==='backtest'&&payload.total){progressBar.style.width=(35+payload.current/payload.total*45)+'%';progressStatus.textContent=payload.current+' / '+payload.total}
+    else if(payload.stage==='backtest'){progressBar.style.width='35%';progressStatus.textContent='Step 2 / 3'}
+    else if(payload.stage==='finalization'){progressBar.style.width='88%';progressStatus.textContent='Step 3 / 3'}
+    else if(payload.stage==='complete'){progressBar.style.width='100%';progressStatus.textContent='Complete'}
+    else if(payload.stage==='error'){progressStatus.textContent='Failed';progressBar.style.width='100%'}
+    else if(payload.stage==='cancelled'){progressStatus.textContent='Cancelled';progressBar.style.width='100%'}
+    if(payload.message)appendProgress(payload.message);
+  };
+  if(generationForm.querySelector('input[name="group_name"]'))generationForm.querySelector('input[name="group_name"]').addEventListener('input',event=>{event.currentTarget.dataset.touched='true'});
+  filterForm.addEventListener('submit',event=>{event.preventDefault();loadSummary(true)});
+  filterForm.querySelectorAll('select,input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>loadSummary(true)));
+  generationForm.addEventListener('submit',async event=>{
+    event.preventDefault();closeSource();syncGenerationFields();
+    if(progressPanel)progressPanel.classList.remove('hidden');
+    if(progressLog)progressLog.textContent='';
+    renderProgress({stage:'validation',message:'Creating live-monitor analysis job...'});
+    if(submitButton){submitButton.disabled=true;submitButton.textContent='Generation in progress...'}
+    try{
+      const response=await fetch(generationForm.dataset.jobUrl||'/api/live-monitor/analysis/jobs',{method:'POST',body:new FormData(generationForm),headers:{Accept:'application/json'}});
+      const payload=await response.json();
+      if(!response.ok)throw new Error(payload.detail||'Unable to start live analysis generation');
+      activeJobId=payload.job_id;
+      if(cancelButton){cancelButton.classList.remove('hidden');cancelButton.disabled=false;cancelButton.textContent='Stop / Cancel'}
+      activeSource=new EventSource(payload.events_url);
+      activeSource.addEventListener('progress',message=>{
+        const data=JSON.parse(message.data);renderProgress(data);
+        if(data.stage==='complete'){closeSource();if(cancelButton)cancelButton.classList.add('hidden');setTimeout(()=>window.location.assign(data.result_url),500)}
+        else if(data.stage==='error'||data.stage==='cancelled'){closeSource();if(cancelButton)cancelButton.classList.add('hidden');if(submitButton){submitButton.disabled=false;submitButton.textContent='Generate live-monitor strategies'}}
+      });
+      activeSource.onerror=()=>appendProgress('The live progress connection was interrupted; reconnecting...');
+    }catch(error){
+      renderProgress({stage:'error',message:error.message});
+      if(submitButton){submitButton.disabled=false;submitButton.textContent='Generate live-monitor strategies'}
+    }
+  });
+  if(cancelButton)cancelButton.addEventListener('click',async()=>{
+    if(!activeJobId)return;
+    cancelButton.disabled=true;cancelButton.textContent='Cancelling...';
+    renderProgress({stage:'cancelled',message:'Cancellation requested. Stopping active backend work...'});
+    try{await fetch('/api/group-jobs/'+activeJobId+'/cancel',{method:'POST',headers:{Accept:'application/json'}})}catch(error){appendProgress('Cancel request failed: '+error.message)}
+  });
+  window.addEventListener('pagehide',()=>{closeSource();if(summaryController)summaryController.abort()},{once:true});
+  loadSummary(false);
 }
 function initLiveMonitor(){
   const panel=document.getElementById('live-monitor');if(!panel)return;
@@ -347,14 +624,8 @@ function initLiveMonitor(){
   };
   const drawSavedChart=record=>{
     if(!savedChartElement)return;
-    const history=(record.history||[]).filter(row=>Number.isFinite(row.t));
-    const series=key=>history.map(row=>({x:Number(row.t)*1000,y:Number.isFinite(row[key])?Number(row[key]):null}));
-    savedChart=replaceChart(savedChartElement,{type:'line',data:{datasets:[
-      {label:'Crypto',data:series('crypto_price'),borderColor:neon,backgroundColor:'#29f19c12',yAxisID:'crypto',pointRadius:0,tension:.2,parsing:false},
-      {label:'Target',data:series('target_price'),borderColor:'#8293aa',borderDash:[5,5],yAxisID:'crypto',pointRadius:0,tension:0,parsing:false},
-      {label:'YES bid',data:series('yes_bid'),borderColor:'#60a5fa',backgroundColor:'#60a5fa12',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false},
-      {label:'YES ask',data:series('yes_ask'),borderColor:'#fbbf24',backgroundColor:'#fbbf2412',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false}
-    ]},options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):''}}},scales:{x:timeScale,crypto:{type:'linear',position:'left',ticks:{color:text,callback:v=>'$'+v.toLocaleString()},grid:{color:grid}},contract:{type:'linear',position:'right',min:0,max:100,ticks:{color:text,callback:v=>v.toFixed(0)+'c'},grid:{drawOnChartArea:false,color:grid}}}}});
+    const history=(record.history||[]).filter(row=>finiteNumber(row.t)!==null);
+    savedChart=replaceChart(savedChartElement,{type:'line',data:{datasets:liveContractChartDatasets(history)},options:liveContractChartOptions(history)});
   };
   const renderSavedDetail=record=>{
     if(!savedDetail)return;
@@ -737,4 +1008,4 @@ function initLocalDataTools(){
   tokenForm&&tokenForm.addEventListener('submit',saveToken);
 }
 window.addEventListener('pagehide',()=>{chartInstances.forEach(chart=>chart.destroy());chartInstances.clear()},{once:true});
-document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveMonitor();initLocalDataTools()});
+document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initLiveRetestLoading();initLiveMonitor();initLocalDataTools()});
