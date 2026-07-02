@@ -1766,6 +1766,36 @@ class LiveMonitorSession:
         preloaded.target_price_ts = price_ts
         return True
 
+    def _ensure_target_price_from_history(self) -> bool:
+        if self.state.target_price is not None:
+            return False
+        lock_after = self._target_lock_after_ts()
+        for row in self._history:
+            timestamp = _optional_float(row.get("t"))
+            if timestamp is None:
+                continue
+            if lock_after is not None and timestamp + 1e-6 < lock_after:
+                continue
+            crypto_price = _optional_float(row.get("crypto_price"))
+            if crypto_price is None:
+                continue
+            crypto_updated_at = _optional_float(row.get("crypto_updated_at"))
+            price_ts = (
+                crypto_updated_at
+                if (
+                    crypto_updated_at is not None
+                    and (
+                        lock_after is None
+                        or crypto_updated_at + 1e-6 >= lock_after
+                    )
+                )
+                else timestamp
+            )
+            self.state.target_price = self._price_to_beat(crypto_price)
+            self._target_price_ts = price_ts
+            return True
+        return False
+
     def _refresh_history_targets(self) -> None:
         self._refresh_history_targets_for(
             self._history,
@@ -2337,7 +2367,7 @@ class LiveMonitorSession:
         async def ignore_update(_update_type: str, _detail: dict) -> None:
             return None
 
-        orderbook.attach(orderbook.state, ignore_update)
+        orderbook.attach(LiveMonitorState(), ignore_update)
         self._prune_tasks()
         self._tasks.append(asyncio.create_task(orderbook.close()))
 
@@ -2356,6 +2386,7 @@ class LiveMonitorSession:
             connection_stats,
             crypto_connection_stats,
         )
+        self._ensure_target_price_from_history()
         self._refresh_history_targets()
         history = self._complete_history_grid(
             self._contract_window_history(list(self._history), self.event),
@@ -3570,6 +3601,7 @@ def _record_saved_category(record: dict) -> dict:
 
 
 def _with_saved_category(record: dict) -> dict:
+    record = _record_with_target_fallback(record)
     return {
         **record,
         **_record_partial_fields(record),
@@ -3590,6 +3622,66 @@ def _saved_list_record(record: dict) -> dict:
     if "history_count" not in full_record and isinstance(history, list) and history:
         full_record["history_count"] = len(history) if isinstance(history, list) else 0
     return full_record
+
+
+def _record_with_target_fallback(record: dict) -> dict:
+    if _optional_float(record.get("target_price")) is not None:
+        return record
+    history = record.get("history")
+    if not isinstance(history, list):
+        return record
+    window_start = _optional_float(record.get("window_start_ts"))
+    target_row: dict | None = None
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        timestamp = _optional_float(row.get("t"))
+        crypto_price = _optional_float(row.get("crypto_price"))
+        if timestamp is None or crypto_price is None:
+            continue
+        if window_start is not None and timestamp + 1e-6 < window_start:
+            continue
+        target_row = row
+        break
+    if target_row is None:
+        return record
+    target_ts = _optional_float(target_row.get("t"))
+    crypto_price = _optional_float(target_row.get("crypto_price"))
+    if target_ts is None or crypto_price is None:
+        return record
+    target = _price_to_beat(crypto_price, str(record.get("crypto_symbol") or ""))
+    patched = dict(record)
+    patched["target_price"] = target
+    patched["target_price_ts"] = round(target_ts, 3)
+    patched["target_price_time"] = _format_history_time(target_ts)
+    patched_history = []
+    for row in history:
+        if not isinstance(row, dict):
+            patched_history.append(row)
+            continue
+        item = dict(row)
+        timestamp = _optional_float(item.get("t"))
+        if timestamp is not None and timestamp + 1e-6 >= target_ts:
+            item["target_price"] = target
+            item["target_price_ts"] = round(target_ts, 3)
+            row_crypto = _optional_float(item.get("crypto_price"))
+            item["deviation_pct"] = (
+                round((row_crypto - target) / target * 100, 4)
+                if row_crypto is not None and target
+                else None
+            )
+        patched_history.append(item)
+    patched["history"] = patched_history
+    final_crypto = _optional_float(patched.get("final_crypto_price"))
+    if final_crypto is None:
+        for row in reversed(patched_history):
+            if isinstance(row, dict):
+                final_crypto = _optional_float(row.get("crypto_price"))
+                if final_crypto is not None:
+                    patched["final_crypto_price"] = final_crypto
+                    break
+    patched["winning_outcome"] = _winning_outcome(target, final_crypto)
+    return patched
 
 
 def _record_connection_fields(record: dict) -> dict:

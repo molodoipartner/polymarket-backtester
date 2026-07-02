@@ -533,6 +533,43 @@ async def test_manager_stop_clears_active_session(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_closing_previous_orderbook_does_not_finish_live_session(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1782639600",
+        slug="btc-updown-5m-1782639600",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=1782639600,
+        window_end_ts=1782639900,
+    )
+    manager = LiveMonitorManager(tmp_path)
+    session = manager.sessions["session-1"] = LiveMonitorSession(
+        "session-1",
+        "user-1",
+        event,
+        tmp_path,
+    )
+    manager.active_by_user["user-1"] = ["session-1"]
+    session.state.quote_status = "ready"
+
+    session._close_orderbook_soon(session.polymarket)
+    await asyncio.gather(*session._tasks, return_exceptions=True)
+    session._prune_tasks()
+
+    assert session.state.quote_status == "ready"
+    assert manager.active_sessions("user-1") == [session]
+
+
+@pytest.mark.asyncio
 async def test_manager_rejects_more_than_five_active_sessions(tmp_path):
     manager = LiveMonitorManager(tmp_path)
     event = ResolvedPolymarketEvent(
@@ -1169,6 +1206,77 @@ def test_target_price_uses_dogecoin_precision(tmp_path):
 
     assert session.state.target_price == 0.072516
     assert session._history[0]["target_price"] == 0.072516
+
+
+def test_finished_record_falls_back_to_first_history_price_for_missing_target(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/doge-updown-5m-1000",
+        slug="doge-updown-5m-1000",
+        title="Dogecoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Dogecoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="doge/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    session.started_at_ts = 999.0
+    quote = LiveQuote(bid=0.4, ask=0.45, event_at=1000.0, updated_at=1000.0)
+    session._history = [
+        session._history_row(
+            1000.0,
+            quote,
+            0.0741234,
+            captured_at=1000.0,
+            crypto_updated_at=990.0,
+        ),
+        session._history_row(
+            1300.0,
+            quote,
+            0.075,
+            captured_at=1300.0,
+            crypto_updated_at=1299.0,
+        ),
+    ]
+
+    record = session.finished_record(status="ended")
+
+    assert record["target_price"] == 0.074123
+    assert record["target_price_ts"] == 1000.0
+    assert record["winning_outcome"] == "Up"
+    assert record["history"][0]["target_price"] == 0.074123
+
+
+def test_saved_record_with_missing_target_is_repaired_from_history():
+    record = live_monitor._with_saved_category({
+        "id": "record-1",
+        "slug": "doge-updown-5m-1000",
+        "question": "Dogecoin Up or Down",
+        "crypto_symbol": "doge/usd",
+        "window_start_ts": 1000,
+        "window_end_ts": 1300,
+        "target_price": None,
+        "winning_outcome": None,
+        "history": [
+            {"t": 999.5, "crypto_price": 0.073},
+            {"t": 1000.0, "crypto_price": 0.0741234},
+            {"t": 1300.0, "crypto_price": 0.075},
+        ],
+    })
+
+    assert record["target_price"] == 0.074123
+    assert record["target_price_ts"] == 1000.0
+    assert record["winning_outcome"] == "Up"
+    assert record["history"][0].get("target_price") is None
+    assert record["history"][1]["target_price"] == 0.074123
+    assert record["summary"]["final_deviation_pct"] is not None
 
 
 def test_late_history_capture_records_current_sample_only(tmp_path):
