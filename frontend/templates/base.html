@@ -14,7 +14,7 @@
       <a href="{{ '/admin' if is_admin else '/' }}" class="font-semibold tracking-wide"><span class="text-neon">POLY</span> LAB</a>
       {% if user %}
       <nav class="flex items-center gap-4 text-sm text-slate-300">
-        {% if is_admin %}<a href="/admin" class="hover:text-neon">Admin</a>{% else %}<a href="/" class="hover:text-neon">Groups</a><a href="/saved-strategies" class="hover:text-neon">Favorites</a><a href="/groups/new" class="hover:text-neon">New group</a><a href="/live-monitor" class="hover:text-neon">Live monitor</a><a href="/live-monitor/analysis" class="hover:text-neon">Live analysis</a>{% endif %}
+        {% if is_admin %}<a href="/admin" class="hover:text-neon">Admin</a>{% else %}<a href="/" class="hover:text-neon">Groups</a><a href="/saved-strategies" class="hover:text-neon">Favorites</a><a href="/groups/new" class="hover:text-neon">New group</a><a href="/live-monitor" class="hover:text-neon">Live monitor</a><a href="/live-monitor/quality" class="hover:text-neon">Data quality</a><a href="/live-monitor/analysis" class="hover:text-neon">Live analysis</a>{% endif %}<a href="/account" class="hover:text-neon">Account</a>
         <span class="hidden text-slate-500 sm:inline">{{ user.display_name }}</span>
         <form method="post" action="/logout"><button class="text-slate-400 hover:text-white">Log out</button></form>
       </nav>
@@ -27,7 +27,7 @@
     {% block content %}{% endblock %}
   </main>
   {% if local_data_tools %}
-  <button id="local-data-open" class="local-data-open" type="button">Data</button>
+  <button id="local-data-open" class="local-data-open" type="button" data-local-data-open>Data</button>
   <div id="local-data-backdrop" class="local-data-backdrop hidden"></div>
   <aside id="local-data-drawer" class="local-data-drawer hidden" aria-label="Local data">
     <div class="local-data-header">

@@ -33,11 +33,20 @@ POLYMARKET_PRICE_EPSILON = 1e-9
 RECONNECT_STABLE_RESET_SECONDS = 60
 RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
-WS_STALE_POLL_AFTER_SECONDS = 2.0
+WS_STALE_POLL_AFTER_SECONDS = 8.0
+REST_QUOTE_FAILURE_COOLDOWN_SECONDS = 15.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
+CRYPTO_RESUBSCRIBE_STALE_AFTER_SECONDS = 20.0
+CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 20.0
+CRYPTO_HEARTBEAT_INTERVAL_SECONDS = 5.0
+CRYPTO_HEARTBEAT_TIMEOUT_SECONDS = 5.0
+CRYPTO_PROVIDER_TIMESTAMP_MAX_AGE_SECONDS = 20.0
 CRYPTO_FAST_RECONNECT_DELAY_SECONDS = 0.1
-TRANSIENT_DISCONNECT_GRACE_SECONDS = 3.0
-NEXT_CONTRACT_PRECONNECT_SECONDS = 10.0
+TRANSIENT_DISCONNECT_GRACE_SECONDS = 30.0
+GAMMA_REQUEST_MAX_ATTEMPTS = 6
+GAMMA_REQUEST_BASE_DELAY_SECONDS = 0.75
+GAMMA_TARGET_CHECK_CONCURRENCY = 3
+NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
 LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
@@ -48,6 +57,8 @@ SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
 SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
 SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
 PARTIAL_CONTRACT_GRACE_SECONDS = 10
+TARGET_PRICE_LOCK_GRACE_SECONDS = 0.0
+HISTORY_INITIAL_MISSING_GRACE_SECONDS = 5.0
 MAX_ACTIVE_LIVE_MONITORS_PER_USER = 5
 TARGET_PRICE_DECIMALS_BY_ASSET = {
     "btc": 2,
@@ -80,6 +91,7 @@ SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
     32,
     1,
 )
+LIVE_COALESCABLE_EVENTS = {"snapshot", "quote", "crypto", "status", "tick"}
 
 
 @dataclass
@@ -168,12 +180,80 @@ def _disconnect_period(
     return period
 
 
-def _is_recordable_disconnect(duration: float) -> bool:
-    return duration >= TRANSIENT_DISCONNECT_GRACE_SECONDS
+def _is_recordable_disconnect(duration: float, reason: str | None = None) -> bool:
+    if duration >= TRANSIENT_DISCONNECT_GRACE_SECONDS:
+        return True
+    return bool(
+        reason
+        and (
+            reason.startswith("Crypto WebSocket ping timeout")
+            or reason.startswith("Crypto price feed stale")
+        )
+    )
 
 
 def _is_fast_crypto_reconnect(reason: str | None) -> bool:
     return reason == "Crypto price WebSocket stream ended"
+
+
+def _is_gamma_retryable_status(status_code: int | None) -> bool:
+    return status_code == 429 or (status_code is not None and status_code >= 500)
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return max(0.0, retry_at.timestamp() - time.time())
+
+
+def _gamma_retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
+    if response is not None:
+        retry_after = _retry_after_seconds(response)
+        if retry_after is not None:
+            return min(30.0, retry_after)
+    base = GAMMA_REQUEST_BASE_DELAY_SECONDS * (2 ** attempt)
+    jitter = random.uniform(0, GAMMA_REQUEST_BASE_DELAY_SECONDS)
+    return min(30.0, base + jitter)
+
+
+async def _gamma_get_json(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    *,
+    attempts: int = GAMMA_REQUEST_MAX_ATTEMPTS,
+) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        response: httpx.Response | None = None
+        try:
+            response = await client.get(
+                f"{settings.gamma_api_url}/events",
+                params=params,
+            )
+            status_code = getattr(response, "status_code", None)
+            if _is_gamma_retryable_status(status_code):
+                if attempt + 1 >= attempts:
+                    response.raise_for_status()
+                await asyncio.sleep(_gamma_retry_delay(attempt, response))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except (httpx.TimeoutException, httpx.TransportError) as error:
+            last_error = error
+            if attempt + 1 >= attempts:
+                raise
+            await asyncio.sleep(_gamma_retry_delay(attempt, response))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Gamma request failed")
 
 
 def _append_limited(items: list, item: Any, limit: int) -> None:
@@ -297,14 +377,12 @@ class PolymarketLiveOrderBook:
             self._last_message_at = time.monotonic()
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
-            if raw.strip().upper() == "PONG":
+            if raw.strip().upper() in {"PING", "PONG"}:
                 continue
             try:
                 payload = json.loads(raw)
-            except (TypeError, json.JSONDecodeError) as error:
-                raise RuntimeError(
-                    f"invalid Polymarket WS message: {error}"
-                ) from error
+            except (TypeError, json.JSONDecodeError):
+                continue
             messages = payload if isinstance(payload, list) else [payload]
             for message in messages:
                 if isinstance(message, dict):
@@ -325,41 +403,18 @@ class PolymarketLiveOrderBook:
             token_id = str(message.get("asset_id", ""))
             if token_id not in self.state.quotes:
                 return
-            bids = message.get("bids") or []
-            asks = message.get("asks") or []
-            self._books[token_id] = {
-                "bids": {
-                    Decimal(str(level["price"])): Decimal(str(level["size"]))
-                    for level in bids
-                    if Decimal(str(level.get("size", "0"))) > 0
-                },
-                "asks": {
-                    Decimal(str(level["price"])): Decimal(str(level["size"]))
-                    for level in asks
-                    if Decimal(str(level.get("size", "0"))) > 0
-                },
-            }
-            self._tick_sizes[token_id] = self._infer_tick_size(token_id)
-            best_bid = max(self._books[token_id]["bids"], default=None)
-            best_ask = min(self._books[token_id]["asks"], default=None)
-            self._pending_snapshot_tokens.discard(token_id)
-            if not self._pending_snapshot_tokens:
-                self.state.quote_status = "ready"
+            bid, ask, bid_size, ask_size = self._replace_book_snapshot(
+                token_id,
+                _levels_to_decimals(message.get("bids") or []),
+                _levels_to_decimals(message.get("asks") or []),
+            )
             await self._store_quote(
                 token_id,
-                float(best_bid) if best_bid is not None else None,
-                float(best_ask) if best_ask is not None else None,
+                bid,
+                ask,
                 now,
-                bid_size=(
-                    float(self._books[token_id]["bids"][best_bid])
-                    if best_bid is not None
-                    else None
-                ),
-                ask_size=(
-                    float(self._books[token_id]["asks"][best_ask])
-                    if best_ask is not None
-                    else None
-                ),
+                bid_size=bid_size,
+                ask_size=ask_size,
             )
             return
 
@@ -493,6 +548,22 @@ class PolymarketLiveOrderBook:
         )
         await self.on_update("quote", {"token_id": token_id})
 
+    def _replace_book_snapshot(
+        self,
+        token_id: str,
+        bids: dict[Decimal, Decimal],
+        asks: dict[Decimal, Decimal],
+    ) -> tuple[float | None, float | None, float | None, float | None]:
+        self._books[token_id] = {"bids": dict(bids), "asks": dict(asks)}
+        self._tick_sizes[token_id] = self._infer_tick_size(token_id)
+        self._pending_snapshot_tokens.discard(token_id)
+        if not self._pending_snapshot_tokens:
+            self.state.quote_status = "ready"
+        return _best_quote_from_books(
+            self._books[token_id]["bids"],
+            self._books[token_id]["asks"],
+        )
+
     def _polymarket_level_size(
         self,
         token_id: str,
@@ -525,7 +596,7 @@ class PolymarketLiveOrderBook:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            if _is_recordable_disconnect(duration):
+            if _is_recordable_disconnect(duration, self._disconnected_reason):
                 self.disconnect_count += 1
                 self.disconnected_seconds += duration
                 _append_limited(
@@ -567,7 +638,7 @@ class PolymarketLiveOrderBook:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            if _is_recordable_disconnect(duration):
+            if _is_recordable_disconnect(duration, self._disconnected_reason):
                 disconnect_count += 1
                 disconnected_seconds += duration
                 periods.append(_disconnect_period(
@@ -620,7 +691,12 @@ class PolymarketLiveOrderBook:
 
 
 class PolymarketCryptoPriceFeed:
-    def __init__(self, symbol: str, state: LiveMonitorState, on_update) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        state: LiveMonitorState,
+        on_update,
+    ) -> None:
         self.symbol = normalize_crypto_symbol(symbol)
         self.state = state
         self.on_update = on_update
@@ -629,6 +705,7 @@ class PolymarketCryptoPriceFeed:
         self._connected_at: float | None = None
         self._last_message_at: float | None = None
         self._last_price_at: float | None = None
+        self._last_resubscribe_at: float | None = None
         self._ever_connected = False
         self._disconnected_since: float | None = None
         self._disconnected_wall_since: float | None = None
@@ -673,8 +750,8 @@ class PolymarketCryptoPriceFeed:
     async def _connect_and_listen(self) -> None:
         async with websockets.connect(
             POLYMARKET_CRYPTO_WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=None,
+            ping_timeout=None,
             open_timeout=10,
             close_timeout=10,
         ) as ws:
@@ -682,17 +759,11 @@ class PolymarketCryptoPriceFeed:
             self._connected_at = time.monotonic()
             self._last_message_at = time.monotonic()
             self._last_price_at = time.monotonic()
+            self._last_resubscribe_at = None
             self._mark_connected()
             self.state.crypto_status = "connected"
             self.state.last_error = None
-            await ws.send(json.dumps({
-                "action": "subscribe",
-                "subscriptions": [{
-                    "topic": "crypto_prices_chainlink",
-                    "type": "*",
-                    "filters": "",
-                }],
-            }))
+            await self._subscribe(ws)
             await self.on_update("status", {"source": "crypto"})
             await self.on_update(
                 "log",
@@ -703,8 +774,16 @@ class PolymarketCryptoPriceFeed:
                 },
             )
             disconnect_reason = "Crypto price WebSocket stream ended"
+            listener = asyncio.create_task(self._listen(ws))
+            watchdog = asyncio.create_task(self._stale_watchdog(ws))
+            heartbeat = asyncio.create_task(self._heartbeat(ws))
             try:
-                await self._listen(ws)
+                done, _pending = await asyncio.wait(
+                    (listener, watchdog, heartbeat),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    task.result()
                 raise TransientWebSocketDisconnect(
                     disconnect_reason
                 )
@@ -714,6 +793,14 @@ class PolymarketCryptoPriceFeed:
             finally:
                 if not self._closed:
                     self._mark_stream_disconnected(disconnect_reason)
+                for task in (listener, watchdog, heartbeat):
+                    task.cancel()
+                await asyncio.gather(
+                    listener,
+                    watchdog,
+                    heartbeat,
+                    return_exceptions=True,
+                )
                 self._ws = None
 
     async def _listen(self, ws) -> None:
@@ -727,22 +814,127 @@ class PolymarketCryptoPriceFeed:
                 message = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            payload = message.get("payload") or {}
-            if str(payload.get("symbol", "")).lower() != self.symbol:
-                continue
-            price_point = _crypto_price_point_from_payload(payload)
-            if price_point is None:
-                continue
-            price, price_ts = price_point
-            self._last_price_at = time.monotonic()
-            self.state.crypto_price = price
-            self.state.crypto_updated_at = price_ts or time.time()
-            self.state.crypto_status = "ready"
-            self.state.last_error = None
-            await self.on_update(
-                "crypto",
-                {"symbol": self.symbol, "price_ts": self.state.crypto_updated_at},
-            )
+            for payload in _crypto_payload_candidates(message):
+                if not _crypto_symbol_matches(
+                    _crypto_payload_symbol(payload),
+                    self.symbol,
+                ):
+                    continue
+                price_point = _crypto_price_point_from_payload(payload)
+                if price_point is None:
+                    continue
+                price, price_ts = price_point
+                if self._is_stale_provider_timestamp(price_ts):
+                    await self._warn_stale_provider_timestamp(price_ts)
+                    continue
+                self._last_price_at = time.monotonic()
+                self.state.crypto_price = price
+                self.state.crypto_updated_at = price_ts or time.time()
+                self.state.crypto_status = "ready"
+                self.state.last_error = None
+                await self.on_update(
+                    "crypto",
+                    {"symbol": self.symbol, "price_ts": self.state.crypto_updated_at},
+                )
+
+    def _is_stale_provider_timestamp(self, price_ts: float | None) -> bool:
+        if price_ts is None:
+            return False
+        return time.time() - price_ts > CRYPTO_PROVIDER_TIMESTAMP_MAX_AGE_SECONDS
+
+    async def _warn_stale_provider_timestamp(self, price_ts: float | None) -> None:
+        age = time.time() - price_ts if price_ts is not None else None
+        age_text = f"{age:.1f}s" if age is not None else "unknown age"
+        self.state.crypto_status = "stale"
+        self.state.last_error = (
+            f"Crypto price provider timestamp is stale ({age_text})"
+        )
+        await self.on_update(
+            "log",
+            {
+                "level": "warning",
+                "source": "crypto",
+                "message": self.state.last_error,
+            },
+        )
+        await self.on_update("status", {"source": "crypto"})
+
+    async def _stale_watchdog(self, ws) -> None:
+        while True:
+            reference = self._last_price_at or self._connected_at
+            if reference is not None:
+                age = time.monotonic() - reference
+                if age >= CRYPTO_RECONNECT_STALE_AFTER_SECONDS:
+                    reason = f"Crypto price feed stale for {age:.1f}s"
+                    self.state.crypto_status = "reconnecting"
+                    self.state.last_error = reason
+                    self._last_resubscribe_at = time.monotonic()
+                    await self._subscribe(ws)
+                    await self.on_update(
+                        "log",
+                        {
+                            "level": "warning",
+                            "source": "crypto",
+                            "message": f"{reason}; resubscribing and reconnecting.",
+                        },
+                    )
+                    await self.on_update("status", {"source": "crypto"})
+                    await ws.close()
+                    raise TransientWebSocketDisconnect(reason)
+            await asyncio.sleep(min(1.0, CRYPTO_RECONNECT_STALE_AFTER_SECONDS / 3))
+
+    async def _heartbeat(self, ws) -> None:
+        while True:
+            await asyncio.sleep(CRYPTO_HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                pong_waiter = await ws.ping()
+                await asyncio.wait_for(
+                    pong_waiter,
+                    timeout=CRYPTO_HEARTBEAT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as error:
+                reason = (
+                    "Crypto WebSocket ping timeout after "
+                    f"{CRYPTO_HEARTBEAT_TIMEOUT_SECONDS:.1f}s"
+                )
+                self.state.crypto_status = "reconnecting"
+                self.state.last_error = reason
+                await self.on_update(
+                    "log",
+                    {
+                        "level": "warning",
+                        "source": "crypto",
+                        "message": f"{reason}; reconnecting.",
+                    },
+                )
+                await self.on_update("status", {"source": "crypto"})
+                await ws.close()
+                raise TransientWebSocketDisconnect(reason) from error
+            except Exception as error:
+                reason = f"Crypto WebSocket ping failed: {_error_message(error)}"
+                self.state.crypto_status = "reconnecting"
+                self.state.last_error = reason
+                await self.on_update(
+                    "log",
+                    {
+                        "level": "warning",
+                        "source": "crypto",
+                        "message": f"{reason}; reconnecting.",
+                    },
+                )
+                await self.on_update("status", {"source": "crypto"})
+                await ws.close()
+                raise TransientWebSocketDisconnect(reason) from error
+
+    async def _subscribe(self, ws) -> None:
+        await ws.send(json.dumps({
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": "",
+            }],
+        }))
 
     def _connection_age(self) -> float:
         if self._connected_at is None:
@@ -754,7 +946,7 @@ class PolymarketCryptoPriceFeed:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            if _is_recordable_disconnect(duration):
+            if _is_recordable_disconnect(duration, self._disconnected_reason):
                 self.disconnect_count += 1
                 self.disconnected_seconds += duration
                 _append_limited(
@@ -777,13 +969,13 @@ class PolymarketCryptoPriceFeed:
     def _mark_stream_disconnected(self, reason: str | None) -> None:
         if reason and reason.startswith("Crypto price feed stale"):
             self._mark_disconnected(
+                reason=reason,
                 since=(
                     self._last_price_at
                     if self._last_price_at is not None
                     else self._connected_at
                 ),
                 wall_since=self.state.crypto_updated_at,
-                reason=reason,
             )
             return
         self._mark_disconnected(reason=reason)
@@ -817,7 +1009,7 @@ class PolymarketCryptoPriceFeed:
             now = time.monotonic()
             wall_now = time.time()
             duration = now - self._disconnected_since
-            if _is_recordable_disconnect(duration):
+            if _is_recordable_disconnect(duration, self._disconnected_reason):
                 disconnect_count += 1
                 disconnected_seconds += duration
                 periods.append(_disconnect_period(
@@ -927,6 +1119,7 @@ class LiveMonitorSession:
         self._last_rest_poll_at: float | None = None
         self._rest_poll_count = 0
         self._last_rest_error_at = 0.0
+        self._rest_backoff_until = 0.0
         self._last_live_update_publish_at = 0.0
         self._pending_live_update_count = 0
         self._last_sample_enqueue_at = 0.0
@@ -1045,6 +1238,8 @@ class LiveMonitorSession:
         while not self._stopped:
             try:
                 await asyncio.sleep(REST_QUOTE_POLL_SECONDS)
+                if time.monotonic() < self._rest_backoff_until:
+                    continue
                 health = self.polymarket.health()
                 last_message_age = health.get("last_message_age")
                 should_poll = (
@@ -1074,9 +1269,16 @@ class LiveMonitorSession:
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=True, trust_env=True) as client:
                 for token_id in token_ids:
-                    bid, ask, bid_size, ask_size = await _fetch_clob_book(client, token_id)
+                    snapshot = await _fetch_clob_book_snapshot(client, token_id)
                     if self.polymarket is not orderbook or token_id not in self.state.quotes:
                         return
+                    if snapshot is None:
+                        continue
+                    bid, ask, bid_size, ask_size = orderbook._replace_book_snapshot(
+                        token_id,
+                        snapshot[0],
+                        snapshot[1],
+                    )
                     bid, ask, bid_size, ask_size = _normalize_polymarket_quote(
                         bid,
                         ask,
@@ -1107,7 +1309,11 @@ class LiveMonitorSession:
                     )
             self._last_rest_poll_at = time.time()
             self._rest_poll_count += 1
+            self._rest_backoff_until = 0.0
         except Exception as error:
+            self._rest_backoff_until = (
+                time.monotonic() + REST_QUOTE_FAILURE_COOLDOWN_SECONDS
+            )
             now = time.time()
             if now - self._last_rest_error_at >= 10:
                 self._last_rest_error_at = now
@@ -1266,10 +1472,20 @@ class LiveMonitorSession:
             self._preloaded_history_loop(self._preloaded_next)
         )
         self._tasks.append(self._preloaded_next.history_task)
+        seconds_left = (
+            max(0.0, event.window_start_ts - time.time())
+            if event.window_start_ts is not None
+            else None
+        )
+        timing = (
+            f" ({seconds_left:.1f}s before start)"
+            if seconds_left is not None
+            else ""
+        )
         await self._log(
             "info",
             "session",
-            f"Preconnected next contract: {event.slug}.",
+            f"Preconnected next contract: {event.slug}{timing}.",
         )
 
     def _take_preloaded_next(
@@ -1463,20 +1679,26 @@ class LiveMonitorSession:
         if update_type in {"quote", "crypto"}:
             self._pending_live_update_count += 1
             now = time.time()
-            should_publish = target_locked or (
+            interval_elapsed = (
                 now - self._last_live_update_publish_at
                 >= LIVE_STREAM_MIN_INTERVAL_SECONDS
             )
+            should_publish = (
+                update_type == "quote" and bool(self._subscribers)
+            ) or target_locked or interval_elapsed
             should_sample = target_locked or (
                 now - self._last_sample_enqueue_at
                 >= SAMPLE_WRITE_MIN_INTERVAL_SECONDS
             )
             if not should_publish and not should_sample:
                 return
+            include_stream_history = bool(
+                self._subscribers and (target_locked or interval_elapsed)
+            )
             payload = self.snapshot(
                 history_limit=(
                     LIVE_STREAM_HISTORY_LIMIT
-                    if should_publish and self._subscribers
+                    if include_stream_history
                     else 0
                 )
             )
@@ -1509,6 +1731,8 @@ class LiveMonitorSession:
 
     @staticmethod
     def _put_latest(queue: asyncio.Queue, message: dict) -> None:
+        if message.get("event") in LIVE_COALESCABLE_EVENTS:
+            LiveMonitorSession._drop_queued_live_updates(queue)
         while True:
             try:
                 queue.put_nowait(message)
@@ -1518,6 +1742,22 @@ class LiveMonitorSession:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
+
+    @staticmethod
+    def _drop_queued_live_updates(queue: asyncio.Queue) -> None:
+        kept = []
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item.get("event") not in LIVE_COALESCABLE_EVENTS:
+                kept.append(item)
+        for item in kept:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                return
 
     async def _publish_snapshot(self, event: str) -> None:
         if not self._subscribers:
@@ -1713,6 +1953,17 @@ class LiveMonitorSession:
         lock_after: float | None,
     ) -> tuple[float, float] | None:
         max_ts = timestamp + 1e-6
+        if lock_after is not None and timestamp + 1e-6 >= lock_after:
+            for updated_at, price in reversed(self._crypto_timeline):
+                if updated_at <= lock_after + 1e-6:
+                    return price, lock_after
+            if not self._crypto_timeline and self.state.crypto_price is not None:
+                updated_at = self.state.crypto_updated_at
+                if (
+                    updated_at is not None
+                    and updated_at <= lock_after + 1e-6
+                ):
+                    return self.state.crypto_price, lock_after
         for updated_at, price in self._crypto_timeline:
             if lock_after is not None and updated_at + 1e-6 < lock_after:
                 continue
@@ -2055,33 +2306,10 @@ class LiveMonitorSession:
         }
         if not rows_by_ts:
             return []
-        first_ts = min(rows_by_ts)
-        last_ts = max(rows_by_ts)
-        interval = HISTORY_CAPTURE_INTERVAL_SECONDS
-        grid_start = (
-            window_start
-            if first_ts <= window_start + interval + 1e-9
-            else first_ts
-        )
-        grid_end = (
-            window_end
-            if last_ts >= window_end - interval - 1e-9
-            else last_ts
-        )
-        sorted_rows = [
+        completed = [
             rows_by_ts[timestamp]
             for timestamp in sorted(rows_by_ts)
         ]
-        completed = []
-        previous: dict | None = None
-        for timestamp in _history_sample_timestamps(grid_start, grid_end):
-            row = rows_by_ts.get(timestamp)
-            if row is None:
-                row = self._filled_history_row(timestamp, previous, sorted_rows)
-            if row is None:
-                continue
-            completed.append(row)
-            previous = row
         self._refresh_history_targets_for(
             completed,
             self.event,
@@ -2089,53 +2317,6 @@ class LiveMonitorSession:
             self._target_price_ts,
         )
         return completed
-
-    def _filled_history_row(
-        self,
-        timestamp: float,
-        previous: dict | None,
-        sorted_rows: list[dict],
-    ) -> dict | None:
-        source = previous
-        if source is None:
-            source = next(
-                (
-                    row
-                    for row in sorted_rows
-                    if (_optional_float(row.get("t")) or 0) > timestamp
-                ),
-                None,
-            )
-        if source is None:
-            return None
-        row = dict(source)
-        captured_at = _optional_float(row.get("captured_at"))
-        if captured_at is None:
-            captured_at = timestamp
-        captured_at = max(captured_at, timestamp)
-        row["t"] = timestamp
-        row["time"] = _format_history_time(timestamp)
-        row["captured_at"] = round(captured_at, 3)
-        row["captured_time"] = _format_history_time(captured_at)
-        row["sample_delay_ms"] = round(max(0, captured_at - timestamp) * 1000, 1)
-        crypto_updated_at = _optional_float(row.get("crypto_updated_at"))
-        row["crypto_age_seconds"] = (
-            round(max(0, timestamp - crypto_updated_at), 3)
-            if crypto_updated_at is not None
-            else None
-        )
-        quote_event_at = _optional_float(row.get("quote_event_at"))
-        row["quote_age_seconds"] = (
-            round(max(0, timestamp - quote_event_at), 3)
-            if quote_event_at is not None
-            else None
-        )
-        row["seconds_left"] = (
-            round(max(0, self.event.window_end_ts - timestamp), 3)
-            if self.event.window_end_ts
-            else None
-        )
-        return row
 
     def _capture_history_row(
         self,
@@ -2411,7 +2592,7 @@ class LiveMonitorSession:
             "crypto",
             crypto_connection_stats,
         )
-        return {
+        record = {
             "id": self.current_record_id,
             "session_id": self.id,
             "user_id": self.user_id,
@@ -2462,6 +2643,7 @@ class LiveMonitorSession:
             "history_retention_limit": LIVE_HISTORY_MEMORY_LIMIT,
             "history": history,
         }
+        return _record_with_quality_anomalies(record)
 
     def _contract_quality(
         self,
@@ -2484,8 +2666,8 @@ class LiveMonitorSession:
                     crypto_disconnect_count,
                 ),
             }
-        started_after = max(0, int(self.started_at_ts - self.event.window_start_ts))
-        if started_after <= PARTIAL_CONTRACT_GRACE_SECONDS:
+        started_after = max(0.0, self.started_at_ts - self.event.window_start_ts)
+        if started_after <= HISTORY_INITIAL_MISSING_GRACE_SECONDS:
             started_after = 0
         ended_before = self._tracking_ended_before_seconds()
         unsuitable = bool(started_after or ended_before is not None)
@@ -2497,7 +2679,7 @@ class LiveMonitorSession:
                 ended_before,
             ),
             "partial_contract": partial,
-            "started_after_seconds": started_after or None,
+            "started_after_seconds": round(started_after, 3) if started_after else None,
             "ended_before_seconds": ended_before,
             "partial_reason": _partial_reason(
                 disconnect_count,
@@ -2742,6 +2924,270 @@ class LiveMonitorManager:
             ]
         return [_with_saved_category(record) for record in records]
 
+    def list_saved_previews(self, user_id: str, category: str | None = None) -> list[dict]:
+        records = _read_saved_record_previews(
+            _saved_records_dir(self.data_root, user_id),
+            include_history_stats=False,
+        )
+        normalized_category = _normalize_saved_category(category)
+        if normalized_category:
+            records = [
+                record
+                for record in records
+                if _record_saved_category(record)["id"] == normalized_category
+            ]
+        return [_with_saved_category(record) for record in records]
+
+    def scan_saved_quality(
+        self,
+        user_id: str,
+        category: str | None = None,
+        timeframe: str | None = "5m",
+        limit: int = 500,
+    ) -> dict:
+        record_paths = _read_saved_record_preview_paths(
+            _saved_records_dir(self.data_root, user_id),
+            include_history_stats=True,
+        )
+        normalized_category = _normalize_saved_category(category)
+        issues = []
+        scanned = 0
+        matching = 0
+        problem_count = 0
+        target_issue_count = 0
+        history_issue_count = 0
+        problem_ids: set[str] = set()
+        for path, preview in record_paths:
+            if normalized_category and _record_saved_category(preview)["id"] != normalized_category:
+                continue
+            if timeframe and _record_timeframe(preview) != timeframe:
+                continue
+            matching += 1
+            record = _with_saved_category(preview)
+            scanned += 1
+            target_issues = [
+                _quality_issue_summary(issue)
+                for issue in (record.get("quality_anomalies") or [])
+                if isinstance(issue, dict)
+            ]
+            history_issues, history_stats = _saved_record_history_quality(path, record)
+            if target_issues:
+                target_issue_count += 1
+            if history_issues:
+                history_issue_count += 1
+            if target_issues or history_issues:
+                problem_count += 1
+                if history_issues or _quality_issues_are_deletable(target_issues):
+                    _add_record_id(problem_ids, record)
+                if len(issues) < limit:
+                    issues.append({
+                        "id": record.get("id"),
+                        "slug": record.get("slug"),
+                        "question": record.get("question") or record.get("event_title"),
+                        "category": _record_saved_category(record),
+                        "window_start_ts": record.get("window_start_ts"),
+                        "window_start_time": _format_optional_history_time(
+                            record.get("window_start_ts")
+                        ),
+                        "window_end_ts": record.get("window_end_ts"),
+                        "window_end_time": _format_optional_history_time(
+                            record.get("window_end_ts")
+                        ),
+                        "target_price": record.get("target_price"),
+                        "target_price_ts": (
+                            record.get("target_price_effective_ts")
+                            or record.get("target_price_ts")
+                        ),
+                        "target_price_time": (
+                            record.get("target_price_effective_time")
+                            or record.get("target_price_time")
+                            or _format_optional_history_time(record.get("target_price_ts"))
+                        ),
+                        "target_price_raw_ts": record.get("target_price_ts"),
+                        "target_price_raw_time": (
+                            record.get("target_price_time")
+                            or _format_optional_history_time(record.get("target_price_ts"))
+                        ),
+                        "history": history_stats,
+                        "target_issues": target_issues,
+                        "history_issues": history_issues,
+                    })
+        return {
+            "asset": normalized_category or "all",
+            "timeframe": timeframe or "all",
+            "scanned": scanned,
+            "matching": matching,
+            "problem_contracts": problem_count,
+            "target_issue_contracts": target_issue_count,
+            "history_issue_contracts": history_issue_count,
+            "issues": issues,
+            "issues_shown": len(issues),
+            "issues_limited": problem_count > len(issues),
+            "problem_ids": sorted(problem_ids),
+            "history_initial_grace_seconds": HISTORY_INITIAL_MISSING_GRACE_SECONDS,
+            "history_interval_seconds": HISTORY_CAPTURE_INTERVAL_SECONDS,
+        }
+
+    async def check_saved_external_targets(
+        self,
+        user_id: str,
+        category: str | None = None,
+        timeframe: str | None = "5m",
+        limit: int = 1000,
+    ) -> dict:
+        record_paths = _read_saved_record_preview_paths(
+            _saved_records_dir(self.data_root, user_id),
+            include_history_stats=False,
+        )
+        normalized_category = _normalize_saved_category(category)
+        matching_records = []
+        for _path, preview in record_paths:
+            if normalized_category and _record_saved_category(preview)["id"] != normalized_category:
+                continue
+            if timeframe and _record_timeframe(preview) != timeframe:
+                continue
+            matching_records.append(_with_saved_category(preview))
+
+        slug_cache: dict[str, dict] = {}
+        slugs = sorted({
+            str(record.get("slug") or "").strip()
+            for record in matching_records
+            if str(record.get("slug") or "").strip()
+        })
+        semaphore = asyncio.Semaphore(GAMMA_TARGET_CHECK_CONCURRENCY)
+
+        async def fetch_slug(client: httpx.AsyncClient, slug: str) -> tuple[str, dict]:
+            async with semaphore:
+                try:
+                    payload = await _fetch_gamma_event_payload(client, slug)
+                    target = _external_target_from_gamma_payload(payload)
+                    return slug, {"ok": True, "target": target, "error": None}
+                except Exception as exc:
+                    return slug, {"ok": False, "target": None, "error": str(exc)}
+
+        async with httpx.AsyncClient(
+            timeout=15,
+            follow_redirects=True,
+            trust_env=True,
+        ) as client:
+            results = await asyncio.gather(
+                *(fetch_slug(client, slug) for slug in slugs),
+                return_exceptions=False,
+            )
+        slug_cache.update(dict(results))
+
+        mismatches = []
+        unavailable = []
+        problem_ids: set[str] = set()
+        checked = 0
+        mismatch_count = 0
+        saved_missing = 0
+        external_missing = 0
+        fetch_failed = 0
+        for record in matching_records:
+            saved_target = _optional_float(record.get("target_price"))
+            slug = str(record.get("slug") or "").strip()
+            external_result = slug_cache.get(slug) if slug else None
+            external_target = (
+                external_result.get("target")
+                if isinstance(external_result, dict)
+                else None
+            )
+            if saved_target is None:
+                saved_missing += 1
+                if len(unavailable) < limit:
+                    unavailable.append(_external_target_unavailable_summary(
+                        record,
+                        "Saved contract has no target price.",
+                    ))
+                continue
+            if not slug:
+                external_missing += 1
+                if len(unavailable) < limit:
+                    unavailable.append(_external_target_unavailable_summary(
+                        record,
+                        "Saved contract has no slug for Gamma lookup.",
+                    ))
+                continue
+            if not external_result or not external_result.get("ok"):
+                fetch_failed += 1
+                if len(unavailable) < limit:
+                    unavailable.append(_external_target_unavailable_summary(
+                        record,
+                        external_result.get("error") if external_result else "Gamma lookup failed.",
+                    ))
+                continue
+            if not isinstance(external_target, dict):
+                external_missing += 1
+                if len(unavailable) < limit:
+                    unavailable.append(_external_target_unavailable_summary(
+                        record,
+                        "Gamma response did not include priceToBeat.",
+                    ))
+                continue
+            raw_target = _optional_float(external_target.get("value"))
+            rounded_target = _price_to_beat(raw_target, record.get("crypto_symbol"))
+            if raw_target is None or rounded_target is None:
+                external_missing += 1
+                if len(unavailable) < limit:
+                    unavailable.append(_external_target_unavailable_summary(
+                        record,
+                        "Gamma target could not be parsed.",
+                    ))
+                continue
+            checked += 1
+            if math.isclose(saved_target, rounded_target, rel_tol=0.0, abs_tol=1e-8):
+                continue
+            mismatch_count += 1
+            _add_record_id(problem_ids, record)
+            if len(mismatches) < limit:
+                mismatches.append(_external_target_mismatch_summary(
+                    record,
+                    saved_target=saved_target,
+                    external_target=rounded_target,
+                    external_raw_target=raw_target,
+                    source=str(external_target.get("source") or "Gamma"),
+                ))
+
+        return {
+            "asset": normalized_category or "all",
+            "timeframe": timeframe or "all",
+            "matching": len(matching_records),
+            "unique_slugs": len(slugs),
+            "checked": checked,
+            "mismatch_contracts": mismatch_count,
+            "mismatches": mismatches,
+            "mismatches_shown": len(mismatches),
+            "mismatches_limited": mismatch_count > len(mismatches),
+            "unavailable_contracts": saved_missing + external_missing + fetch_failed,
+            "unavailable": unavailable,
+            "unavailable_shown": len(unavailable),
+            "unavailable_limited": (saved_missing + external_missing + fetch_failed) > len(unavailable),
+            "saved_target_missing": saved_missing,
+            "external_target_missing": external_missing,
+            "fetch_failed": fetch_failed,
+            "problem_ids": sorted(problem_ids),
+            "source": "Gamma eventMetadata.priceToBeat",
+        }
+
+    async def delete_saved_external_target_issues(
+        self,
+        user_id: str,
+        category: str | None = None,
+        timeframe: str | None = "5m",
+    ) -> int:
+        report = await self.check_saved_external_targets(
+            user_id,
+            category=category,
+            timeframe=timeframe,
+            limit=1_000_000,
+        )
+        deleted = 0
+        for record_id in report.get("problem_ids") or []:
+            if self.delete_saved(user_id, str(record_id)):
+                deleted += 1
+        return deleted
+
     def list_saved_page(
         self,
         user_id: str,
@@ -2828,6 +3274,35 @@ class LiveMonitorManager:
             deleted += 1
         return deleted
 
+    def delete_saved_quality_issues(
+        self,
+        user_id: str,
+        category: str | None = None,
+        timeframe: str | None = "5m",
+    ) -> int:
+        directory = _saved_records_dir(self.data_root, user_id)
+        normalized_category = _normalize_saved_category(category)
+        deleted = 0
+        for path, preview in _read_saved_record_preview_paths(
+            directory,
+            include_history_stats=True,
+        ):
+            if normalized_category and _record_saved_category(preview)["id"] != normalized_category:
+                continue
+            if timeframe and _record_timeframe(preview) != timeframe:
+                continue
+            record = _with_saved_category(preview)
+            history_issues, _history_stats = _saved_record_history_quality(path, record)
+            quality_anomalies = [
+                issue
+                for issue in record.get("quality_anomalies") or []
+                if isinstance(issue, dict)
+            ]
+            if history_issues or _quality_issues_are_deletable(quality_anomalies):
+                path.unlink()
+                deleted += 1
+        return deleted
+
     async def close(self) -> None:
         sessions = list(self.sessions)
         for session_id in sessions:
@@ -2846,21 +3321,11 @@ async def resolve_polymarket_event(
         follow_redirects=True,
         trust_env=True,
     ) as client:
-        response = await client.get(
-            f"{settings.gamma_api_url}/events",
-            params={"slug": slug},
-        )
-        response.raise_for_status()
-        payload = response.json()
+        payload = await _gamma_get_json(client, {"slug": slug})
         if (not isinstance(payload, list) or not payload) and slug != original_slug:
             next_slug = _next_slug(slug)
             if next_slug:
-                response = await client.get(
-                    f"{settings.gamma_api_url}/events",
-                    params={"slug": next_slug},
-                )
-                response.raise_for_status()
-                next_payload = response.json()
+                next_payload = await _gamma_get_json(client, {"slug": next_slug})
                 if isinstance(next_payload, list) and next_payload:
                     slug = next_slug
                     payload = next_payload
@@ -3073,6 +3538,55 @@ def _market_tokens(market: dict) -> list[LiveToken]:
     return result
 
 
+def _crypto_payload_candidates(message: Any) -> list[dict]:
+    payload = message.get("payload") if isinstance(message, dict) else message
+    return list(_crypto_mapping_candidates(payload))
+
+
+def _crypto_mapping_candidates(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _crypto_mapping_candidates(item)
+        return
+    if not isinstance(value, dict):
+        return
+    data = value.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                candidate = dict(value)
+                candidate.pop("data", None)
+                candidate.update(item)
+                yield candidate
+    elif isinstance(data, dict):
+        candidate = dict(value)
+        candidate.pop("data", None)
+        candidate.update(data)
+        yield candidate
+    yield value
+
+
+def _crypto_payload_symbol(payload: dict) -> str | None:
+    for key in ("symbol", "pair", "ticker", "asset"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _crypto_symbol_matches(value: str | None, expected: str) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    expected = normalize_crypto_symbol(expected)
+    if normalized == expected:
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    expected_compact = expected.replace("/", "")
+    expected_base = expected.split("/", 1)[0]
+    return compact in {expected_compact, expected_base}
+
+
 def _crypto_price_point_from_payload(payload: dict) -> tuple[float, float | None] | None:
     source: Any = payload
     data = payload.get("data")
@@ -3146,18 +3660,35 @@ async def _fetch_clob_book(
     client: httpx.AsyncClient,
     token_id: str,
 ) -> tuple[float | None, float | None, float | None, float | None]:
+    snapshot = await _fetch_clob_book_snapshot(client, token_id)
+    if snapshot is None:
+        return None, None, None, None
+    return _best_quote_from_books(snapshot[0], snapshot[1])
+
+
+async def _fetch_clob_book_snapshot(
+    client: httpx.AsyncClient,
+    token_id: str,
+) -> tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]] | None:
     response = await client.get(
         f"{POLYMARKET_CLOB_URL}/book",
         params={"token_id": token_id},
     )
     if response.status_code in {400, 404, 422}:
-        return None, None, None, None
+        return None
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
-        return None, None, None, None
+        return None
     bids = _levels_to_decimals(payload.get("bids") or [])
     asks = _levels_to_decimals(payload.get("asks") or [])
+    return bids, asks
+
+
+def _best_quote_from_books(
+    bids: dict[Decimal, Decimal],
+    asks: dict[Decimal, Decimal],
+) -> tuple[float | None, float | None, float | None, float | None]:
     best_bid = max(bids, default=None)
     best_ask = min(asks, default=None)
     return (
@@ -3352,6 +3883,7 @@ def _read_saved_record_preview(
     if not isinstance(metadata, dict):
         return None
     preview = dict(metadata)
+    preview = _saved_record_with_target_stats(path, preview)
     if include_history_stats:
         preview = _saved_record_with_history_stats(path, preview)
     if "id" not in preview:
@@ -3406,6 +3938,102 @@ def _saved_record_with_history_stats(path: Path, record: dict) -> dict:
             if value is not None or key == "history_count"
         },
     }
+
+
+def _saved_record_with_target_stats(path: Path, record: dict) -> dict:
+    target = _optional_float(record.get("target_price"))
+    window_start = _optional_float(record.get("window_start_ts"))
+    target_ts = _optional_float(record.get("target_price_ts"))
+    if target_ts is not None:
+        record["target_price_time"] = _format_history_time(target_ts)
+    if target is None or window_start is None:
+        return record
+    start_target_row = _saved_record_matching_target_row(path, target, window_start)
+    if target_ts is not None and abs(target_ts - window_start) <= 1e-6:
+        record["target_price_effective_ts"] = round(window_start, 3)
+        record["target_price_effective_time"] = _format_history_time(window_start)
+        return record
+
+    if start_target_row is None:
+        return record
+    record["target_price_history_ts"] = round(window_start, 3)
+    record["target_price_history_time"] = _format_history_time(window_start)
+    record["target_price_effective_ts"] = round(window_start, 3)
+    record["target_price_effective_time"] = _format_history_time(window_start)
+    return record
+
+
+def _saved_record_matching_target_row(
+    path: Path,
+    target: float,
+    window_start: float,
+) -> dict | None:
+    for row in _iter_saved_record_history_rows(path):
+        timestamp = _optional_float(row.get("t"))
+        if timestamp is None:
+            continue
+        if timestamp - window_start > 1e-6:
+            break
+        if abs(timestamp - window_start) > 1e-6:
+            continue
+        row_target = _optional_float(row.get("target_price"))
+        if row_target is None:
+            continue
+        if math.isclose(row_target, target, rel_tol=0.0, abs_tol=1e-8):
+            return row
+    return None
+
+
+def _iter_saved_record_history_rows(path: Path):
+    yielded = False
+    in_history = False
+    row_lines: list[str] = []
+    depth = 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not in_history:
+                    if '"history"' not in line:
+                        continue
+                    in_history = True
+                    continue
+                stripped = line.strip()
+                if not row_lines:
+                    if stripped.startswith("]"):
+                        break
+                    if not stripped.startswith("{"):
+                        continue
+                row_lines.append(line)
+                depth += line.count("{") - line.count("}")
+                if depth > 0:
+                    continue
+                row_text = "".join(row_lines).strip().rstrip(",")
+                row_lines = []
+                depth = 0
+                try:
+                    row = json.loads(row_text)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    yielded = True
+                    yield row
+    except OSError:
+        return
+
+    if yielded:
+        return
+    try:
+        if path.stat().st_size > SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES:
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    history = payload.get("history") if isinstance(payload, dict) else None
+    if not isinstance(history, list):
+        return
+    for row in history:
+        if isinstance(row, dict):
+            yield row
 
 
 def _read_saved_record_metadata(path: Path) -> dict | None:
@@ -3600,8 +4228,295 @@ def _record_saved_category(record: dict) -> dict:
     }
 
 
+def _record_timeframe(record: dict) -> str | None:
+    start = _optional_float(record.get("window_start_ts"))
+    end = _optional_float(record.get("window_end_ts"))
+    if start is not None and end is not None:
+        duration = round(end - start)
+        for timeframe, seconds in {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}.items():
+            if abs(duration - seconds) <= 1:
+                return timeframe
+    slug = str(record.get("slug") or "").lower()
+    for timeframe in ("5m", "15m", "1h", "4h"):
+        if f"-{timeframe}-" in slug or f"_{timeframe}_" in slug:
+            return timeframe
+    return None
+
+
+def _format_optional_history_time(value) -> str | None:
+    timestamp = _optional_float(value)
+    return _format_history_time(timestamp) if timestamp is not None else None
+
+
+def _quality_issue_summary(issue: dict) -> dict:
+    return {
+        "type": issue.get("type"),
+        "severity": issue.get("severity"),
+        "message": issue.get("message") or issue.get("type") or "Data quality issue",
+        "target_price": issue.get("target_price"),
+        "target_price_ts": issue.get("target_price_ts"),
+        "target_price_time": (
+            issue.get("target_price_time")
+            or _format_optional_history_time(issue.get("target_price_ts"))
+        ),
+        "window_start_ts": issue.get("window_start_ts"),
+        "window_start_time": (
+            issue.get("window_start_time")
+            or _format_optional_history_time(issue.get("window_start_ts"))
+        ),
+        "delay_seconds": issue.get("delay_seconds"),
+        "min_deviation_pct": issue.get("min_deviation_pct"),
+        "delta": issue.get("delta"),
+        "expected_rows": issue.get("expected_rows"),
+        "actual_rows": issue.get("actual_rows"),
+        "missing_rows": issue.get("missing_rows"),
+        "first_missing_time": issue.get("first_missing_time"),
+    }
+
+
+async def _fetch_gamma_event_payload(client: httpx.AsyncClient, slug: str) -> Any:
+    return await _gamma_get_json(client, {"slug": slug})
+
+
+def _external_target_from_gamma_payload(payload: Any) -> dict | None:
+    event = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(event, dict):
+        return None
+
+    for path in (
+        ("eventMetadata", "priceToBeat"),
+        ("eventMetadata", "price_to_beat"),
+        ("eventMetadata", "targetPrice"),
+        ("eventMetadata", "target_price"),
+        ("priceToBeat",),
+        ("price_to_beat",),
+        ("targetPrice",),
+        ("target_price",),
+    ):
+        value = _value_at_path(event, path)
+        parsed = _optional_float(value)
+        if parsed is not None and parsed > 0:
+            return {"value": parsed, "source": ".".join(path)}
+
+    markets = event.get("markets")
+    if not isinstance(markets, list):
+        return None
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        for path in (
+            ("eventMetadata", "priceToBeat"),
+            ("eventMetadata", "price_to_beat"),
+            ("priceToBeat",),
+            ("price_to_beat",),
+            ("targetPrice",),
+            ("target_price",),
+        ):
+            value = _value_at_path(market, path)
+            parsed = _optional_float(value)
+            if parsed is not None and parsed > 0:
+                return {"value": parsed, "source": "markets[]." + ".".join(path)}
+    return None
+
+
+def _value_at_path(payload: dict, path: tuple[str, ...]) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _external_target_mismatch_summary(
+    record: dict,
+    *,
+    saved_target: float,
+    external_target: float,
+    external_raw_target: float,
+    source: str,
+) -> dict:
+    return {
+        **_external_target_contract_summary(record),
+        "saved_target_price": saved_target,
+        "external_target_price": external_target,
+        "external_raw_target_price": external_raw_target,
+        "delta": round(saved_target - external_target, 8),
+        "source": source,
+    }
+
+
+def _external_target_unavailable_summary(record: dict, reason: str | None) -> dict:
+    return {
+        **_external_target_contract_summary(record),
+        "saved_target_price": record.get("target_price"),
+        "reason": reason or "External target unavailable.",
+    }
+
+
+def _add_record_id(record_ids: set[str], record: dict) -> None:
+    record_id = str(record.get("id") or "").strip()
+    if record_id:
+        record_ids.add(record_id)
+
+
+NON_DELETABLE_QUALITY_ISSUE_TYPES = {"target_timestamp_missing"}
+
+
+def _quality_issues_are_deletable(issues: list[dict]) -> bool:
+    return any(
+        str(issue.get("type") or "") not in NON_DELETABLE_QUALITY_ISSUE_TYPES
+        for issue in issues
+        if isinstance(issue, dict)
+    )
+
+
+def _external_target_contract_summary(record: dict) -> dict:
+    return {
+        "id": record.get("id"),
+        "slug": record.get("slug"),
+        "question": record.get("question") or record.get("event_title"),
+        "category": _record_saved_category(record),
+        "window_start_ts": record.get("window_start_ts"),
+        "window_start_time": _format_optional_history_time(record.get("window_start_ts")),
+        "window_end_ts": record.get("window_end_ts"),
+        "window_end_time": _format_optional_history_time(record.get("window_end_ts")),
+        "target_price_ts": record.get("target_price_effective_ts") or record.get("target_price_ts"),
+        "target_price_time": (
+            record.get("target_price_effective_time")
+            or record.get("target_price_time")
+            or _format_optional_history_time(record.get("target_price_ts"))
+        ),
+    }
+
+
+def _saved_record_history_quality(path: Path, record: dict) -> tuple[list[dict], dict]:
+    timestamps = sorted({
+        round(timestamp, 3)
+        for timestamp in (
+            _optional_float(row.get("t"))
+            for row in _iter_saved_record_history_rows(path)
+            if isinstance(row, dict)
+        )
+        if timestamp is not None
+    })
+    return _history_quality_from_timestamps(record, timestamps)
+
+
+def _history_quality_from_timestamps(
+    record: dict,
+    timestamps: list[float],
+) -> tuple[list[dict], dict]:
+    window_start = _optional_float(record.get("window_start_ts"))
+    window_end = _optional_float(record.get("window_end_ts"))
+    stats = {
+        "row_count": len(timestamps),
+        "first_ts": timestamps[0] if timestamps else None,
+        "first_time": _format_history_time(timestamps[0]) if timestamps else None,
+        "last_ts": timestamps[-1] if timestamps else None,
+        "last_time": _format_history_time(timestamps[-1]) if timestamps else None,
+        "expected_interval_seconds": HISTORY_CAPTURE_INTERVAL_SECONDS,
+        "initial_grace_seconds": HISTORY_INITIAL_MISSING_GRACE_SECONDS,
+        "expected_rows_from_first": None,
+        "missing_rows_after_first": 0,
+        "largest_gap_seconds": 0.0,
+    }
+    issues: list[dict] = []
+    if window_start is None or window_end is None:
+        issues.append({
+            "type": "history_window_missing",
+            "severity": "high",
+            "message": "Contract window timestamps are missing.",
+        })
+        return issues, stats
+    if not timestamps:
+        issues.append({
+            "type": "history_missing",
+            "severity": "high",
+            "message": "Saved contract has no history rows.",
+            "window_start_ts": round(window_start, 3),
+            "window_start_time": _format_history_time(window_start),
+        })
+        return issues, stats
+
+    first_ts = timestamps[0]
+    last_ts = timestamps[-1]
+    initial_missing = max(0.0, first_ts - window_start)
+    end_missing = max(0.0, window_end - last_ts)
+    expected_full_window = set(_history_sample_timestamps(window_start, window_end))
+    actual_full_window = {
+        timestamp for timestamp in timestamps if window_start <= timestamp <= window_end
+    }
+    full_window_missing = sorted(expected_full_window - actual_full_window)
+    expected_rows = len(_history_sample_timestamps(first_ts, window_end))
+    expected = set(_history_sample_timestamps(first_ts, window_end))
+    actual = {timestamp for timestamp in timestamps if first_ts <= timestamp <= window_end}
+    missing = sorted(expected - actual)
+    gaps = [
+        round(timestamps[index] - timestamps[index - 1], 3)
+        for index in range(1, len(timestamps))
+        if timestamps[index] <= window_end + 1e-6
+    ]
+    largest_gap = max(gaps, default=0.0)
+    stats.update({
+        "initial_missing_seconds": round(initial_missing, 3),
+        "end_missing_seconds": round(end_missing, 3),
+        "expected_full_window_rows": len(expected_full_window),
+        "missing_full_window_rows": len(full_window_missing),
+        "expected_rows_from_first": expected_rows,
+        "missing_rows_after_first": len(missing),
+        "largest_gap_seconds": largest_gap,
+    })
+    if initial_missing - HISTORY_INITIAL_MISSING_GRACE_SECONDS > 1e-6:
+        issues.append({
+            "type": "history_started_late",
+            "severity": "high",
+            "message": "History starts more than 5.0s after the contract window opened.",
+            "first_ts": round(first_ts, 3),
+            "first_time": _format_history_time(first_ts),
+            "window_start_ts": round(window_start, 3),
+            "window_start_time": _format_history_time(window_start),
+            "missing_seconds": round(initial_missing, 3),
+        })
+    if full_window_missing:
+        issues.append({
+            "type": "history_incomplete_window",
+            "severity": "high",
+            "message": "History has fewer rows than the full 5m contract window.",
+            "expected_rows": len(expected_full_window),
+            "actual_rows": len(actual_full_window),
+            "missing_rows": len(full_window_missing),
+            "first_missing_ts": round(full_window_missing[0], 3),
+            "first_missing_time": _format_history_time(full_window_missing[0]),
+        })
+    if end_missing > 1e-6:
+        issues.append({
+            "type": "history_ended_early",
+            "severity": "high",
+            "message": "History does not reach the contract expiration timestamp.",
+            "last_ts": round(last_ts, 3),
+            "last_time": _format_history_time(last_ts),
+            "window_end_ts": round(window_end, 3),
+            "window_end_time": _format_history_time(window_end),
+            "missing_seconds": round(end_missing, 3),
+        })
+    if missing:
+        first_missing = missing[0]
+        issues.append({
+            "type": "history_internal_gaps",
+            "severity": "high",
+            "message": "History has missing 0.5s samples after the first recorded row.",
+            "missing_rows": len(missing),
+            "first_missing_ts": round(first_missing, 3),
+            "first_missing_time": _format_history_time(first_missing),
+            "largest_gap_seconds": largest_gap,
+        })
+    return issues, stats
+
+
 def _with_saved_category(record: dict) -> dict:
     record = _record_with_target_fallback(record)
+    record = _record_with_quality_anomalies(record)
     return {
         **record,
         **_record_partial_fields(record),
@@ -3612,6 +4527,8 @@ def _with_saved_category(record: dict) -> dict:
 
 
 def _saved_list_record(record: dict) -> dict:
+    record = _record_with_target_fallback(record)
+    record = _record_with_quality_anomalies(record)
     full_record = {
         **record,
         **_record_partial_fields(record),
@@ -3622,6 +4539,102 @@ def _saved_list_record(record: dict) -> dict:
     if "history_count" not in full_record and isinstance(history, list) and history:
         full_record["history_count"] = len(history) if isinstance(history, list) else 0
     return full_record
+
+
+def _record_with_quality_anomalies(record: dict) -> dict:
+    anomalies = _record_quality_anomalies(record)
+    if not anomalies:
+        return record
+    patched = dict(record)
+    patched["quality_anomalies"] = anomalies
+    patched["target_price_anomaly"] = True
+    patched["unsuitable_contract"] = True
+    reason = "; ".join(str(item.get("message") or item.get("type")) for item in anomalies)
+    existing_reason = str(patched.get("unsuitable_reason") or "").strip()
+    patched["unsuitable_reason"] = (
+        f"{existing_reason}; {reason}" if existing_reason else reason
+    )
+    patched.setdefault("partial_contract", True)
+    return patched
+
+
+def _record_quality_anomalies(record: dict) -> list[dict]:
+    target = _optional_float(record.get("target_price"))
+    window_start = _optional_float(record.get("window_start_ts"))
+    if target is None or window_start is None:
+        return []
+    anomalies = []
+    target_ts = _optional_float(record.get("target_price_ts"))
+    effective_target_ts = _record_effective_target_ts(
+        record,
+        target,
+        window_start,
+        target_ts,
+    )
+    if effective_target_ts is None:
+        anomalies.append({
+            "type": "target_timestamp_missing",
+            "severity": "high",
+            "message": "Target price timestamp is missing.",
+            "target_price": target,
+            "window_start_ts": round(window_start, 3),
+        })
+    else:
+        lock_delay = effective_target_ts - window_start
+        if lock_delay < -1e-6:
+            anomalies.append({
+                "type": "target_before_window",
+                "severity": "high",
+                "message": "Target price timestamp is before the contract window.",
+                "target_price": target,
+                "target_price_ts": round(effective_target_ts, 3),
+                "target_price_time": _format_history_time(effective_target_ts),
+                "window_start_ts": round(window_start, 3),
+                "window_start_time": _format_history_time(window_start),
+                "delay_seconds": round(lock_delay, 3),
+            })
+        elif lock_delay > TARGET_PRICE_LOCK_GRACE_SECONDS:
+            anomalies.append({
+                "type": "target_locked_late",
+                "severity": "high",
+                "message": (
+                    f"Target price locked {lock_delay:.1f}s after the contract started."
+                ),
+                "target_price": target,
+                "target_price_ts": round(effective_target_ts, 3),
+                "target_price_time": _format_history_time(effective_target_ts),
+                "window_start_ts": round(window_start, 3),
+                "window_start_time": _format_history_time(window_start),
+                "delay_seconds": round(lock_delay, 3),
+            })
+    return anomalies
+
+
+def _record_effective_target_ts(
+    record: dict,
+    target: float,
+    window_start: float,
+    target_ts: float | None,
+) -> float | None:
+    preview_effective_ts = _optional_float(record.get("target_price_effective_ts"))
+    if preview_effective_ts is not None:
+        return preview_effective_ts
+    history = record.get("history")
+    if isinstance(history, list):
+        for row in history:
+            if not isinstance(row, dict):
+                continue
+            timestamp = _optional_float(row.get("t"))
+            if timestamp is None:
+                continue
+            if abs(timestamp - window_start) > 1e-6:
+                continue
+            row_target = _optional_float(row.get("target_price"))
+            if row_target is None:
+                continue
+            if math.isclose(row_target, target, rel_tol=0.0, abs_tol=1e-8):
+                return window_start
+    return target_ts
 
 
 def _record_with_target_fallback(record: dict) -> dict:
@@ -3752,7 +4765,7 @@ def _record_partial_fields(record: dict) -> dict:
             ),
         }
     started_after = max(0, first_history_ts - window_start)
-    if started_after <= PARTIAL_CONTRACT_GRACE_SECONDS:
+    if started_after <= HISTORY_INITIAL_MISSING_GRACE_SECONDS:
         started_after = 0
     unsuitable = bool(started_after or ended_before is not None)
     partial = disconnect_count > 0 or crypto_disconnect_count > 0

@@ -3,7 +3,9 @@ from __future__ import annotations
 import itertools
 import hashlib
 import math
+import os
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -33,6 +35,47 @@ FAMILY_LABELS = {
     "double_follow": "Double Follow",
     "double_fade": "Double Fade",
 }
+
+_FILE_WORKER_EVENTS: list[dict] = []
+_FILE_WORKER_STARTING_BALANCE = 0.0
+_FILE_WORKER_EMPTY_TIMESTAMP = ""
+
+
+def _strategy_backtest_worker_count(strategy_count: int, workload_units: int) -> int:
+    if strategy_count <= 1 or workload_units < 20_000:
+        return 1
+    configured = os.getenv("STRATEGY_BACKTEST_WORKERS", "").strip()
+    if configured:
+        try:
+            requested = int(configured)
+        except ValueError:
+            requested = 0
+        if requested <= 1:
+            return 1
+        return min(strategy_count, requested)
+    return min(strategy_count, max(1, os.cpu_count() or 1))
+
+
+def _init_file_strategy_worker(
+    events: list[dict],
+    starting_balance: float,
+    empty_timestamp: str,
+) -> None:
+    global _FILE_WORKER_EVENTS, _FILE_WORKER_STARTING_BALANCE, _FILE_WORKER_EMPTY_TIMESTAMP
+    _FILE_WORKER_EVENTS = events
+    _FILE_WORKER_STARTING_BALANCE = starting_balance
+    _FILE_WORKER_EMPTY_TIMESTAMP = empty_timestamp
+
+
+def _run_file_strategy_worker(task: tuple[int, dict]) -> tuple[int, dict, dict]:
+    index, specification = task
+    engine = FileBacktester()
+    result = (
+        engine.run(_FILE_WORKER_EVENTS, specification, _FILE_WORKER_STARTING_BALANCE)
+        if _FILE_WORKER_EVENTS else
+        engine.empty_result(_FILE_WORKER_STARTING_BALANCE, _FILE_WORKER_EMPTY_TIMESTAMP)
+    )
+    return index, specification, result
 
 
 class StrategyGroupGenerator:
@@ -75,18 +118,20 @@ class StrategyGroupGenerator:
 
         group_id = uuid.uuid4().hex
         created_at = datetime.now(timezone.utc).isoformat()
+        specifications = self.specifications(strategy_count, assumed_ask_price)
+        results = self._run_strategy_backtests(
+            events,
+            specifications,
+            starting_balance,
+            period_start.isoformat(),
+            progress,
+            cancel_check,
+        )
         strategies = []
         transactions = []
-        for index, specification in enumerate(
-            self.specifications(strategy_count, assumed_ask_price), start=1
-        ):
+        for index, specification, result in results:
             if cancel_check:
                 cancel_check()
-            result = (
-                self.engine.run(events, specification, starting_balance)
-                if events else
-                self.engine.empty_result(starting_balance, period_start.isoformat())
-            )
             strategy_id = uuid.uuid4().hex
             strategy = {
                 "id": strategy_id,
@@ -115,13 +160,6 @@ class StrategyGroupGenerator:
                 {"strategy_id": strategy_id, "group_id": group_id, **transaction}
                 for transaction in result["transactions"]
             )
-            if progress:
-                progress({
-                    "stage": "backtest",
-                    "message": f"Running strategy backtests: generated strategy {index} of {strategy_count}...",
-                    "current": index,
-                    "total": strategy_count,
-                })
 
         rois = [strategy["metrics"]["roi"] for strategy in strategies]
         group = {
@@ -167,6 +205,70 @@ class StrategyGroupGenerator:
             "timeframe": timeframe,
         })
         return group
+
+    def _run_strategy_backtests(
+        self,
+        events: list[dict],
+        specifications: list[dict],
+        starting_balance: float,
+        empty_timestamp: str,
+        progress: Callable[[dict], None] | None,
+        cancel_check: Callable[[], None] | None,
+    ) -> list[tuple[int, dict, dict]]:
+        total = len(specifications)
+        worker_count = _strategy_backtest_worker_count(total, total * len(events))
+        if worker_count == 1:
+            results = []
+            for index, specification in enumerate(specifications, start=1):
+                if cancel_check:
+                    cancel_check()
+                result = (
+                    self.engine.run(events, specification, starting_balance)
+                    if events else
+                    self.engine.empty_result(starting_balance, empty_timestamp)
+                )
+                results.append((index, specification, result))
+                if progress:
+                    progress({
+                        "stage": "backtest",
+                        "message": f"Running strategy backtests: generated strategy {index} of {total}...",
+                        "current": index,
+                        "total": total,
+                    })
+            return results
+
+        results: list[tuple[int, dict, dict] | None] = [None] * total
+        completed = 0
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_file_strategy_worker,
+            initargs=(events, starting_balance, empty_timestamp),
+        )
+        try:
+            futures = [
+                executor.submit(_run_file_strategy_worker, (index, specification))
+                for index, specification in enumerate(specifications, start=1)
+            ]
+            for future in as_completed(futures):
+                if cancel_check:
+                    cancel_check()
+                index, specification, result = future.result()
+                results[index - 1] = (index, specification, result)
+                completed += 1
+                if progress:
+                    progress({
+                        "stage": "backtest",
+                        "message": (
+                            f"Running strategy backtests in parallel "
+                            f"({worker_count} workers): generated strategy {completed} of {total}..."
+                        ),
+                        "current": completed,
+                        "total": total,
+                        "workers": worker_count,
+                    })
+        finally:
+            executor.shutdown(cancel_futures=True)
+        return [item for item in results if item is not None]
 
     def retest(
         self,

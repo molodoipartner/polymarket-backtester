@@ -4,6 +4,7 @@ import asyncio
 import json
 import hashlib
 import os
+import random
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,8 @@ class PolymarketClient:
     # response is also how we detect the final page.
     GAMMA_EVENTS_PAGE_LIMIT = 100
     MEMORY_CACHE_MAX_ENTRIES = 128
+    REQUEST_MAX_ATTEMPTS = 6
+    REQUEST_BASE_DELAY_SECONDS = 0.75
 
     def __init__(self, timeout: float = 20, cache_dir: Path | None = None) -> None:
         connection_limit = max(32, settings.history_request_concurrency * 2)
@@ -144,9 +147,7 @@ class PolymarketClient:
 
     async def _get_json(self, url: str, params: dict[str, Any], ttl: int) -> Any:
         if self.cache_dir is None or ttl <= 0:
-            response = await self.http.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+            return await self._request_json(url, params)
 
         identity = json.dumps([url, params], sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -162,9 +163,7 @@ class PolymarketClient:
             return cached[1]
 
         try:
-            response = await self.http.get(url, params=params)
-            response.raise_for_status()
-            payload = response.json()
+            payload = await self._request_json(url, params)
         except (httpx.HTTPError, ValueError):
             if cached:
                 self._remember(key, cached)
@@ -174,6 +173,55 @@ class PolymarketClient:
         self._remember(key, (now, payload))
         await self._write_cache(path, payload)
         return payload
+
+    async def _request_json(self, url: str, params: dict[str, Any]) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(self.REQUEST_MAX_ATTEMPTS):
+            response = None
+            try:
+                response = await self.http.get(url, params=params)
+                status_code = getattr(response, "status_code", None)
+                if self._is_retryable_status(status_code):
+                    if attempt + 1 >= self.REQUEST_MAX_ATTEMPTS:
+                        response.raise_for_status()
+                    await asyncio.sleep(self._retry_delay(attempt, response))
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except (httpx.TimeoutException, httpx.TransportError) as error:
+                last_error = error
+                if attempt + 1 >= self.REQUEST_MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(self._retry_delay(attempt, response))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Gamma request failed")
+
+    @staticmethod
+    def _is_retryable_status(status_code: int | None) -> bool:
+        return status_code == 429 or (status_code is not None and status_code >= 500)
+
+    @classmethod
+    def _retry_delay(cls, attempt: int, response: httpx.Response | None = None) -> float:
+        retry_after = cls._retry_after_seconds(response) if response is not None else None
+        if retry_after is not None:
+            return min(30.0, retry_after)
+        base = cls.REQUEST_BASE_DELAY_SECONDS * (2 ** attempt)
+        jitter = random.uniform(0, cls.REQUEST_BASE_DELAY_SECONDS)
+        return min(30.0, base + jitter)
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        value = response.headers.get("retry-after")
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            parsed = parse_datetime(value)
+            if parsed is None:
+                return None
+            return max(0.0, parsed.timestamp() - time.time())
 
     def _remember(self, key: str, value: tuple[float, Any]) -> None:
         self._memory_cache.pop(key, None)

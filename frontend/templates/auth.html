@@ -13,6 +13,19 @@
     <label>Password<input type="password" name="password" minlength="8" autocomplete="{{ 'new-password' if mode == 'signup' else 'current-password' }}" required></label>
     <button class="primary w-full">{{ 'Create account' if mode == 'signup' else 'Log in' }}</button>
   </form>
+  {% if mode == 'login' and local_data_tools %}
+  <section class="panel mt-5 space-y-3">
+    <div>
+      <p class="eyebrow">Local development</p>
+      <h2 class="text-lg">Local data and .env login</h2>
+      <p class="muted mt-1">Current .env user: {{ local_env_username or '-' }}</p>
+    </div>
+    <div class="grid gap-3 sm:grid-cols-2">
+      <button class="secondary" type="button" data-local-data-open>Choose data profile</button>
+      <form method="post" action="/login/env"><button class="primary w-full" type="submit">Log in from .env</button></form>
+    </div>
+  </section>
+  {% endif %}
   <p class="mt-5 text-center text-sm text-slate-400">
     {% if mode == 'signup' %}Already have an account? <a class="text-neon" href="/login">Log in</a>{% else %}New here? <a class="text-neon" href="/signup">Create account</a>{% endif %}
   </p>

@@ -5,6 +5,7 @@ import math
 import shutil
 import threading
 import uuid
+import heapq
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -388,6 +389,71 @@ class FileStore:
                         break
         return rows
 
+    def top_user_records_by_numeric(
+        self,
+        user_id: str,
+        collection: str,
+        filters: dict[str, Any],
+        numeric_field: str,
+        limit: int = 20,
+        largest: bool = True,
+    ) -> list[dict]:
+        self._validate_collection(collection)
+        if not 1 <= limit <= 100:
+            raise ValueError("Invalid top record limit")
+        path = self._user_dir(user_id) / f"{collection}.jsonl"
+
+        def matches(item: dict) -> bool:
+            return all(item.get(key) == value for key, value in filters.items())
+
+        heap: list[tuple[float, int, dict]] = []
+        counter = 0
+        with self._guard():
+            for item in self._iter_jsonl(path):
+                if not matches(item):
+                    continue
+                try:
+                    value = float(item.get(numeric_field, 0))
+                except (TypeError, ValueError):
+                    continue
+                score = value if largest else -value
+                entry = (score, counter, item)
+                counter += 1
+                if len(heap) < limit:
+                    heapq.heappush(heap, entry)
+                elif score > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+        rows = [item for _score, _counter, item in sorted(heap, reverse=True)]
+        return sorted(
+            rows,
+            key=lambda item: float(item.get(numeric_field, 0)),
+            reverse=largest,
+        )
+
+    def find_user_record_reverse(
+        self,
+        user_id: str,
+        collection: str,
+        filters: dict[str, Any],
+        max_scan_bytes: int | None = None,
+    ) -> dict | None:
+        self._validate_collection(collection)
+
+        def matches(item: dict) -> bool:
+            return all(item.get(key) == value for key, value in filters.items())
+
+        path = self._user_dir(user_id) / f"{collection}.jsonl"
+        iterator = (
+            self._iter_jsonl_reverse_limited(path, max_scan_bytes=max_scan_bytes)
+            if max_scan_bytes is not None
+            else self._iter_jsonl_reverse(path)
+        )
+        with self._guard():
+            for item in iterator:
+                if matches(item):
+                    return item
+        return None
+
     def get_user_record(self, user_id: str, collection: str, record_id: str) -> dict | None:
         self._validate_collection(collection)
         self._safe_id(record_id)
@@ -551,6 +617,44 @@ class FileStore:
                 self._write_jsonl(self._user_dir(user_id) / f"{collection}.jsonl", [])
             self._write_json(self._favorites_path(user_id), {})
             self.log(user_id, "strategy_groups_deleted", {"permanent": True})
+
+    def clear_project_cache_preserving_accounts(self) -> dict[str, int]:
+        with self._guard():
+            profile_paths = list(self.users_dir.glob("*/profile.json"))
+            removed_user_records = 0
+            for profile_path in profile_paths:
+                user_dir = profile_path.parent
+                for collection in self.COLLECTIONS:
+                    path = user_dir / f"{collection}.jsonl"
+                    removed_user_records += self._jsonl_row_count(path)
+                    self._write_jsonl(path, [])
+                favorites_path = user_dir / "strategy_favorites.json"
+                if favorites_path.exists():
+                    favorites_path.unlink()
+
+            removed_fixed_events = self.count_fixed_events()
+            removed_paths = 0
+            for path in (
+                self.market_dir,
+                self.root / "cache",
+                self.root / "jobs",
+                self.root / "live_monitor",
+            ):
+                if path.exists():
+                    shutil.rmtree(path)
+                    removed_paths += 1
+
+            self.market_dir.mkdir(parents=True, exist_ok=True)
+            self.events_path.touch(exist_ok=True)
+            self.coverage_path.touch(exist_ok=True)
+            self.system_logs_path.write_text("", encoding="utf-8")
+            self._jsonl_cache.clear()
+            return {
+                "accounts_preserved": len(profile_paths),
+                "user_records_removed": removed_user_records,
+                "fixed_events_removed": removed_fixed_events,
+                "directories_removed": removed_paths,
+            }
 
     def log(self, user_id: str, event: str, details: dict | None = None) -> dict:
         return self.append_user_record(
@@ -1054,6 +1158,13 @@ class FileStore:
             "rows": values,
             "by_id": {item.get("id"): item for item in values if item.get("id")},
         }
+
+    @staticmethod
+    def _jsonl_row_count(path: Path) -> int:
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
 
     def _append_jsonl_many(self, path: Path, values: list[dict]) -> None:
         if not values:

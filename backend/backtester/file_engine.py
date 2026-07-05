@@ -6,6 +6,8 @@ from statistics import fmean, pstdev
 
 from backend.fixed_time import TIMEFRAME_SECONDS, parse_utc_datetime
 
+MIN_POSITION_BUDGET = 1.0
+
 
 class FileBacktester:
     """Cash-and-margin backtester for fixed-expiration binary contracts."""
@@ -159,6 +161,8 @@ class FileBacktester:
             budget_scale = total_budget / sum(raw_budgets) if sum(raw_budgets) else 0
             for (event, prediction, analysis_outcomes, allocation_pct_used), raw_budget in zip(signals, raw_budgets):
                 budget_per_position = raw_budget * budget_scale
+                if budget_per_position < MIN_POSITION_BUDGET:
+                    continue
                 ask_price = assumed_ask_price
                 margin_locked = budget_per_position / (1 + fee_rate)
                 entry_fee = budget_per_position - margin_locked

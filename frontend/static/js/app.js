@@ -36,6 +36,20 @@ const finiteNumber=value=>{
   const number=Number(value);
   return Number.isFinite(number)?number:null;
 };
+const errorDetailMessage=(detail,fallback='Request failed')=>{
+  if(Array.isArray(detail)){
+    return detail.map(item=>{
+      if(item&&typeof item==='object'){
+        const where=Array.isArray(item.loc)?item.loc.filter(part=>part!=='body').join('.'):'';
+        const msg=item.msg||item.message||JSON.stringify(item);
+        return where?where+': '+msg:msg;
+      }
+      return String(item);
+    }).join('; ')||fallback;
+  }
+  if(detail&&typeof detail==='object')return detail.message||detail.detail||JSON.stringify(detail);
+  return detail?String(detail):fallback;
+};
 const liveContractSeries=(history,key)=>history.map(row=>{
   const timestamp=finiteNumber(row.t),value=finiteNumber(row[key]);
   return timestamp===null?null:{x:timestamp*1000,y:value};
@@ -92,9 +106,10 @@ function drawTradeContractChart(canvas,payload){
   const entry=Number.isFinite(entryY)?[point(trade.opened_at,entryY)]:[];
   const exit=Number.isFinite(exitY)?[point(trade.closed_at,exitY)]:[];
   const entryColor=side==='DOWN'?'#ff647c':neon;
+  const exitLabel=trade.exit_type&&trade.exit_type!=='settlement'?'Bid exit':'Expiration exit';
   return replaceChart(canvas,{type:'line',data:{datasets:liveContractChartDatasets(history,[
     {label:side+' entry',type:'scatter',data:entry,backgroundColor:entryColor,borderColor:'#07111f',borderWidth:3,yAxisID:'contract',pointStyle:'triangle',rotation:side==='DOWN'?180:0,pointRotation:side==='DOWN'?180:0,pointRadius:13,pointHoverRadius:15,order:-20,parsing:false},
-    {label:'Expiration exit',type:'scatter',data:exit,backgroundColor:Number(trade.pnl)>=0?neon:'#ff647c',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointRadius:8,pointHoverRadius:10,order:-10,parsing:false}
+    {label:exitLabel,type:'scatter',data:exit,backgroundColor:Number(trade.pnl)>=0?neon:'#ff647c',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointRadius:8,pointHoverRadius:10,order:-10,parsing:false}
   ])},options:liveContractChartOptions(history)});
 }
 function initStrategyTradeContractCharts(){
@@ -118,7 +133,10 @@ function initStrategyTradeContractCharts(){
         if(symbol)symbol.textContent=(record.crypto_symbol||'Live contract')+' / '+(trade.side||'trade');
         const entryCents=Number(trade.entry_price_cents);
         const axisCents=Number(trade.entry_yes_axis_cents);
-        if(meta)meta.textContent='Entry '+new Date(trade.opened_at).toLocaleString()+' at '+(Number.isFinite(entryCents)?entryCents.toFixed(2):'-')+'c ('+(Number.isFinite(axisCents)?axisCents.toFixed(2):'-')+'c on YES axis); exit at expiration '+new Date(trade.closed_at).toLocaleString()+'.';
+        const exitCents=Number(trade.exit_price_cents),exitAxis=Number(trade.exit_yes_axis_cents),edge=Number(trade.entry_edge_cents),prob=Number(trade.entry_probability);
+        const exitKind=trade.exit_type&&trade.exit_type!=='settlement'?'bid '+String(trade.exit_type).replaceAll('_',' '):'expiration settlement';
+        const insight=(Number.isFinite(edge)||Number.isFinite(prob))?' fair '+(Number.isFinite(prob)?(prob*100).toFixed(1)+'%':'-')+', edge '+(Number.isFinite(edge)?edge.toFixed(2):'-')+'c;':'';
+        if(meta)meta.textContent='Entry '+new Date(trade.opened_at).toLocaleString()+' at '+(Number.isFinite(entryCents)?entryCents.toFixed(2):'-')+'c ('+(Number.isFinite(axisCents)?axisCents.toFixed(2):'-')+'c on YES axis);'+insight+' exit '+new Date(trade.closed_at).toLocaleString()+' via '+exitKind+' at '+(Number.isFinite(exitCents)?exitCents.toFixed(2):'-')+'c ('+(Number.isFinite(exitAxis)?exitAxis.toFixed(2):'-')+'c on YES axis).';
         if(wrap)wrap.classList.remove('hidden');
         drawTradeContractChart(canvas,payload);
         detailRow.dataset.loaded='true';
@@ -126,6 +144,39 @@ function initStrategyTradeContractCharts(){
       }catch(error){
         if(status)status.textContent='Failed';
         const meta=detailRow.querySelector('[data-trade-contract-meta]');
+        if(meta)meta.textContent=error.message;
+      }
+    });
+  });
+}
+function initSavedContractInlineCharts(){
+  document.querySelectorAll('[data-saved-contract-toggle]').forEach(button=>{
+    button.addEventListener('click',async()=>{
+      const detailRow=button.closest('tr')?.nextElementSibling;
+      if(!detailRow||!detailRow.matches('[data-saved-contract-row]'))return;
+      const isOpen=!detailRow.classList.contains('hidden');
+      if(isOpen){detailRow.classList.add('hidden');button.textContent='Open';return}
+      detailRow.classList.remove('hidden');button.textContent='Hide';
+      const status=detailRow.querySelector('[data-saved-contract-status]'),wrap=detailRow.querySelector('[data-saved-contract-chart-wrap]'),canvas=detailRow.querySelector('[data-saved-contract-chart]');
+      if(detailRow.dataset.loaded==='true'){if(wrap)wrap.classList.remove('hidden');return}
+      if(status)status.textContent='Loading';
+      try{
+        const response=await fetch('/api/live-monitor/saved/'+encodeURIComponent(button.dataset.recordId||''),{headers:{Accept:'application/json'}});
+        const payload=await response.json();
+        if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to load saved contract'));
+        const record=payload.record||{},history=(record.history||[]).filter(row=>Number.isFinite(Number(row.t)));
+        const title=detailRow.querySelector('[data-saved-contract-title]'),symbol=detailRow.querySelector('[data-saved-contract-symbol]'),meta=detailRow.querySelector('[data-saved-contract-meta]');
+        if(title)title.textContent=record.question||record.slug||'Saved contract';
+        if(symbol)symbol.textContent=(record.crypto_symbol||'Live contract')+' / saved';
+        const price=value=>Number.isFinite(Number(value))?'$'+Number(value).toLocaleString(undefined,{maximumFractionDigits:8}):'-';
+        if(meta)meta.textContent='Target '+price(record.target_price)+'; final '+price(record.final_crypto_price)+'; outcome '+(record.winning_outcome||'-')+'. '+(record.unsuitable_reason||'');
+        if(wrap)wrap.classList.remove('hidden');
+        replaceChart(canvas,{type:'line',data:{datasets:liveContractChartDatasets(history)},options:liveContractChartOptions(history)});
+        detailRow.dataset.loaded='true';
+        if(status)status.textContent='Loaded';
+      }catch(error){
+        if(status)status.textContent='Failed';
+        const meta=detailRow.querySelector('[data-saved-contract-meta]');
         if(meta)meta.textContent=error.message;
       }
     });
@@ -332,16 +383,20 @@ function initLiveAnalysis(){
   if(!filterForm||!generationForm)return;
   const summaryStatus=document.getElementById('live-analysis-summary-status'),loadingPanel=document.getElementById('live-analysis-summary-loading');
   const rangePanel=document.getElementById('live-analysis-range'),submitButton=generationForm.querySelector('button[type="submit"]');
+  const loadRangeButton=document.getElementById('live-analysis-load-range');
   const progressPanel=document.getElementById('live-analysis-progress'),progressStatus=document.getElementById('live-analysis-progress-status'),progressBar=document.getElementById('live-analysis-progress-bar'),progressLog=document.getElementById('live-analysis-live-log'),cancelButton=document.getElementById('live-analysis-cancel');
-  let summaryController=null,activeSource=null,activeJobId=null;
+  let summaryController=null,activeSource=null,activeJobId=null,rangeLoaded=false;
   const setSummaryStatus=(text,mode='')=>{if(summaryStatus){summaryStatus.textContent=text;summaryStatus.className='badge '+mode}};
   const appendProgress=message=>{if(!progressLog||!message)return;const row=document.createElement('p');row.textContent=new Date().toLocaleTimeString()+'  '+message;progressLog.appendChild(row);while(progressLog.childElementCount>250)progressLog.firstElementChild.remove();progressLog.scrollTop=progressLog.scrollHeight};
   const closeSource=()=>{if(activeSource){activeSource.close();activeSource=null}};
   const syncGenerationFields=()=>{
     const asset=filterForm.querySelector('[name="asset_symbol"]')?.value||'BTC';
     const timeframe=filterForm.querySelector('[name="timeframe"]')?.value||'5m';
+    const strategyMode=filterForm.querySelector('[name="strategy_mode"]')?.value||'lightweight';
     generationForm.querySelector('input[name="asset_symbol"]').value=asset;
     generationForm.querySelector('input[name="timeframe"]').value=timeframe;
+    const strategyModeInput=generationForm.querySelector('input[name="strategy_mode"]');
+    if(strategyModeInput)strategyModeInput.value=strategyMode;
     const groupName=generationForm.querySelector('input[name="group_name"]');
     if(groupName&&!groupName.dataset.touched)groupName.value='Live_'+asset+'_5m';
     const include=!!filterForm.querySelector('[name="include_partial_contracts"]')?.checked;
@@ -361,37 +416,42 @@ function initLiveAnalysis(){
     document.querySelectorAll('[data-live-analysis-metric]').forEach(element=>{
       const value=summary[element.dataset.liveAnalysisMetric];
       element.textContent=Number.isFinite(Number(value))?Number(value).toLocaleString():String(value??'-');
-      element.classList.toggle('loss',element.dataset.liveAnalysisMetric==='partial_contracts'&&Number(value)>0||element.dataset.liveAnalysisMetric==='unsuitable_contracts'&&Number(value)>0);
+      element.classList.toggle('loss',element.dataset.liveAnalysisMetric==='partial_contracts'&&Number(value)>0||element.dataset.liveAnalysisMetric==='unsuitable_contracts'&&Number(value)>0||element.dataset.liveAnalysisMetric==='target_price_anomaly_contracts'&&Number(value)>0);
     });
     document.querySelectorAll('[data-live-range-count]').forEach(element=>{
       const count=Number(summary.selected_contracts)||0;
       element.textContent=element.dataset.liveRangeCountFormat==='number'?String(count):count+' selected';
     });
     if(rangePanel&&summary.range_start_ts&&summary.range_end_ts){
-      rangePanel.classList.remove('hidden');
-      rangePanel.dataset.contracts=JSON.stringify(summary.contracts||[]);
-      rangePanel.dataset.minTs=String(summary.range_start_ts);
-      rangePanel.dataset.maxTs=String(summary.range_end_ts);
-      rangePanel.dataset.selectedStartTs=String(summary.selected_start_ts||summary.range_start_ts);
-      rangePanel.dataset.selectedEndTs=String(summary.selected_end_ts||summary.range_end_ts);
-      setupLiveTimeRange(rangePanel);
+      if(summary.contracts_loaded){
+        rangePanel.classList.remove('hidden');
+        rangePanel.dataset.contracts=JSON.stringify(summary.contracts||[]);
+        rangePanel.dataset.minTs=String(summary.range_start_ts);
+        rangePanel.dataset.maxTs=String(summary.range_end_ts);
+        rangePanel.dataset.selectedStartTs=String(summary.selected_start_ts||summary.range_start_ts);
+        rangePanel.dataset.selectedEndTs=String(summary.selected_end_ts||summary.range_end_ts);
+        setupLiveTimeRange(rangePanel);
+        rangeLoaded=true;
+        if(loadRangeButton)loadRangeButton.textContent='Refresh range selector';
+      }
     }else if(rangePanel){
       rangePanel.classList.add('hidden');
     }
     if(submitButton)submitButton.disabled=(Number(summary.selected_contracts)||0)<=0;
   };
-  const loadSummary=async(updateUrl=false)=>{
+  const loadSummary=async(updateUrl=false,includeContracts=false)=>{
     syncGenerationFields();
     if(summaryController)summaryController.abort();
     summaryController=new AbortController();
-    setSummaryStatus('Loading');
+    setSummaryStatus(includeContracts?'Loading range':'Loading');
     if(loadingPanel)loadingPanel.classList.remove('hidden');
     if(submitButton)submitButton.disabled=true;
     const params=summaryParams();
+    if(includeContracts)params.set('include_contracts','true');
     try{
       const response=await fetch((filterForm.dataset.summaryUrl||'/api/live-monitor/analysis/summary')+'?'+params.toString(),{headers:{Accept:'application/json'},signal:summaryController.signal});
       const payload=await response.json();
-      if(!response.ok)throw new Error(payload.detail||'Unable to load live analysis summary');
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to load live analysis summary'));
       renderSummary(payload);
       setSummaryStatus('Ready');
       if(loadingPanel)loadingPanel.classList.add('hidden');
@@ -419,8 +479,9 @@ function initLiveAnalysis(){
     if(payload.message)appendProgress(payload.message);
   };
   if(generationForm.querySelector('input[name="group_name"]'))generationForm.querySelector('input[name="group_name"]').addEventListener('input',event=>{event.currentTarget.dataset.touched='true'});
-  filterForm.addEventListener('submit',event=>{event.preventDefault();loadSummary(true)});
-  filterForm.querySelectorAll('select,input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>loadSummary(true)));
+  filterForm.addEventListener('submit',event=>{event.preventDefault();rangeLoaded=false;if(rangePanel)rangePanel.classList.add('hidden');loadSummary(true,false)});
+  filterForm.querySelectorAll('select,input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>{rangeLoaded=false;if(rangePanel)rangePanel.classList.add('hidden');loadSummary(true,false)}));
+  if(loadRangeButton)loadRangeButton.addEventListener('click',()=>loadSummary(true,true));
   generationForm.addEventListener('submit',async event=>{
     event.preventDefault();closeSource();syncGenerationFields();
     if(progressPanel)progressPanel.classList.remove('hidden');
@@ -430,7 +491,7 @@ function initLiveAnalysis(){
     try{
       const response=await fetch(generationForm.dataset.jobUrl||'/api/live-monitor/analysis/jobs',{method:'POST',body:new FormData(generationForm),headers:{Accept:'application/json'}});
       const payload=await response.json();
-      if(!response.ok)throw new Error(payload.detail||'Unable to start live analysis generation');
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to start live analysis generation'));
       activeJobId=payload.job_id;
       if(cancelButton){cancelButton.classList.remove('hidden');cancelButton.disabled=false;cancelButton.textContent='Stop / Cancel'}
       activeSource=new EventSource(payload.events_url);
@@ -452,7 +513,7 @@ function initLiveAnalysis(){
     try{await fetch('/api/group-jobs/'+activeJobId+'/cancel',{method:'POST',headers:{Accept:'application/json'}})}catch(error){appendProgress('Cancel request failed: '+error.message)}
   });
   window.addEventListener('pagehide',()=>{closeSource();if(summaryController)summaryController.abort()},{once:true});
-  loadSummary(false);
+  loadSummary(false,false);
 }
 function initLiveMonitor(){
   const panel=document.getElementById('live-monitor');if(!panel)return;
@@ -555,6 +616,7 @@ function initLiveMonitor(){
       card,
       lastPayloadAt:0,
       staleWarningShown:false,
+      streamWarningShown:false,
       eventTitle:card.querySelector('[data-live-event-title]'),
       eventSlug:card.querySelector('[data-live-event-slug]'),
       cryptoPrice:card.querySelector('[data-live-crypto-price]'),
@@ -614,6 +676,7 @@ function initLiveMonitor(){
   const updateChart=(payload,controller)=>{
     if(!controller.chartOpen)return;
     const current=ensureChart(controller);if(!current)return;
+    if(!Array.isArray(payload.history)||!payload.history.length)return;
     const history=(payload.history||[]).filter(row=>Number.isFinite(row.t));
     const series=key=>history.map(row=>({x:Number(row.t)*1000,y:Number.isFinite(row[key])?Number(row[key]):null}));
     current.data.datasets[0].data=series('crypto_price');
@@ -759,7 +822,7 @@ function initLiveMonitor(){
   };
   const render=(payload,controller)=>{
     controller.latestPayload=payload;
-    controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;
+    controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false;
     controller.eventTitle.textContent=payload.event?.title||'Live session';
     controller.eventSlug.textContent=payload.event?.slug||'-';
     controller.cryptoPrice.textContent=fmtPrice(payload.crypto?.price);
@@ -788,11 +851,20 @@ function initLiveMonitor(){
     controller.source.addEventListener('crypto',listener);
     controller.source.addEventListener('status',listener);
     controller.source.addEventListener('tick',listener);
+    controller.source.addEventListener('ping',()=>{controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false});
     controller.source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')},controller)});
     controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);loadSaved()});
     controller.source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog(data.log,controller)});
     controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved()});
-    controller.source.onerror=error=>{controller.quoteStatus.textContent='Stream reconnecting';console.error('[live-monitor] SSE error',error);appendLog({level:'error',source:'browser',message:'SSE stream interrupted; browser will retry.'},controller)};
+    controller.source.onerror=error=>{
+      const age=controller.lastPayloadAt?(Date.now()-controller.lastPayloadAt)/1000:Infinity;
+      controller.quoteStatus.textContent='Stream reconnecting';
+      console.error('[live-monitor] SSE error',error);
+      if(age>8&&!controller.streamWarningShown){
+        controller.streamWarningShown=true;
+        appendLog({level:'error',source:'browser',message:'SSE stream interrupted for '+age.toFixed(1)+'s; browser will retry.'},controller);
+      }
+    };
     return controller;
   };
   const restoreActiveSession=async()=>{
@@ -834,6 +906,7 @@ function initLiveMonitor(){
         tr.children[4].textContent=fmtPrice(record.final_crypto_price);
         const tags=[];
         if(record.unsuitable_contract)tags.push('Unsuitable');
+        if(record.target_price_anomaly)tags.push('Target anomaly');
         if(record.partial_contract)tags.push('Partial');
         tr.children[5].textContent=(record.winning_outcome||'-')+(tags.length?' - '+tags.join(', '):'');
         tr.children[6].textContent=record.history_count==null?'-':String(record.history_count);
@@ -875,7 +948,7 @@ function initLiveMonitor(){
     sessionControllers.forEach(controller=>{
       if(!controller.source||!controller.lastPayloadAt)return;
       const age=(Date.now()-controller.lastPayloadAt)/1000;
-      if(age>4&&!controller.staleWarningShown){
+      if(age>8&&!controller.staleWarningShown){
         controller.staleWarningShown=true;
         setDot(controller.quoteDot,false,true);
         appendLog({level:'error',source:'browser',message:'No SSE payload received for '+age.toFixed(1)+'s. Backend stream may be stuck.'},controller);
@@ -908,8 +981,9 @@ function initLiveMonitor(){
   restoreActiveSession();
 }
 function initLocalDataTools(){
-  const openButton=document.getElementById('local-data-open'),drawer=document.getElementById('local-data-drawer'),backdrop=document.getElementById('local-data-backdrop');
-  if(!openButton||!drawer||!backdrop)return;
+  const drawer=document.getElementById('local-data-drawer'),backdrop=document.getElementById('local-data-backdrop');
+  const openButtons=document.querySelectorAll('[data-local-data-open]');
+  if(!openButtons.length||!drawer||!backdrop)return;
   const closeButton=document.getElementById('local-data-close'),status=document.getElementById('local-data-status'),list=document.getElementById('local-data-list'),refreshButton=document.getElementById('local-data-refresh'),downloadButton=document.getElementById('local-data-download'),tokenForm=document.getElementById('local-data-token-form'),tokenInput=document.getElementById('local-data-token');
   let loading=false;
   const setStatus=(text,mode='')=>{status.textContent=text;status.className='local-data-status '+mode};
@@ -1000,7 +1074,7 @@ function initLocalDataTools(){
       loadProfiles();
     }
   };
-  openButton.addEventListener('click',open);
+  openButtons.forEach(button=>button.addEventListener('click',open));
   closeButton&&closeButton.addEventListener('click',close);
   backdrop.addEventListener('click',close);
   refreshButton&&refreshButton.addEventListener('click',loadProfiles);
@@ -1008,4 +1082,4 @@ function initLocalDataTools(){
   tokenForm&&tokenForm.addEventListener('submit',saveToken);
 }
 window.addEventListener('pagehide',()=>{chartInstances.forEach(chart=>chart.destroy());chartInstances.clear()},{once:true});
-document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initLiveRetestLoading();initLiveMonitor();initLocalDataTools()});
+document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initSavedContractInlineCharts();initLiveRetestLoading();initLiveMonitor();initLocalDataTools()});

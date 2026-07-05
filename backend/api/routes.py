@@ -8,6 +8,7 @@ import queue
 import shutil
 import tarfile
 import threading
+import time
 import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
+from dotenv import dotenv_values
 from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -104,6 +106,15 @@ def _require_local_data_tools(request: Request) -> None:
         raise HTTPException(404, "Local data tools are available only in local development")
 
 
+def _local_env_login_credentials() -> tuple[str, str]:
+    values = dotenv_values(ROOT_DIR / ".env")
+    username = str(values.get("USERNAME") or settings.username).strip()
+    password = str(values.get("PASSWORD") or settings.password)
+    if not username or not password:
+        raise HTTPException(400, "USERNAME and PASSWORD must be set in .env")
+    return username, password
+
+
 def _ensure_stability(strategy: dict) -> None:
     metrics = strategy["metrics"]
     if "stability_score" not in metrics:
@@ -171,6 +182,117 @@ def _trade_summary_from_metrics(metrics: dict) -> dict[str, int]:
     }
 
 
+def _family_profit_summary(strategies: list[dict]) -> list[dict]:
+    buckets: dict[str, dict] = {}
+    phases = (1, 2, 3)
+    for strategy in strategies:
+        key = strategy.get("family") or "unknown"
+        metrics = strategy.get("metrics", {})
+        bucket = buckets.setdefault(
+            key,
+            {
+                "family": key,
+                "family_label": strategy.get("family_label") or key.replace("_", " ").title(),
+                "strategy_count": 0,
+                "profitable_count": 0,
+                "total_roi": 0.0,
+                "best_roi": None,
+                "total_trades": 0,
+                "total_net_profit": 0.0,
+                "phases": {
+                    phase: {
+                        "phase": phase,
+                        "tested_count": 0,
+                        "profitable_count": 0,
+                        "total_roi": 0.0,
+                        "best_roi": None,
+                    }
+                    for phase in phases
+                },
+            },
+        )
+        roi = float(metrics.get("roi", 0) or 0)
+        bucket["strategy_count"] += 1
+        bucket["profitable_count"] += int(roi > 0)
+        bucket["total_roi"] += roi
+        bucket["best_roi"] = roi if bucket["best_roi"] is None else max(bucket["best_roi"], roi)
+        bucket["total_trades"] += int(metrics.get("trade_count", 0) or 0)
+        bucket["total_net_profit"] += float(metrics.get("net_profit", 0) or 0)
+        for phase in phases:
+            phase_roi = _number_or_none(metrics.get(f"phase_{phase}_roi"))
+            if phase_roi is None:
+                continue
+            phase_bucket = bucket["phases"][phase]
+            phase_bucket["tested_count"] += 1
+            phase_bucket["profitable_count"] += int(phase_roi > 0)
+            phase_bucket["total_roi"] += phase_roi
+            phase_bucket["best_roi"] = (
+                phase_roi
+                if phase_bucket["best_roi"] is None
+                else max(phase_bucket["best_roi"], phase_roi)
+            )
+    rows = []
+    for bucket in buckets.values():
+        count = max(1, int(bucket["strategy_count"]))
+        phase_rows = []
+        has_phase_metrics = False
+        for phase in phases:
+            phase_bucket = bucket["phases"][phase]
+            tested_count = int(phase_bucket["tested_count"])
+            has_phase_metrics = has_phase_metrics or tested_count > 0
+            average_roi = phase_bucket["total_roi"] / tested_count if tested_count else 0.0
+            profitable_percent = (
+                phase_bucket["profitable_count"] / tested_count * 100 if tested_count else 0.0
+            )
+            phase_rows.append({
+                "phase": phase,
+                "tested_count": tested_count,
+                "profitable_count": int(phase_bucket["profitable_count"]),
+                "average_roi": round(average_roi, 6),
+                "best_roi": round(float(phase_bucket["best_roi"] or 0), 6),
+                "profitable_percent": round(profitable_percent, 4),
+            })
+        bucket = {**bucket, "phases": phase_rows, "has_phase_metrics": has_phase_metrics}
+        rows.append({
+            **bucket,
+            "average_roi": round(bucket["total_roi"] / count, 6),
+            "best_roi": round(float(bucket["best_roi"] or 0), 6),
+            "profitable_percent": round(bucket["profitable_count"] / count * 100, 4),
+            "total_net_profit": round(bucket["total_net_profit"], 4),
+        })
+    rows = sorted(
+        rows,
+        key=lambda item: (
+            item["phases"][2]["average_roi"],
+            item["phases"][1]["average_roi"],
+            item["phases"][0]["average_roi"],
+            item["profitable_percent"],
+            item["average_roi"],
+            item["best_roi"],
+            item["strategy_count"],
+        ),
+        reverse=True,
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+        row["generated_count"] = row["strategy_count"]
+        row["final_strategy_count"] = row["strategy_count"]
+    return rows
+
+
+def _normalize_live_bid_exit_outcomes(live_monitor, user_id: str, transactions: list[dict]) -> None:
+    for transaction in transactions:
+        if str(transaction.get("resolved_outcome") or "").upper() != "BID_EXIT":
+            continue
+        saved_record_id = str(transaction.get("saved_record_id") or "").strip()
+        if not saved_record_id:
+            continue
+        record = live_monitor.get_saved(user_id, saved_record_id)
+        outcome = str(record.get("winning_outcome") or "").strip().upper() if record else ""
+        if outcome in {"UP", "DOWN", "FLAT"}:
+            transaction["resolved_outcome"] = outcome
+
+
 def _number_or_none(value) -> float | None:
     try:
         result = float(value)
@@ -202,6 +324,14 @@ def _error_message(error: BaseException) -> str:
     return error.__class__.__name__
 
 
+def _form_float(value, field: str) -> float | None:
+    return _optional_float(str(value or ""), field)
+
+
+def _form_int(value, field: str, default: int = 0) -> int:
+    return _optional_int(str(value or ""), field) or default
+
+
 def _require_user(request: Request) -> dict:
     user = _user(request)
     if not user or _is_admin(request):
@@ -229,7 +359,14 @@ def _track_job_task(app, job_id: str, task: asyncio.Task) -> None:
 def login_page(request: Request):
     if _user(request):
         return RedirectResponse("/admin" if _is_admin(request) else "/", status_code=303)
-    return templates.TemplateResponse(request, "auth.html", _context(request, mode="login"))
+    local_env_username = ""
+    if _local_data_tools_available(request):
+        local_env_username, _ = _local_env_login_credentials()
+    return templates.TemplateResponse(
+        request,
+        "auth.html",
+        _context(request, mode="login", local_env_username=local_env_username),
+    )
 
 
 @router.get("/signup", response_class=HTMLResponse)
@@ -283,12 +420,81 @@ def login(
     return RedirectResponse("/", status_code=303)
 
 
+@router.post("/login/env")
+def login_from_environment(request: Request):
+    _require_local_data_tools(request)
+    store = _store(request)
+    username, password = _local_env_login_credentials()
+    user = store.ensure_user(username, hash_password(password), "Test User")
+    request.session.clear()
+    request.session.update({"user_id": user["id"], "role": "user"})
+    request.state.rotate_session = True
+    store.log(user["id"], "local_env_login")
+    return RedirectResponse("/", status_code=303)
+
+
 @router.post("/logout")
 def logout(request: Request):
     if _is_admin(request):
         _store(request).log_system("admin_logout", {"username": settings.admin_username})
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+@router.get("/account", response_class=HTMLResponse)
+def account_page(request: Request):
+    user = _user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    account = {
+        "id": user.get("id"),
+        "email": user.get("email", ""),
+        "username": user.get("username", ""),
+        "display_name": user.get("display_name", ""),
+        "role": "admin" if _is_admin(request) else "user",
+        "data_root": str(_store(request).root),
+    }
+    return templates.TemplateResponse(
+        request,
+        "account.html",
+        _context(request, account=account),
+    )
+
+
+@router.post("/account/clear-project-cache")
+async def clear_project_cache(request: Request):
+    user = _require_user(request)
+    _require_local_data_tools(request)
+    data_root = _store(request).root
+    tasks = tuple(getattr(request.app.state, "background_tasks", set()))
+    job_tasks = tuple(getattr(request.app.state, "job_tasks", {}).values())
+    for task in tasks + job_tasks:
+        task.cancel()
+    if tasks or job_tasks:
+        await asyncio.gather(*(tasks + job_tasks), return_exceptions=True)
+    old_live_monitor = getattr(request.app.state, "live_monitor", None)
+    old_collector = getattr(request.app.state, "collector", None)
+    if old_live_monitor:
+        await old_live_monitor.close()
+    if old_collector:
+        await old_collector.close()
+
+    result = _store(request).clear_project_cache_preserving_accounts()
+    store = FileStore(data_root)
+    request.app.state.store = store
+    request.app.state.collector = DataCollector(store)
+    request.app.state.job_store = GenerationJobStore(store.root / "jobs")
+    request.app.state.live_monitor = LiveMonitorManager(store.root / "live_monitor")
+    request.app.state.background_tasks = set()
+    request.app.state.job_tasks = {}
+    store.log(user["id"], "project_cache_cleared", result)
+    request.session["message"] = (
+        "Project cache cleared. "
+        f"Accounts preserved: {result['accounts_preserved']}; "
+        f"records removed: {result['user_records_removed']}; "
+        f"fixed events removed: {result['fixed_events_removed']}."
+    )
+    return RedirectResponse("/account", status_code=303)
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -340,14 +546,144 @@ def live_monitor_page(request: Request):
     )
 
 
+@router.get("/live-monitor/quality", response_class=HTMLResponse)
+async def live_monitor_quality_page(
+    request: Request,
+    asset_symbol: str = Query("all"),
+    timeframe: str = Query("5m"),
+    scan: bool = Query(False),
+    check_targets: bool = Query(False),
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    report = None
+    target_report = None
+    if scan or check_targets:
+        category = None if selected_asset == "ALL" else selected_asset.lower()
+        report, target_report = await asyncio.gather(
+            asyncio.to_thread(
+                request.app.state.live_monitor.scan_saved_quality,
+                user["id"],
+                category=category,
+                timeframe=selected_timeframe,
+            ),
+            request.app.state.live_monitor.check_saved_external_targets(
+                user["id"],
+                category=category,
+                timeframe=selected_timeframe,
+            ),
+        )
+    return templates.TemplateResponse(
+        request,
+        "live_monitor_quality.html",
+        _context(
+            request,
+            assets=ASSETS,
+            timeframes={"5m": TIMEFRAMES["5m"]},
+            selected_asset=selected_asset,
+            selected_timeframe=selected_timeframe,
+            report=report,
+            target_report=target_report,
+            scan=scan,
+            check_targets=check_targets or scan,
+        ),
+    )
+
+
+@router.post("/live-monitor/quality/delete-problems")
+async def delete_live_monitor_quality_problems(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    form = await request.form()
+    problem_ids = form.getlist("problem_ids")
+    if problem_ids:
+        deleted = 0
+        for record_id in dict.fromkeys(str(value).strip() for value in problem_ids):
+            if record_id and request.app.state.live_monitor.delete_saved(
+                user["id"],
+                record_id,
+            ):
+                deleted += 1
+        request.session["message"] = (
+            f"Deleted {deleted} problematic saved live-monitor contract(s)."
+        )
+        params = urlencode({
+            "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+            "timeframe": selected_timeframe,
+        })
+        return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+    quality_deleted = request.app.state.live_monitor.delete_saved_quality_issues(
+        user["id"],
+        category=None if selected_asset == "ALL" else selected_asset.lower(),
+        timeframe=selected_timeframe,
+    )
+    gamma_deleted = await request.app.state.live_monitor.delete_saved_external_target_issues(
+        user["id"],
+        category=None if selected_asset == "ALL" else selected_asset.lower(),
+        timeframe=selected_timeframe,
+    )
+    deleted = quality_deleted + gamma_deleted
+    request.session["message"] = (
+        f"Deleted {deleted} problematic saved live-monitor contract(s): "
+        f"{quality_deleted} quality issue(s), {gamma_deleted} Gamma issue(s)."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
+@router.post("/live-monitor/quality/delete-gamma-results")
+async def delete_live_monitor_gamma_results(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    deleted = await request.app.state.live_monitor.delete_saved_external_target_issues(
+        user["id"],
+        category=None if selected_asset == "ALL" else selected_asset.lower(),
+        timeframe=selected_timeframe,
+    )
+    request.session["message"] = (
+        f"Deleted {deleted} saved live-monitor contract(s) from the Gamma check results."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+        "check_targets": "1",
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
 @router.get("/live-monitor/analysis", response_class=HTMLResponse)
 def live_monitor_analysis_page(
     request: Request,
     asset_symbol: str = Query("BTC"),
     timeframe: str = Query("5m"),
+    strategy_mode: str = Query("lightweight"),
     include_partial_contracts: bool = Query(False),
     start_ts: float | None = Query(None),
     end_ts: float | None = Query(None),
+    phase_1_contracts: int = Query(0),
+    phase_2_contracts: int = Query(0),
+    phase_3_contracts: int = Query(0),
 ):
     _require_user(request)
     selected_asset = asset_symbol.upper() if asset_symbol.upper() in ASSETS else "BTC"
@@ -361,9 +697,15 @@ def live_monitor_analysis_page(
             timeframes={"5m": TIMEFRAMES["5m"]},
             selected_asset=selected_asset,
             selected_timeframe=selected_timeframe,
+            selected_strategy_mode=(
+                strategy_mode if strategy_mode in {"lightweight", "smart"} else "lightweight"
+            ),
             include_partial_contracts=include_partial_contracts,
             selected_start_ts=start_ts,
             selected_end_ts=end_ts,
+            phase_1_contracts=max(0, phase_1_contracts),
+            phase_2_contracts=max(0, phase_2_contracts),
+            phase_3_contracts=max(0, phase_3_contracts),
             default_balance=100.0,
         ),
     )
@@ -377,6 +719,7 @@ def live_monitor_analysis_summary(
     include_partial_contracts: bool = Query(False),
     start_ts: float | None = Query(None),
     end_ts: float | None = Query(None),
+    include_contracts: bool = Query(False),
 ):
     user = _require_user(request)
     generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
@@ -388,6 +731,7 @@ def live_monitor_analysis_summary(
             include_partial_contracts,
             start_ts,
             end_ts,
+            include_contracts,
         )
     except ValueError as error:
         raise HTTPException(422, _error_message(error)) from error
@@ -405,11 +749,22 @@ def create_live_monitor_analysis_group(
     timeframe: Annotated[str, Form()],
     strategy_count: Annotated[int, Form()],
     starting_balance: Annotated[float, Form()],
+    strategy_mode: Annotated[str, Form()] = "lightweight",
     include_partial_contracts: Annotated[bool, Form()] = False,
-    start_ts: Annotated[float | None, Form()] = None,
-    end_ts: Annotated[float | None, Form()] = None,
+    start_ts: Annotated[str, Form()] = "",
+    end_ts: Annotated[str, Form()] = "",
+    phase_1_contracts: Annotated[str, Form()] = "0",
+    phase_2_contracts: Annotated[str, Form()] = "0",
+    phase_3_contracts: Annotated[str, Form()] = "0",
 ):
     user = _require_user(request)
+    parsed_start_ts = _form_float(start_ts, "start_ts")
+    parsed_end_ts = _form_float(end_ts, "end_ts")
+    phase_counts = (
+        max(0, _form_int(phase_1_contracts, "phase_1_contracts")),
+        max(0, _form_int(phase_2_contracts, "phase_2_contracts")),
+        max(0, _form_int(phase_3_contracts, "phase_3_contracts")),
+    )
     generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
     try:
         group = generator.generate(
@@ -420,8 +775,10 @@ def create_live_monitor_analysis_group(
             bool(include_partial_contracts),
             strategy_count,
             starting_balance,
-            start_ts,
-            end_ts,
+            parsed_start_ts,
+            parsed_end_ts,
+            strategy_mode,
+            phase_contract_counts=phase_counts,
         )
         request.session["message"] = (
             f"Created {group['strategy_count']} live-monitor strategies from "
@@ -434,11 +791,19 @@ def create_live_monitor_analysis_group(
         "asset_symbol": asset_symbol,
         "timeframe": timeframe,
         "include_partial_contracts": "true" if include_partial_contracts else "false",
+        "strategy_mode": strategy_mode,
     }
-    if start_ts is not None:
-        params["start_ts"] = str(start_ts)
-    if end_ts is not None:
-        params["end_ts"] = str(end_ts)
+    if parsed_start_ts is not None:
+        params["start_ts"] = str(parsed_start_ts)
+    if parsed_end_ts is not None:
+        params["end_ts"] = str(parsed_end_ts)
+    for key, value in (
+        ("phase_1_contracts", phase_counts[0]),
+        ("phase_2_contracts", phase_counts[1]),
+        ("phase_3_contracts", phase_counts[2]),
+    ):
+        if value:
+            params[key] = str(value)
     params = urlencode(params)
     return RedirectResponse(f"/live-monitor/analysis?{params}", status_code=303)
 
@@ -451,11 +816,22 @@ async def start_live_monitor_analysis_job(
     timeframe: Annotated[str, Form()],
     strategy_count: Annotated[int, Form()],
     starting_balance: Annotated[float, Form()],
+    strategy_mode: Annotated[str, Form()] = "lightweight",
     include_partial_contracts: Annotated[bool, Form()] = False,
-    start_ts: Annotated[float | None, Form()] = None,
-    end_ts: Annotated[float | None, Form()] = None,
+    start_ts: Annotated[str, Form()] = "",
+    end_ts: Annotated[str, Form()] = "",
+    phase_1_contracts: Annotated[str, Form()] = "0",
+    phase_2_contracts: Annotated[str, Form()] = "0",
+    phase_3_contracts: Annotated[str, Form()] = "0",
 ):
     user = _require_user(request)
+    parsed_start_ts = _form_float(start_ts, "start_ts")
+    parsed_end_ts = _form_float(end_ts, "end_ts")
+    phase_counts = (
+        max(0, _form_int(phase_1_contracts, "phase_1_contracts")),
+        max(0, _form_int(phase_2_contracts, "phase_2_contracts")),
+        max(0, _form_int(phase_3_contracts, "phase_3_contracts")),
+    )
     job = request.app.state.job_store.create(user["id"])
     task = asyncio.create_task(
         _run_live_monitor_analysis_job(
@@ -468,8 +844,10 @@ async def start_live_monitor_analysis_job(
             bool(include_partial_contracts),
             strategy_count,
             starting_balance,
-            start_ts,
-            end_ts,
+            parsed_start_ts,
+            parsed_end_ts,
+            strategy_mode,
+            phase_counts,
         )
     )
     _track_job_task(request.app, job["id"], task)
@@ -540,13 +918,17 @@ async def live_monitor_events(request: Request, session_id: str):
 
     async def stream():
         try:
+            yield "retry: 1000\n\n"
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    message = await asyncio.wait_for(queue.get(), timeout=15)
+                    message = await asyncio.wait_for(queue.get(), timeout=2)
                 except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
+                    yield (
+                        "event: ping\n"
+                        f"data: {json.dumps({'server_time': time.time()})}\n\n"
+                    )
                     continue
                 yield (
                     f"event: {message['event']}\n"
@@ -855,6 +1237,8 @@ async def _run_live_monitor_analysis_job(
     starting_balance: float,
     start_ts: float | None,
     end_ts: float | None,
+    strategy_mode: str,
+    phase_contract_counts: tuple[int, int, int] | None = None,
 ) -> None:
     def ensure_not_cancelled() -> None:
         current = app.state.job_store.get(job_id)
@@ -903,8 +1287,10 @@ async def _run_live_monitor_analysis_job(
             starting_balance,
             start_ts,
             end_ts,
+            strategy_mode,
             report,
             ensure_not_cancelled,
+            phase_contract_counts,
         )
         report({
             "stage": "complete",
@@ -964,6 +1350,11 @@ def group_detail(
     for item in strategies:
         _ensure_stability(item)
         _ensure_contract_summary(group, item)
+    all_group_strategies = list(strategies)
+    family_summary = (
+        group.get("phase_validation", {}).get("family_rankings")
+        or _family_profit_summary(all_group_strategies)
+    )
     numeric_filters = {
         "min_roi": _optional_float(min_roi, "min_roi"),
         "min_win_rate": _optional_float(min_win_rate, "min_win_rate"),
@@ -1020,8 +1411,44 @@ def group_detail(
                 page_query(strategy_page + 1)
                 if strategy_page < strategy_page_count else ""
             ),
+            family_summary=family_summary,
         ),
     )
+
+
+@router.post("/groups/{group_id}/target-anomalies/delete")
+def delete_group_target_anomalies(request: Request, group_id: str):
+    user = _require_user(request)
+    store = _store(request)
+    group = store.get_user_record(user["id"], "groups", group_id)
+    if not group:
+        raise HTTPException(404, "Strategy group not found")
+    summary = dict(group.get("saved_contract_summary") or {})
+    anomalies = summary.get("target_price_anomalies")
+    if not isinstance(anomalies, list):
+        anomalies = []
+    record_ids = [
+        str(item.get("id") or "").strip()
+        for item in anomalies
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    deleted = 0
+    for record_id in dict.fromkeys(record_ids):
+        if request.app.state.live_monitor.delete_saved(user["id"], record_id):
+            deleted += 1
+    summary["target_price_anomalies"] = []
+    summary["target_price_anomaly_contracts"] = 0
+    try:
+        store.update_user_record(
+            user["id"],
+            "groups",
+            group_id,
+            {"saved_contract_summary": summary},
+        )
+    except ValueError:
+        pass
+    request.session["message"] = f"Deleted {deleted} target-price anomaly contract(s)."
+    return RedirectResponse(f"/groups/{group_id}", status_code=303)
 
 
 @router.get("/groups/{group_id}/strategies/{strategy_id}", response_class=HTMLResponse)
@@ -1031,6 +1458,8 @@ def strategy_detail(
     strategy_id: str,
     trade_page: int = Query(1, ge=1),
     show_trades: bool = Query(False),
+    show_top_trades: bool = Query(False),
+    top_trade_filter: str = Query("best"),
 ):
     user = _require_user(request)
     store = _store(request)
@@ -1042,13 +1471,16 @@ def strategy_detail(
     _ensure_contract_summary(group, strategy)
     known_trade_summary = _trade_summary_from_metrics(strategy["metrics"])
     large_transaction_log = store.user_collection_size(user["id"], "transactions") > 100_000_000
-    defer_transactions = large_transaction_log and not show_trades
+    live_monitor_fast_preview = group.get("source") == "live_monitor_saved_contracts"
+    defer_transactions = (large_transaction_log or live_monitor_fast_preview) and not show_trades
     reconstructed_transactions = bool(
         strategy.get("transactions_summary_only") or group.get("transactions_summary_only")
     )
+    reconstructed_top_source = None
     if reconstructed_transactions:
         all_transactions = _reconstructed_strategy_transactions(store, group, strategy)
         all_transactions.reverse()
+        reconstructed_top_source = all_transactions
         transaction_count = len(all_transactions)
         trade_page_count = max(1, (transaction_count + 19) // 20)
         trade_page = min(trade_page, trade_page_count)
@@ -1073,6 +1505,40 @@ def strategy_detail(
             known_total=int(strategy["metrics"].get("trade_count", 0)),
             known_summary=known_trade_summary,
         )
+    top_trade_filter = str(top_trade_filter or "best").lower()
+    if top_trade_filter not in {"best", "wins", "losses", "worst"}:
+        top_trade_filter = "best"
+    top_trades = []
+    can_scan_top_trades = not (
+        reconstructed_top_source is None
+        and store.user_collection_size(user["id"], "transactions") > 250_000_000
+    )
+    if show_top_trades and can_scan_top_trades:
+        largest = top_trade_filter not in {"losses", "worst"}
+        if reconstructed_top_source is not None:
+            top_trades = sorted(
+                reconstructed_top_source,
+                key=lambda trade: float(trade.get("pnl", 0) or 0),
+                reverse=largest,
+            )[:50]
+        else:
+            top_trades = store.top_user_records_by_numeric(
+                user["id"],
+                "transactions",
+                {"group_id": group_id, "strategy_id": strategy_id},
+                "pnl",
+                limit=50,
+                largest=largest,
+            )
+        if top_trade_filter == "wins":
+            top_trades = [trade for trade in top_trades if float(trade.get("pnl", 0) or 0) > 0]
+        elif top_trade_filter in {"losses", "worst"}:
+            top_trades = [trade for trade in top_trades if float(trade.get("pnl", 0) or 0) < 0]
+        top_trades = top_trades[:20]
+        if group.get("source") == "live_monitor_saved_contracts":
+            _normalize_live_bid_exit_outcomes(request.app.state.live_monitor, user["id"], top_trades)
+    if group.get("source") == "live_monitor_saved_contracts":
+        _normalize_live_bid_exit_outcomes(request.app.state.live_monitor, user["id"], transactions)
     strategy["metrics"].update({
         "up_trade_count": trade_summary.get("up", strategy["metrics"].get("up_trade_count", 0)),
         "down_trade_count": trade_summary.get("down", strategy["metrics"].get("down_trade_count", 0)),
@@ -1118,6 +1584,8 @@ def strategy_detail(
             trade_page_count=trade_page_count, trade_summary=trade_summary,
             defer_transactions=defer_transactions, show_trades=show_trades,
             reconstructed_transactions=reconstructed_transactions,
+            top_trades=top_trades, show_top_trades=show_top_trades,
+            top_trade_filter=top_trade_filter, can_scan_top_trades=can_scan_top_trades,
             test_period_days=period_days,
             chart_equity_curve=_sample_series(strategy.get("equity_curve", [])),
             live_retest_summary=live_retest_summary,
@@ -1136,7 +1604,11 @@ def strategy_trade_contract_chart(
     store = _store(request)
     group = store.get_user_record(user["id"], "groups", group_id)
     strategy = store.get_user_record(user["id"], "strategies", strategy_id)
-    transaction = store.get_user_record(user["id"], "transactions", transaction_id)
+    transaction = store.find_user_record_reverse(
+        user["id"],
+        "transactions",
+        {"id": transaction_id, "group_id": group_id, "strategy_id": strategy_id},
+    )
     if (
         not group
         or not strategy
@@ -1153,6 +1625,13 @@ def strategy_trade_contract_chart(
     record = request.app.state.live_monitor.get_saved(user["id"], saved_record_id)
     if not record:
         raise HTTPException(404, "Saved live contract not found")
+    resolved_outcome = transaction.get("resolved_outcome")
+    if str(resolved_outcome or "").upper() == "BID_EXIT":
+        winning = str(record.get("winning_outcome") or "").strip().upper()
+        if winning in {"UP", "DOWN", "FLAT"}:
+            resolved_outcome = winning
+        else:
+            resolved_outcome = None
     history = _sample_series(record.get("history") or [], limit=1600)
     side = str(transaction.get("side") or "").upper()
     entry_price = _number_or_none(transaction.get("ask_price"))
@@ -1195,8 +1674,14 @@ def strategy_trade_contract_chart(
             "exit_price": exit_price,
             "exit_price_cents": exit_price_cents,
             "exit_yes_axis_cents": exit_yes_axis_cents,
+            "exit_type": transaction.get("exit_type"),
+            "exit_bid_price": transaction.get("exit_bid_price"),
+            "entry_probability": transaction.get("entry_probability"),
+            "entry_edge_cents": transaction.get("entry_edge_cents"),
+            "exit_probability": transaction.get("exit_probability"),
+            "exit_edge_cents": transaction.get("exit_edge_cents"),
             "pnl": transaction.get("pnl"),
-            "resolved_outcome": transaction.get("resolved_outcome"),
+            "resolved_outcome": resolved_outcome,
         },
     }
 

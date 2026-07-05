@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Live data quality - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="mb-8 flex flex-wrap items-end justify-between gap-5">
+  <div>
+    <p class="eyebrow">Saved live contracts</p>
+    <h1>Live data quality</h1>
+    <p class="mt-3 max-w-3xl text-slate-300">Scan saved live-monitor contracts for corrupted target prices and missing history samples without running strategy backtests.</p>
+  </div>
+  <div class="flex gap-3"><a class="secondary" href="/live-monitor">Live monitor</a><a class="secondary" href="/live-monitor/analysis">Live analysis</a></div>
+</div>
+
+<form method="get" action="/live-monitor/quality" class="panel mb-6" data-quality-scan-form>
+  <div class="section-title"><div><p class="eyebrow">Quality scan</p><h2>Saved contract checker</h2><p class="muted">Runs the local history checker and Gamma target comparison together for the selected saved contracts.</p></div><span class="badge">{{ 'Ready' if not scan else 'Scanned' }}</span></div>
+  <div class="grid gap-4 md:grid-cols-3">
+    <label>Crypto
+      <select name="asset_symbol">
+        <option value="all" {{ 'selected' if selected_asset == 'ALL' }}>All assets</option>
+        {% for symbol,label in assets.items() %}<option value="{{ symbol }}" {{ 'selected' if selected_asset == symbol }}>{{ symbol }} - {{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Timeframe
+      <select name="timeframe">
+        {% for value,label in timeframes.items() %}<option value="{{ value }}" {{ 'selected' if selected_timeframe == value }}>{{ value }} - {{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <input type="hidden" name="scan" value="1">
+    <button class="primary self-end" type="submit">Scan saved contracts</button>
+  </div>
+</form>
+
+<section class="panel mb-6 hidden" data-quality-progress aria-live="polite">
+  <div class="section-title"><div><p class="eyebrow">Running</p><h2 data-quality-progress-title>Checking saved contracts</h2><p class="muted" data-quality-progress-message>Starting...</p></div><span class="badge">Working</span></div>
+  <div class="live-log" data-quality-progress-log><p>Preparing request...</p></div>
+</section>
+
+{% if report %}
+<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5" aria-live="polite">
+  <div class="metric-card"><p>Matching</p><strong>{{ report.matching }}</strong></div>
+  <div class="metric-card"><p>Scanned</p><strong>{{ report.scanned }}</strong></div>
+  <div class="metric-card"><p>Problem contracts</p><strong class="{{ 'loss' if report.problem_contracts else 'profit' }}">{{ report.problem_contracts }}</strong></div>
+  <div class="metric-card"><p>Target issues</p><strong class="{{ 'loss' if report.target_issue_contracts else 'profit' }}">{{ report.target_issue_contracts }}</strong></div>
+  <div class="metric-card"><p>History issues</p><strong class="{{ 'loss' if report.history_issue_contracts else 'profit' }}">{{ report.history_issue_contracts }}</strong></div>
+</section>
+
+<section class="panel mt-6 overflow-x-auto">
+  <div class="section-title"><div><p class="eyebrow">Results</p><h2>Suspicious contracts</h2><p class="muted">{{ report.issues_shown }} local issue(s) shown{% if report.issues_limited %}; result list was limited{% endif %}. Gamma target comparison results are included in this same list.</p></div><div class="flex items-center gap-3"><span class="badge">{{ report.history_interval_seconds }}s cadence</span>{% if (report.problem_ids or []) or (target_report and (target_report.problem_ids or [])) %}<form method="post" action="/live-monitor/quality/delete-problems" data-quality-delete-form data-confirm="Delete all deletable local quality and Gamma problem contracts for this filter? This cannot be undone."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}">{% for record_id in report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% if target_report %}{% for record_id in target_report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% endif %}<button class="danger" type="submit">Delete all problems</button></form>{% endif %}</div></div>
+  <table>
+    <thead><tr><th>Contract</th><th>Window</th><th>Target</th><th>History</th><th>Issues</th><th></th></tr></thead>
+    <tbody>
+      {% for item in report.issues %}
+      <tr>
+        <td class="min-w-[260px]"><strong>{{ item.question or item.slug or item.id }}</strong><p class="muted">{{ item.category.label if item.category else '' }}{% if item.slug %} - {{ item.slug }}{% endif %}</p></td>
+        <td class="whitespace-nowrap"><strong>{{ item.window_start_time or '-' }}</strong><p class="muted">to {{ item.window_end_time or '-' }}</p></td>
+        <td class="whitespace-nowrap">{% if item.target_price is not none %}<strong>{{ item.target_price }}</strong>{% else %}-{% endif %}<p class="muted">{{ item.target_price_time or '-' }}</p>{% if item.target_price_raw_ts is not none and item.target_price_raw_ts != item.target_price_ts %}<p class="muted">raw {{ item.target_price_raw_time or item.target_price_raw_ts }}</p>{% endif %}</td>
+        <td class="whitespace-nowrap"><strong>{{ item.history.row_count }}</strong><p class="muted">first {{ item.history.first_time or '-' }}</p><p class="muted">last {{ item.history.last_time or '-' }}</p><p class="{{ 'loss' if item.history.missing_rows_after_first else 'profit' }}">{{ item.history.missing_rows_after_first }} missing</p>{% if item.history.expected_rows_from_first %}<p class="muted">{{ item.history.expected_rows_from_first }} expected</p>{% endif %}</td>
+        <td class="min-w-[320px]">
+          {% for issue in item.target_issues %}<p class="loss">{{ issue.message }}</p>{% if issue.delay_seconds is not none %}<p class="muted">{{ '%.3f'|format(issue.delay_seconds) }}s from window start</p>{% endif %}{% endfor %}
+          {% for issue in item.history_issues %}<p class="loss">{{ issue.message }}</p>{% if issue.missing_seconds is defined %}<p class="muted">{{ '%.3f'|format(issue.missing_seconds) }}s missing</p>{% endif %}{% if issue.missing_rows is defined %}<p class="muted">{{ issue.missing_rows }} row(s), first {{ issue.first_missing_time }}</p>{% endif %}{% if issue.expected_rows is defined and issue.expected_rows %}<p class="muted">{{ issue.actual_rows }} / {{ issue.expected_rows }} row(s)</p>{% endif %}{% endfor %}
+        </td>
+        <td>{% if item.id %}<button class="secondary" type="button" data-saved-contract-toggle data-record-id="{{ item.id }}">Open</button>{% endif %}</td>
+      </tr>
+      <tr class="trade-contract-row hidden" data-saved-contract-row><td colspan="6"><div class="trade-contract-detail"><div class="section-title"><div><p class="eyebrow" data-saved-contract-symbol>Saved contract</p><h2 data-saved-contract-title>{{ item.question or item.slug or item.id }}</h2><p class="muted" data-saved-contract-meta>Click Open to load this contract.</p></div><span class="badge" data-saved-contract-status>Idle</span></div><div class="trade-contract-chart-wrap hidden" data-saved-contract-chart-wrap><canvas data-saved-contract-chart height="120"></canvas></div></div></td></tr>
+      {% endfor %}
+      {% if target_report %}
+      {% for item in target_report.mismatches %}
+      <tr>
+        <td class="min-w-[260px]"><strong>{{ item.question or item.slug or item.id }}</strong><p class="muted">{{ item.category.label if item.category else '' }}{% if item.slug %} - {{ item.slug }}{% endif %}</p></td>
+        <td class="whitespace-nowrap"><strong>{{ item.window_start_time or '-' }}</strong><p class="muted">to {{ item.window_end_time or '-' }}</p></td>
+        <td class="whitespace-nowrap"><strong>{{ item.saved_target_price }}</strong><p class="muted">{{ item.target_price_time or '-' }}</p></td>
+        <td class="whitespace-nowrap">-</td>
+        <td class="min-w-[320px]"><p class="loss">Gamma target mismatch.</p><p class="muted">saved {{ item.saved_target_price }}, Gamma {{ item.external_target_price }}; delta {{ item.delta }}</p><p class="muted">{{ item.source }}</p></td>
+        <td>{% if item.id %}<button class="secondary" type="button" data-saved-contract-toggle data-record-id="{{ item.id }}">Open</button>{% endif %}</td>
+      </tr>
+      <tr class="trade-contract-row hidden" data-saved-contract-row><td colspan="6"><div class="trade-contract-detail"><div class="section-title"><div><p class="eyebrow" data-saved-contract-symbol>Saved contract</p><h2 data-saved-contract-title>{{ item.question or item.slug or item.id }}</h2><p class="muted" data-saved-contract-meta>Click Open to load this contract.</p></div><span class="badge" data-saved-contract-status>Idle</span></div><div class="trade-contract-chart-wrap hidden" data-saved-contract-chart-wrap><canvas data-saved-contract-chart height="120"></canvas></div></div></td></tr>
+      {% endfor %}
+      {% for item in target_report.unavailable %}
+      <tr>
+        <td class="min-w-[260px]"><strong>{{ item.question or item.slug or item.id }}</strong><p class="muted">{{ item.category.label if item.category else '' }}{% if item.slug %} - {{ item.slug }}{% endif %}</p></td>
+        <td class="whitespace-nowrap"><strong>{{ item.window_start_time or '-' }}</strong><p class="muted">to {{ item.window_end_time or '-' }}</p></td>
+        <td class="whitespace-nowrap">{{ item.saved_target_price if item.saved_target_price is not none else '-' }}</td>
+        <td class="whitespace-nowrap">-</td>
+        <td class="min-w-[320px]"><p class="loss">{{ item.reason }}</p></td>
+        <td>{% if item.id %}<button class="secondary" type="button" data-saved-contract-toggle data-record-id="{{ item.id }}">Open</button>{% endif %}</td>
+      </tr>
+      <tr class="trade-contract-row hidden" data-saved-contract-row><td colspan="6"><div class="trade-contract-detail"><div class="section-title"><div><p class="eyebrow" data-saved-contract-symbol>Saved contract</p><h2 data-saved-contract-title>{{ item.question or item.slug or item.id }}</h2><p class="muted" data-saved-contract-meta>Click Open to load this contract.</p></div><span class="badge" data-saved-contract-status>Idle</span></div><div class="trade-contract-chart-wrap hidden" data-saved-contract-chart-wrap><canvas data-saved-contract-chart height="120"></canvas></div></div></td></tr>
+      {% endfor %}
+      {% endif %}
+      {% if not report.issues and not (target_report and (target_report.mismatches or target_report.unavailable)) %}
+      <tr><td colspan="6" class="empty">No suspicious saved contracts found for this filter.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+{% elif scan %}
+<section class="panel"><p class="empty">No saved contracts matched this filter.</p></section>
+{% endif %}
+
+{% if target_report %}
+<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5 mt-8" aria-live="polite">
+  <div class="metric-card"><p>Matching</p><strong>{{ target_report.matching }}</strong></div>
+  <div class="metric-card"><p>Gamma checked</p><strong>{{ target_report.checked }}</strong></div>
+  <div class="metric-card"><p>Target mismatches</p><strong class="{{ 'loss' if target_report.mismatch_contracts else 'profit' }}">{{ target_report.mismatch_contracts }}</strong></div>
+  <div class="metric-card"><p>Unavailable</p><strong class="{{ 'loss' if target_report.unavailable_contracts else 'profit' }}">{{ target_report.unavailable_contracts }}</strong></div>
+  <div class="metric-card"><p>Unique slugs</p><strong>{{ target_report.unique_slugs }}</strong></div>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const panel = document.querySelector('[data-quality-progress]');
+  if (!panel) return;
+  const title = panel.querySelector('[data-quality-progress-title]');
+  const message = panel.querySelector('[data-quality-progress-message]');
+  const log = panel.querySelector('[data-quality-progress-log]');
+  const showProgress = (mode) => {
+    panel.classList.remove('hidden');
+    if (title) title.textContent = mode === 'delete' ? 'Deleting problem contracts' : 'Checking saved contracts';
+    const lines = mode === 'delete'
+      ? ['Preparing cleanup...', 'Deleting local quality problems...', 'Checking Gamma results before cleanup...', 'Deleting Gamma problem contracts...']
+      : ['Reading saved contracts...', 'Checking local history quality...', 'Fetching Gamma target prices...', 'Comparing saved targets with Gamma...'];
+    if (message) message.textContent = lines[0];
+    if (log) log.innerHTML = lines.map((line, index) => `<p>${index === 0 ? 'Now' : 'Queued'}: ${line}</p>`).join('');
+    let index = 0;
+    window.setInterval(() => {
+      index = Math.min(index + 1, lines.length - 1);
+      if (message) message.textContent = lines[index];
+      if (log) {
+        log.innerHTML = lines.map((line, position) => {
+          const label = position < index ? 'Done' : position === index ? 'Now' : 'Queued';
+          return `<p>${label}: ${line}</p>`;
+        }).join('');
+      }
+    }, 1400);
+  };
+  document.querySelectorAll('[data-quality-scan-form]').forEach(form => {
+    form.addEventListener('submit', () => {
+      const button = form.querySelector('button[type="submit"]');
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Scanning...';
+      }
+      showProgress('scan');
+    });
+  });
+  document.querySelectorAll('[data-quality-delete-form]').forEach(form => {
+    form.addEventListener('submit', event => {
+      const prompt = form.getAttribute('data-confirm');
+      if (prompt && !window.confirm(prompt)) {
+        event.preventDefault();
+        return;
+      }
+      const button = form.querySelector('button[type="submit"]');
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Deleting...';
+      }
+      showProgress('delete');
+    });
+  });
+})();
+</script>
+{% endblock %}

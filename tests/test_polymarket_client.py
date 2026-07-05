@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 import asyncio
 
+import httpx
 import pytest
 
+import backend.data.polymarket_client as polymarket_client_module
 from backend.data.polymarket_client import PolymarketClient, parse_datetime, parse_list
 
 
@@ -186,3 +188,54 @@ async def test_gamma_chunks_are_fetched_in_parallel_and_report_progress():
     assert client.http.max_active == 4
     assert updates.count("scheduled") == 4
     assert updates.count("completed") == 4
+
+
+@pytest.mark.asyncio
+async def test_gamma_history_retries_after_rate_limit(monkeypatch):
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self.payload = payload
+            self.headers = {"retry-after": "0.1"} if status_code == 429 else {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("GET", "https://gamma-api.polymarket.com/events")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+        def json(self):
+            return self.payload
+
+    class FakeHTTP:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, _url, params):
+            self.calls += 1
+            if self.calls == 1:
+                return Response(429, {"error": "slow down"})
+            return Response(200, [{"id": "ok", "endDate": "2025-01-01T00:00:00Z"}])
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(polymarket_client_module.asyncio, "sleep", sleep)
+
+    client = PolymarketClient()
+    await client.http.aclose()
+    client.http = FakeHTTP()
+    rows = await client.get_closed_events(
+        "series",
+        datetime(2025, 1, 1, tzinfo=timezone.utc),
+        datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+
+    assert rows == [{"id": "ok", "endDate": "2025-01-01T00:00:00Z"}]
+    assert client.http.calls == 2
+    assert sleeps == [0.1]
