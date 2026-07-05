@@ -1953,17 +1953,6 @@ class LiveMonitorSession:
         lock_after: float | None,
     ) -> tuple[float, float] | None:
         max_ts = timestamp + 1e-6
-        if lock_after is not None and timestamp + 1e-6 >= lock_after:
-            for updated_at, price in reversed(self._crypto_timeline):
-                if updated_at <= lock_after + 1e-6:
-                    return price, lock_after
-            if not self._crypto_timeline and self.state.crypto_price is not None:
-                updated_at = self.state.crypto_updated_at
-                if (
-                    updated_at is not None
-                    and updated_at <= lock_after + 1e-6
-                ):
-                    return self.state.crypto_price, lock_after
         for updated_at, price in self._crypto_timeline:
             if lock_after is not None and updated_at + 1e-6 < lock_after:
                 continue

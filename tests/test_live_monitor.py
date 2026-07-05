@@ -1699,10 +1699,9 @@ def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path
 
     session._capture_history_row(timestamp=1000.0, captured_at=1000.0)
 
-    assert session.state.target_price == 99.01
+    assert session.state.target_price is None
     assert [row["t"] for row in session._history] == [1000.0]
-    assert session._history[0]["target_price"] == 99.01
-    assert session._history[0]["target_price_ts"] == 1000
+    assert session._history[0]["target_price"] is None
 
     session.state.crypto_price = 101.005
     session.state.crypto_updated_at = 1000.2
@@ -1710,45 +1709,11 @@ def test_target_price_locks_on_first_websocket_price_after_window_start(tmp_path
     session._capture_history_row(timestamp=1000.5, captured_at=1000.5)
 
     assert [row["t"] for row in session._history] == [1000.0, 1000.5]
-    assert session.state.target_price == 99.01
-    assert session._history[0]["target_price"] == 99.01
-    assert session._history[0]["target_price_ts"] == 1000
-    assert session._history[1]["target_price"] == 99.01
-    assert session._history[1]["target_price_ts"] == 1000
-
-
-def test_target_price_uses_last_prewindow_tick_even_when_older_than_stale_threshold(tmp_path):
-    event = ResolvedPolymarketEvent(
-        url="https://polymarket.com/event/eth-updown-5m-1000",
-        slug="eth-updown-5m-1000",
-        title="Ethereum Up or Down",
-        markets=[],
-        tokens=[
-            LiveToken(
-                token_id="token-1",
-                market_question="Ethereum Up or Down",
-                outcome="Up",
-            )
-        ],
-        crypto_symbol="eth/usd",
-        window_size_seconds=300,
-        window_start_ts=1000,
-        window_end_ts=1300,
-    )
-    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
-    session.started_at_ts = 990.0
-    session.state.quotes["token-1"] = LiveQuote(bid=0.4, ask=0.45)
-    session.state.crypto_price = 99.005
-    session.state.crypto_updated_at = 990.0
-    session._remember_crypto_update()
-
-    session._capture_history_row(timestamp=1000.0, captured_at=1000.0)
-
-    assert session.state.target_price == 99.01
-    assert session._target_price_ts == 1000
-    assert session._history[0]["target_price"] == 99.01
-    assert session._history[0]["target_price_ts"] == 1000
-    assert session._history[0]["crypto_age_seconds"] == 10.0
+    assert session.state.target_price == 101.01
+    assert session._history[0]["target_price"] == 101.01
+    assert session._history[0]["target_price_ts"] == 1000.2
+    assert session._history[1]["target_price"] == 101.01
+    assert session._history[1]["target_price_ts"] == 1000.2
 
 
 def test_saved_contract_marks_late_target_price_as_anomaly():
