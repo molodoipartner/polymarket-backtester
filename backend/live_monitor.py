@@ -45,7 +45,8 @@ CRYPTO_FAST_RECONNECT_DELAY_SECONDS = 0.1
 TRANSIENT_DISCONNECT_GRACE_SECONDS = 30.0
 GAMMA_REQUEST_MAX_ATTEMPTS = 6
 GAMMA_REQUEST_BASE_DELAY_SECONDS = 0.75
-GAMMA_TARGET_CHECK_CONCURRENCY = 3
+GAMMA_TARGET_CHECK_CONCURRENCY = 2
+GAMMA_TARGET_CHECK_REQUEST_SPACING_SECONDS = 0.35
 NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
@@ -2932,6 +2933,7 @@ class LiveMonitorManager:
         user_id: str,
         category: str | None = None,
         timeframe: str | None = "5m",
+        recent_limit: int | None = None,
         limit: int = 500,
     ) -> dict:
         record_paths = _read_saved_record_preview_paths(
@@ -2939,19 +2941,22 @@ class LiveMonitorManager:
             include_history_stats=True,
         )
         normalized_category = _normalize_saved_category(category)
-        issues = []
-        scanned = 0
-        matching = 0
-        problem_count = 0
-        target_issue_count = 0
-        history_issue_count = 0
-        problem_ids: set[str] = set()
+        filtered_paths = []
         for path, preview in record_paths:
             if normalized_category and _record_saved_category(preview)["id"] != normalized_category:
                 continue
             if timeframe and _record_timeframe(preview) != timeframe:
                 continue
-            matching += 1
+            filtered_paths.append((path, preview))
+        selected_paths = _latest_saved_record_paths(filtered_paths, recent_limit)
+        issues = []
+        scanned = 0
+        matching = len(filtered_paths)
+        problem_count = 0
+        target_issue_count = 0
+        history_issue_count = 0
+        problem_ids: set[str] = set()
+        for path, preview in selected_paths:
             record = _with_saved_category(preview)
             scanned += 1
             target_issues = [
@@ -3006,6 +3011,7 @@ class LiveMonitorManager:
             "timeframe": timeframe or "all",
             "scanned": scanned,
             "matching": matching,
+            "recent_limit": recent_limit,
             "problem_contracts": problem_count,
             "target_issue_contracts": target_issue_count,
             "history_issue_contracts": history_issue_count,
@@ -3022,6 +3028,7 @@ class LiveMonitorManager:
         user_id: str,
         category: str | None = None,
         timeframe: str | None = "5m",
+        recent_limit: int | None = None,
         limit: int = 1000,
     ) -> dict:
         record_paths = _read_saved_record_preview_paths(
@@ -3029,13 +3036,15 @@ class LiveMonitorManager:
             include_history_stats=False,
         )
         normalized_category = _normalize_saved_category(category)
-        matching_records = []
-        for _path, preview in record_paths:
+        filtered_paths = []
+        for path, preview in record_paths:
             if normalized_category and _record_saved_category(preview)["id"] != normalized_category:
                 continue
             if timeframe and _record_timeframe(preview) != timeframe:
                 continue
-            matching_records.append(_with_saved_category(preview))
+            filtered_paths.append((path, preview))
+        selected_paths = _latest_saved_record_paths(filtered_paths, recent_limit)
+        matching_records = [_with_saved_category(preview) for _path, preview in selected_paths]
 
         slug_cache: dict[str, dict] = {}
         slugs = sorted({
@@ -3044,15 +3053,34 @@ class LiveMonitorManager:
             if str(record.get("slug") or "").strip()
         })
         semaphore = asyncio.Semaphore(GAMMA_TARGET_CHECK_CONCURRENCY)
+        request_spacing_lock = asyncio.Lock()
+        next_request_at = 0.0
 
         async def fetch_slug(client: httpx.AsyncClient, slug: str) -> tuple[str, dict]:
+            nonlocal next_request_at
             async with semaphore:
                 try:
+                    async with request_spacing_lock:
+                        now = time.monotonic()
+                        if now < next_request_at:
+                            await asyncio.sleep(next_request_at - now)
+                        next_request_at = time.monotonic() + GAMMA_TARGET_CHECK_REQUEST_SPACING_SECONDS
                     payload = await _fetch_gamma_event_payload(client, slug)
                     target = _external_target_from_gamma_payload(payload)
-                    return slug, {"ok": True, "target": target, "error": None}
+                    outcome = _external_outcome_from_gamma_payload(payload)
+                    return slug, {
+                        "ok": True,
+                        "target": target,
+                        "outcome": outcome,
+                        "error": None,
+                    }
                 except Exception as exc:
-                    return slug, {"ok": False, "target": None, "error": str(exc)}
+                    return slug, {
+                        "ok": False,
+                        "target": None,
+                        "outcome": None,
+                        "error": str(exc),
+                    }
 
         async with httpx.AsyncClient(
             timeout=15,
@@ -3067,18 +3095,30 @@ class LiveMonitorManager:
 
         mismatches = []
         unavailable = []
+        outcome_mismatches = []
         problem_ids: set[str] = set()
+        outcome_problem_ids: set[str] = set()
         checked = 0
+        outcome_checked = 0
         mismatch_count = 0
+        outcome_mismatch_count = 0
         saved_missing = 0
         external_missing = 0
         fetch_failed = 0
+        saved_outcome_missing = 0
+        external_outcome_missing = 0
         for record in matching_records:
             saved_target = _optional_float(record.get("target_price"))
+            saved_outcome = _normalize_external_outcome(record.get("winning_outcome"))
             slug = str(record.get("slug") or "").strip()
             external_result = slug_cache.get(slug) if slug else None
             external_target = (
                 external_result.get("target")
+                if isinstance(external_result, dict)
+                else None
+            )
+            external_outcome = (
+                external_result.get("outcome")
                 if isinstance(external_result, dict)
                 else None
             )
@@ -3089,7 +3129,6 @@ class LiveMonitorManager:
                         record,
                         "Saved contract has no target price.",
                     ))
-                continue
             if not slug:
                 external_missing += 1
                 if len(unavailable) < limit:
@@ -3106,69 +3145,157 @@ class LiveMonitorManager:
                         external_result.get("error") if external_result else "Gamma lookup failed.",
                     ))
                 continue
-            if not isinstance(external_target, dict):
+            if saved_target is not None and not isinstance(external_target, dict):
                 external_missing += 1
                 if len(unavailable) < limit:
                     unavailable.append(_external_target_unavailable_summary(
                         record,
                         "Gamma response did not include priceToBeat.",
                     ))
+            elif saved_target is not None:
+                raw_target = _optional_float(external_target.get("value"))
+                rounded_target = _price_to_beat(raw_target, record.get("crypto_symbol"))
+                if raw_target is None or rounded_target is None:
+                    external_missing += 1
+                    if len(unavailable) < limit:
+                        unavailable.append(_external_target_unavailable_summary(
+                            record,
+                            "Gamma target could not be parsed.",
+                        ))
+                else:
+                    checked += 1
+                    if not math.isclose(
+                        saved_target,
+                        rounded_target,
+                        rel_tol=0.0,
+                        abs_tol=1e-8,
+                    ):
+                        mismatch_count += 1
+                        _add_record_id(problem_ids, record)
+                        if len(mismatches) < limit:
+                            mismatches.append(_external_target_mismatch_summary(
+                                record,
+                                saved_target=saved_target,
+                                external_target=rounded_target,
+                                external_raw_target=raw_target,
+                                source=str(external_target.get("source") or "Gamma"),
+                            ))
+
+            if saved_outcome is None:
+                saved_outcome_missing += 1
                 continue
-            raw_target = _optional_float(external_target.get("value"))
-            rounded_target = _price_to_beat(raw_target, record.get("crypto_symbol"))
-            if raw_target is None or rounded_target is None:
+            if not isinstance(external_outcome, dict):
+                external_outcome_missing += 1
+                continue
+            gamma_outcome = _normalize_external_outcome(external_outcome.get("value"))
+            if gamma_outcome is None:
                 external_missing += 1
-                if len(unavailable) < limit:
-                    unavailable.append(_external_target_unavailable_summary(
-                        record,
-                        "Gamma target could not be parsed.",
-                    ))
                 continue
-            checked += 1
-            if math.isclose(saved_target, rounded_target, rel_tol=0.0, abs_tol=1e-8):
+            outcome_checked += 1
+            if saved_outcome == gamma_outcome:
                 continue
-            mismatch_count += 1
+            outcome_mismatch_count += 1
             _add_record_id(problem_ids, record)
-            if len(mismatches) < limit:
-                mismatches.append(_external_target_mismatch_summary(
+            _add_record_id(outcome_problem_ids, record)
+            if len(outcome_mismatches) < limit:
+                outcome_mismatches.append(_external_outcome_mismatch_summary(
                     record,
-                    saved_target=saved_target,
-                    external_target=rounded_target,
-                    external_raw_target=raw_target,
-                    source=str(external_target.get("source") or "Gamma"),
+                    saved_outcome=saved_outcome,
+                    external_outcome=gamma_outcome,
+                    source=str(external_outcome.get("source") or "Gamma"),
                 ))
 
         return {
             "asset": normalized_category or "all",
             "timeframe": timeframe or "all",
+            "recent_limit": recent_limit,
             "matching": len(matching_records),
+            "matching_total": len(filtered_paths),
             "unique_slugs": len(slugs),
             "checked": checked,
+            "outcome_checked": outcome_checked,
             "mismatch_contracts": mismatch_count,
             "mismatches": mismatches,
             "mismatches_shown": len(mismatches),
             "mismatches_limited": mismatch_count > len(mismatches),
+            "outcome_mismatch_contracts": outcome_mismatch_count,
+            "outcome_mismatches": outcome_mismatches,
+            "outcome_mismatches_shown": len(outcome_mismatches),
+            "outcome_mismatches_limited": outcome_mismatch_count > len(outcome_mismatches),
             "unavailable_contracts": saved_missing + external_missing + fetch_failed,
             "unavailable": unavailable,
             "unavailable_shown": len(unavailable),
             "unavailable_limited": (saved_missing + external_missing + fetch_failed) > len(unavailable),
             "saved_target_missing": saved_missing,
             "external_target_missing": external_missing,
+            "saved_outcome_missing": saved_outcome_missing,
+            "external_outcome_missing": external_outcome_missing,
             "fetch_failed": fetch_failed,
             "problem_ids": sorted(problem_ids),
-            "source": "Gamma eventMetadata.priceToBeat",
+            "outcome_problem_ids": sorted(outcome_problem_ids),
+            "source": "Gamma eventMetadata.priceToBeat and market resolution",
         }
+
+    async def update_saved_external_outcome_issues(
+        self,
+        user_id: str,
+        category: str | None = None,
+        timeframe: str | None = "5m",
+        recent_limit: int | None = None,
+    ) -> int:
+        report = await self.check_saved_external_targets(
+            user_id,
+            category=category,
+            timeframe=timeframe,
+            recent_limit=recent_limit,
+            limit=1_000_000,
+        )
+        updated = 0
+        for item in report.get("outcome_mismatches") or []:
+            record_id = str(item.get("id") or "").strip()
+            gamma_outcome = _normalize_external_outcome(item.get("external_outcome"))
+            if record_id and gamma_outcome and self.update_saved_outcome(
+                user_id,
+                record_id,
+                gamma_outcome,
+            ):
+                updated += 1
+        return updated
+
+    def update_saved_outcome_items(
+        self,
+        user_id: str,
+        updates: list[tuple[str, str]],
+    ) -> int:
+        updated = 0
+        for record_id, outcome in updates:
+            if self.update_saved_outcome(user_id, record_id, outcome):
+                updated += 1
+        return updated
+
+    def update_saved_target_items(
+        self,
+        user_id: str,
+        updates: list[tuple[str, float]],
+    ) -> int:
+        updated = 0
+        for record_id, target_price in updates:
+            if self.update_saved_target_price(user_id, record_id, target_price):
+                updated += 1
+        return updated
 
     async def delete_saved_external_target_issues(
         self,
         user_id: str,
         category: str | None = None,
         timeframe: str | None = "5m",
+        recent_limit: int | None = None,
     ) -> int:
         report = await self.check_saved_external_targets(
             user_id,
             category=category,
             timeframe=timeframe,
+            recent_limit=recent_limit,
             limit=1_000_000,
         )
         deleted = 0
@@ -3239,6 +3366,48 @@ class LiveMonitorManager:
         except (OSError, ValueError):
             return None
         return _with_saved_category(payload) if isinstance(payload, dict) else None
+
+    def update_saved_outcome(self, user_id: str, record_id: str, outcome: str) -> bool:
+        normalized_outcome = _normalize_external_outcome(outcome)
+        if normalized_outcome is None:
+            return False
+        path = _find_saved_record_path(self.data_root, user_id, record_id)
+        if path is None:
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        payload["winning_outcome"] = normalized_outcome.title()
+        _write_json(path, payload)
+        return True
+
+    def update_saved_target_price(
+        self,
+        user_id: str,
+        record_id: str,
+        target_price: float,
+    ) -> bool:
+        parsed_target = _optional_float(target_price)
+        if parsed_target is None:
+            return False
+        path = _find_saved_record_path(self.data_root, user_id, record_id)
+        if path is None:
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        payload["target_price"] = parsed_target
+        for row in payload.get("history") or []:
+            if isinstance(row, dict) and "target_price" in row:
+                row["target_price"] = parsed_target
+        _write_json(path, payload)
+        return True
 
     def delete_saved(self, user_id: str, record_id: str) -> bool:
         path = _find_saved_record_path(self.data_root, user_id, record_id)
@@ -3818,6 +3987,29 @@ def _find_saved_record_path(
     return None
 
 
+def _latest_saved_record_paths(
+    records: list[tuple[Path, dict]],
+    recent_limit: int | None,
+) -> list[tuple[Path, dict]]:
+    if recent_limit is None or recent_limit <= 0:
+        return list(records)
+    return sorted(
+        records,
+        key=lambda item: _saved_record_recency_key(item[1]),
+        reverse=True,
+    )[:recent_limit]
+
+
+def _saved_record_recency_key(record: dict) -> tuple[float, str]:
+    timestamp = (
+        _optional_float(record.get("window_start_ts"))
+        or _optional_float(record.get("window_end_ts"))
+        or _optional_float(record.get("target_price_ts"))
+        or 0.0
+    )
+    return timestamp, str(record.get("saved_at") or "")
+
+
 def _read_saved_records(directory: Path) -> list[dict]:
     if not directory.exists():
         return []
@@ -4308,6 +4500,70 @@ def _external_target_from_gamma_payload(payload: Any) -> dict | None:
     return None
 
 
+def _external_outcome_from_gamma_payload(payload: Any) -> dict | None:
+    event = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(event, dict):
+        return None
+
+    for path in (
+        ("winningOutcome",),
+        ("winning_outcome",),
+        ("resolvedOutcome",),
+        ("resolved_outcome",),
+        ("outcome",),
+        ("result",),
+        ("resolution",),
+    ):
+        normalized = _normalize_external_outcome(_value_at_path(event, path))
+        if normalized is not None:
+            return {"value": normalized, "source": ".".join(path)}
+
+    markets = event.get("markets")
+    if not isinstance(markets, list):
+        return None
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        for path in (
+            ("winningOutcome",),
+            ("winning_outcome",),
+            ("resolvedOutcome",),
+            ("resolved_outcome",),
+            ("outcome",),
+            ("result",),
+            ("resolution",),
+        ):
+            normalized = _normalize_external_outcome(_value_at_path(market, path))
+            if normalized is not None:
+                return {"value": normalized, "source": "markets[]." + ".".join(path)}
+
+        outcomes = parse_list(market.get("outcomes"))
+        outcome_prices = [
+            _optional_float(value)
+            for value in parse_list(market.get("outcomePrices"))
+        ]
+        if len(outcomes) != len(outcome_prices):
+            continue
+        for index, price in enumerate(outcome_prices):
+            if price is None or price < 0.99:
+                continue
+            normalized = _normalize_external_outcome(outcomes[index])
+            if normalized is not None:
+                return {"value": normalized, "source": "markets[].outcomePrices"}
+    return None
+
+
+def _normalize_external_outcome(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"up", "yes"}:
+        return "up"
+    if normalized in {"down", "no"}:
+        return "down"
+    if normalized in {"flat", "tie", "draw"}:
+        return "flat"
+    return None
+
+
 def _value_at_path(payload: dict, path: tuple[str, ...]) -> Any:
     current: Any = payload
     for key in path:
@@ -4331,6 +4587,21 @@ def _external_target_mismatch_summary(
         "external_target_price": external_target,
         "external_raw_target_price": external_raw_target,
         "delta": round(saved_target - external_target, 8),
+        "source": source,
+    }
+
+
+def _external_outcome_mismatch_summary(
+    record: dict,
+    *,
+    saved_outcome: str,
+    external_outcome: str,
+    source: str,
+) -> dict:
+    return {
+        **_external_target_contract_summary(record),
+        "saved_outcome": saved_outcome.upper(),
+        "external_outcome": external_outcome.upper(),
         "source": source,
     }
 

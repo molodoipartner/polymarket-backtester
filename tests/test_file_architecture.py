@@ -1330,6 +1330,296 @@ def test_live_monitor_quality_gamma_target_check_lists_mismatches(
         assert client.get("/api/live-monitor/saved/gamma-target-bad").status_code == 404
 
 
+def test_live_monitor_quality_can_delete_single_listed_contract(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    write_quality_live_monitor_record(store, user, "single-delete-keep", 0)
+    write_quality_live_monitor_record(
+        store,
+        user,
+        "single-delete-remove",
+        1,
+        first_offset=6.0,
+    )
+
+    async def fake_gamma_payload(_client, slug: str):
+        start_ts = int(slug.rsplit("-", 1)[-1])
+        index = (start_ts - 1782639600) // 300
+        return [{"eventMetadata": {"priceToBeat": 100 + index}}]
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    monkeypatch.setattr(
+        live_monitor_module,
+        "_fetch_gamma_event_payload",
+        fake_gamma_payload,
+    )
+
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        checked = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert checked.status_code == 200
+        assert 'name="single_record_id" value="single-delete-remove"' in checked.text
+        assert 'name="contract_limit" value="250"' in checked.text
+        assert "Delete this saved live-monitor contract?" in checked.text
+
+        deleted = client.post(
+            "/live-monitor/quality/delete-problems",
+            data={
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "single_record_id": "single-delete-remove",
+            },
+            follow_redirects=False,
+        )
+        assert deleted.status_code == 303
+        assert "scan=1" not in deleted.headers["location"]
+        assert client.get("/api/live-monitor/saved/single-delete-keep").status_code == 200
+        assert client.get("/api/live-monitor/saved/single-delete-remove").status_code == 404
+
+
+def test_live_monitor_quality_contract_limit_checks_latest_records_only(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    for index in range(11):
+        write_quality_live_monitor_record(store, user, f"limited-{index}", index)
+    gamma_calls = []
+
+    async def fake_gamma_payload(_client, slug: str):
+        gamma_calls.append(slug)
+        start_ts = int(slug.rsplit("-", 1)[-1])
+        index = (start_ts - 1782639600) // 300
+        return [{"eventMetadata": {"priceToBeat": 100 + index}}]
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    monkeypatch.setattr(
+        live_monitor_module,
+        "_fetch_gamma_event_payload",
+        fake_gamma_payload,
+    )
+
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        checked = client.get(
+            "/live-monitor/quality?asset_symbol=BTC&timeframe=5m&contract_limit=10&scan=1"
+        )
+        assert checked.status_code == 200
+        assert "Last 10" in checked.text
+        assert "limited-0" not in checked.text
+        assert len(gamma_calls) == 10
+        assert f"btc-updown-5m-{1782639600}" not in gamma_calls
+        assert f"btc-updown-5m-{1782639600 + 10 * 300}" in gamma_calls
+
+
+def test_live_monitor_quality_gamma_outcome_check_lists_mismatches(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    write_quality_live_monitor_record(store, user, "gamma-outcome-good", 0)
+    write_quality_live_monitor_record(store, user, "gamma-outcome-bad", 1)
+    gamma_calls = []
+
+    async def fake_gamma_payload(_client, slug: str):
+        gamma_calls.append(slug)
+        start_ts = int(slug.rsplit("-", 1)[-1])
+        index = (start_ts - 1782639600) // 300
+        outcome_prices = ["1", "0"] if index == 0 else ["0", "1"]
+        return [{
+            "eventMetadata": {"priceToBeat": 100 + index},
+            "markets": [{
+                "outcomes": json.dumps(["Up", "Down"]),
+                "outcomePrices": json.dumps(outcome_prices),
+            }],
+        }]
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    monkeypatch.setattr(
+        live_monitor_module,
+        "_fetch_gamma_event_payload",
+        fake_gamma_payload,
+    )
+
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        checked = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert checked.status_code == 200
+        assert "Outcome mismatches" in checked.text
+        assert "Gamma outcome mismatch." in checked.text
+        assert "saved UP, Gamma DOWN" in checked.text
+        assert "gamma-outcome-good" not in checked.text
+        assert "gamma-outcome-bad" in checked.text
+        assert 'name="problem_ids" value="gamma-outcome-bad"' in checked.text
+        assert len(gamma_calls) == 2
+
+        deleted = client.post(
+            "/live-monitor/quality/delete-problems",
+            data={
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "problem_ids": "gamma-outcome-bad",
+            },
+        )
+        assert deleted.status_code == 200
+        assert len(gamma_calls) == 2
+        assert client.get("/api/live-monitor/saved/gamma-outcome-good").status_code == 200
+        assert client.get("/api/live-monitor/saved/gamma-outcome-bad").status_code == 404
+
+
+def test_live_monitor_quality_updates_only_gamma_outcome_mismatches(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    write_quality_live_monitor_record(store, user, "gamma-outcome-fix", 1)
+    gamma_calls = []
+
+    async def fake_gamma_payload(_client, slug: str):
+        gamma_calls.append(slug)
+        return [{
+            "eventMetadata": {"priceToBeat": 101},
+            "markets": [{
+                "outcomes": json.dumps(["Up", "Down"]),
+                "outcomePrices": json.dumps(["0", "1"]),
+            }],
+        }]
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    monkeypatch.setattr(
+        live_monitor_module,
+        "_fetch_gamma_event_payload",
+        fake_gamma_payload,
+    )
+
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        checked = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert checked.status_code == 200
+        assert "Update Gamma outcomes" in checked.text
+        assert "Gamma outcome mismatch." in checked.text
+        assert 'name="outcome_updates" value="gamma-outcome-fix|DOWN"' in checked.text
+        assert len(gamma_calls) == 1
+
+        updated = client.post(
+            "/live-monitor/quality/update-gamma-outcomes",
+            data={
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "outcome_updates": "gamma-outcome-fix|DOWN",
+            },
+            follow_redirects=False,
+        )
+        assert updated.status_code == 303
+        assert "scan=1" not in updated.headers["location"]
+        assert len(gamma_calls) == 1
+        record = client.get("/api/live-monitor/saved/gamma-outcome-fix")
+        assert record.status_code == 200
+        payload = record.json()
+        assert payload["record"]["winning_outcome"] == "Down"
+        assert payload["record"]["target_price"] == 101
+        assert payload["record"]["history"][0]["target_price"] == 101
+
+        rescanned = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert rescanned.status_code == 200
+        assert "Gamma outcome mismatch." not in rescanned.text
+        assert client.get("/api/live-monitor/saved/gamma-outcome-fix").status_code == 200
+
+
+def test_live_monitor_quality_updates_gamma_target_mismatches_without_refetch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    write_quality_live_monitor_record(store, user, "gamma-target-fix", 1)
+    gamma_calls = []
+
+    async def fake_gamma_payload(_client, slug: str):
+        gamma_calls.append(slug)
+        return [{"eventMetadata": {"priceToBeat": 109.99}}]
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    monkeypatch.setattr(
+        live_monitor_module,
+        "_fetch_gamma_event_payload",
+        fake_gamma_payload,
+    )
+
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        checked = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert checked.status_code == 200
+        assert "Update Gamma targets" in checked.text
+        assert "Gamma target mismatch." in checked.text
+        assert 'name="target_updates" value="gamma-target-fix|109.99"' in checked.text
+        assert len(gamma_calls) == 1
+
+        updated = client.post(
+            "/live-monitor/quality/update-gamma-targets",
+            data={
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "target_updates": "gamma-target-fix|109.99",
+            },
+            follow_redirects=False,
+        )
+        assert updated.status_code == 303
+        assert "scan=1" not in updated.headers["location"]
+        assert len(gamma_calls) == 1
+        record = client.get("/api/live-monitor/saved/gamma-target-fix")
+        assert record.status_code == 200
+        payload = record.json()
+        assert payload["record"]["target_price"] == 109.99
+        assert payload["record"]["history"][0]["target_price"] == 109.99
+        assert payload["record"]["winning_outcome"] == "Up"
+
+        rescanned = client.get("/live-monitor/quality?asset_symbol=BTC&timeframe=5m&scan=1")
+        assert rescanned.status_code == 200
+        assert "Gamma target mismatch." not in rescanned.text
+
+
 def test_live_monitor_quality_does_not_delete_missing_target_results(
     tmp_path: Path,
     monkeypatch,

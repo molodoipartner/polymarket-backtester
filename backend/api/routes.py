@@ -40,6 +40,37 @@ from config.settings import ROOT_DIR, settings
 router = APIRouter()
 templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
+QUALITY_CONTRACT_LIMITS = {
+    "10": "Last 10",
+    "25": "Last 25",
+    "50": "Last 50",
+    "100": "Last 100",
+    "250": "Last 250",
+    "500": "Last 500",
+    "1000": "Last 1000",
+    "all": "All contracts",
+}
+
+
+def _normalize_quality_contract_limit(value: str | int | None) -> str:
+    normalized = str(value or "250").strip().lower()
+    return normalized if normalized in QUALITY_CONTRACT_LIMITS else "250"
+
+
+def _quality_contract_limit_value(value: str) -> int | None:
+    normalized = _normalize_quality_contract_limit(value)
+    return None if normalized == "all" else int(normalized)
+
+
+def _parse_quality_update_pairs(values: list[str]) -> list[tuple[str, str]]:
+    updates: list[tuple[str, str]] = []
+    for value in values:
+        record_id, separator, payload = str(value).partition("|")
+        record_id = record_id.strip()
+        payload = payload.strip()
+        if separator and record_id and payload:
+            updates.append((record_id, payload))
+    return updates
 
 
 def _live_monitor_session_payload(session) -> dict:
@@ -551,6 +582,7 @@ async def live_monitor_quality_page(
     request: Request,
     asset_symbol: str = Query("all"),
     timeframe: str = Query("5m"),
+    contract_limit: str = Query("250"),
     scan: bool = Query(False),
     check_targets: bool = Query(False),
 ):
@@ -559,6 +591,8 @@ async def live_monitor_quality_page(
     if selected_asset != "ALL" and selected_asset not in ASSETS:
         selected_asset = "ALL"
     selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    recent_limit = _quality_contract_limit_value(selected_contract_limit)
     report = None
     target_report = None
     if scan or check_targets:
@@ -569,11 +603,13 @@ async def live_monitor_quality_page(
                 user["id"],
                 category=category,
                 timeframe=selected_timeframe,
+                recent_limit=recent_limit,
             ),
             request.app.state.live_monitor.check_saved_external_targets(
                 user["id"],
                 category=category,
                 timeframe=selected_timeframe,
+                recent_limit=recent_limit,
             ),
         )
     return templates.TemplateResponse(
@@ -583,8 +619,10 @@ async def live_monitor_quality_page(
             request,
             assets=ASSETS,
             timeframes={"5m": TIMEFRAMES["5m"]},
+            contract_limits=QUALITY_CONTRACT_LIMITS,
             selected_asset=selected_asset,
             selected_timeframe=selected_timeframe,
+            selected_contract_limit=selected_contract_limit,
             report=report,
             target_report=target_report,
             scan=scan,
@@ -598,13 +636,31 @@ async def delete_live_monitor_quality_problems(
     request: Request,
     asset_symbol: Annotated[str, Form()] = "all",
     timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
 ):
     user = _require_user(request)
     selected_asset = asset_symbol.upper()
     if selected_asset != "ALL" and selected_asset not in ASSETS:
         selected_asset = "ALL"
     selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
     form = await request.form()
+    single_record_id = str(form.get("single_record_id") or "").strip()
+    if single_record_id:
+        deleted = 1 if request.app.state.live_monitor.delete_saved(
+            user["id"],
+            single_record_id,
+        ) else 0
+        request.session["message"] = (
+            f"Deleted {deleted} saved live-monitor contract(s)."
+        )
+        params = urlencode({
+            "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+            "timeframe": selected_timeframe,
+            "contract_limit": selected_contract_limit,
+        })
+        return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
     problem_ids = form.getlist("problem_ids")
     if problem_ids:
         deleted = 0
@@ -620,6 +676,7 @@ async def delete_live_monitor_quality_problems(
         params = urlencode({
             "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
             "timeframe": selected_timeframe,
+            "contract_limit": selected_contract_limit,
         })
         return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 
@@ -632,6 +689,7 @@ async def delete_live_monitor_quality_problems(
         user["id"],
         category=None if selected_asset == "ALL" else selected_asset.lower(),
         timeframe=selected_timeframe,
+        recent_limit=_quality_contract_limit_value(selected_contract_limit),
     )
     deleted = quality_deleted + gamma_deleted
     request.session["message"] = (
@@ -641,6 +699,7 @@ async def delete_live_monitor_quality_problems(
     params = urlencode({
         "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
         "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
     })
     return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 
@@ -650,16 +709,19 @@ async def delete_live_monitor_gamma_results(
     request: Request,
     asset_symbol: Annotated[str, Form()] = "all",
     timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
 ):
     user = _require_user(request)
     selected_asset = asset_symbol.upper()
     if selected_asset != "ALL" and selected_asset not in ASSETS:
         selected_asset = "ALL"
     selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
     deleted = await request.app.state.live_monitor.delete_saved_external_target_issues(
         user["id"],
         category=None if selected_asset == "ALL" else selected_asset.lower(),
         timeframe=selected_timeframe,
+        recent_limit=_quality_contract_limit_value(selected_contract_limit),
     )
     request.session["message"] = (
         f"Deleted {deleted} saved live-monitor contract(s) from the Gamma check results."
@@ -667,7 +729,80 @@ async def delete_live_monitor_gamma_results(
     params = urlencode({
         "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
         "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
         "check_targets": "1",
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
+@router.post("/live-monitor/quality/update-gamma-outcomes")
+async def update_live_monitor_gamma_outcomes(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    form = await request.form()
+    updates = _parse_quality_update_pairs(form.getlist("outcome_updates"))
+    if updates:
+        updated = request.app.state.live_monitor.update_saved_outcome_items(
+            user["id"],
+            updates,
+        )
+    else:
+        updated = await request.app.state.live_monitor.update_saved_external_outcome_issues(
+            user["id"],
+            category=None if selected_asset == "ALL" else selected_asset.lower(),
+            timeframe=selected_timeframe,
+            recent_limit=_quality_contract_limit_value(selected_contract_limit),
+        )
+    request.session["message"] = (
+        f"Updated {updated} saved live-monitor resolution outcome(s) from Gamma."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
+@router.post("/live-monitor/quality/update-gamma-targets")
+async def update_live_monitor_gamma_targets(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    form = await request.form()
+    target_updates = []
+    for record_id, value in _parse_quality_update_pairs(form.getlist("target_updates")):
+        parsed = _optional_float(value, "target_updates")
+        if parsed is not None:
+            target_updates.append((record_id, parsed))
+    updated = request.app.state.live_monitor.update_saved_target_items(
+        user["id"],
+        target_updates,
+    )
+    request.session["message"] = (
+        f"Updated {updated} saved live-monitor target price(s) from Gamma."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
     })
     return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 
