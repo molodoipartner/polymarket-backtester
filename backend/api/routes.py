@@ -10,6 +10,7 @@ import tarfile
 import threading
 import time
 import traceback
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
@@ -40,6 +41,7 @@ from config.settings import ROOT_DIR, settings
 router = APIRouter()
 templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
+QUALITY_REPORT_CACHE_TTL_SECONDS = 900
 QUALITY_CONTRACT_LIMITS = {
     "10": "Last 10",
     "25": "Last 25",
@@ -71,6 +73,108 @@ def _parse_quality_update_pairs(values: list[str]) -> list[tuple[str, str]]:
         if separator and record_id and payload:
             updates.append((record_id, payload))
     return updates
+
+
+def _quality_report_cache(request: Request) -> dict:
+    cache = getattr(request.app.state, "quality_report_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        request.app.state.quality_report_cache = cache
+    now = time.time()
+    expired = [
+        key for key, value in cache.items()
+        if now - float(value.get("created_at") or 0) > QUALITY_REPORT_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        cache.pop(key, None)
+    return cache
+
+
+def _save_quality_report(request: Request, user_id: str, payload: dict) -> str:
+    report_id = uuid.uuid4().hex
+    _quality_report_cache(request)[report_id] = {
+        "created_at": time.time(),
+        "user_id": user_id,
+        **payload,
+    }
+    return report_id
+
+
+def _read_quality_report(request: Request, user_id: str, report_id: str | None) -> dict | None:
+    if not report_id:
+        return None
+    cached = _quality_report_cache(request).get(str(report_id))
+    if not isinstance(cached, dict) or cached.get("user_id") != user_id:
+        return None
+    return cached
+
+
+def _quality_summary(report: dict | None, target_report: dict | None) -> dict:
+    report = report or {}
+    target_report = target_report or {}
+    return {
+        "matching": report.get("matching") or target_report.get("matching_total") or 0,
+        "scanned": report.get("scanned") or target_report.get("matching") or 0,
+        "local_problem_contracts": report.get("problem_contracts") or 0,
+        "target_mismatches": target_report.get("mismatch_contracts") or 0,
+        "outcome_mismatches": target_report.get("outcome_mismatch_contracts") or 0,
+        "missing_data": (
+            len(report.get("missing_data_problem_ids") or [])
+            + len(target_report.get("unavailable_problem_ids") or [])
+        ),
+        "unavailable": target_report.get("unavailable_contracts") or 0,
+        "rate_limited": target_report.get("rate_limited") or 0,
+    }
+
+
+def _quality_timeline(report: dict | None, target_report: dict | None) -> list[dict]:
+    buckets: dict[int, dict] = {}
+
+    def add(timestamp: Any, key: str) -> None:
+        parsed = _optional_float(str(timestamp or ""), "timestamp")
+        if parsed is None:
+            return
+        bucket_ts = int(parsed // 3600 * 3600)
+        bucket = buckets.setdefault(bucket_ts, {
+            "ts": bucket_ts,
+            "time": datetime.fromtimestamp(bucket_ts, timezone.utc).strftime("%m-%d %H:%M"),
+            "local": 0,
+            "target": 0,
+            "outcome": 0,
+            "missing": 0,
+            "total": 0,
+        })
+        bucket[key] += 1
+        bucket["total"] += 1
+
+    for item in (report or {}).get("issues") or []:
+        add(item.get("window_start_ts"), "local")
+    for item in (target_report or {}).get("mismatches") or []:
+        add(item.get("window_start_ts"), "target")
+    for item in (target_report or {}).get("outcome_mismatches") or []:
+        add(item.get("window_start_ts"), "outcome")
+    for item in (target_report or {}).get("unavailable") or []:
+        add(item.get("window_start_ts"), "missing")
+    timeline = sorted(buckets.values(), key=lambda item: item["ts"])
+    max_total = max((item["total"] for item in timeline), default=0)
+    first_ts = timeline[0]["ts"] if timeline else 0
+    last_ts = timeline[-1]["ts"] if timeline else 0
+    span = max(3600, last_ts - first_ts + 3600)
+    for item in timeline:
+        item["pct"] = round(item["total"] / max_total * 100, 1) if max_total else 0
+        item["offset_pct"] = round((item["ts"] - first_ts) / span * 100, 3)
+        item["width_pct"] = round(max(0.8, 3600 / span * 100), 3)
+        item["height_pct"] = max(8, item["pct"]) if max_total else 0
+    return timeline
+
+
+def _quality_timeline_range(timeline: list[dict]) -> dict:
+    if not timeline:
+        return {"start": None, "end": None}
+    return {
+        "start": timeline[0].get("time"),
+        "end": timeline[-1].get("time"),
+    }
 
 
 def _live_monitor_session_payload(session) -> dict:
@@ -583,6 +687,7 @@ async def live_monitor_quality_page(
     asset_symbol: str = Query("all"),
     timeframe: str = Query("5m"),
     contract_limit: str = Query("250"),
+    report_id: str | None = Query(None),
     scan: bool = Query(False),
     check_targets: bool = Query(False),
 ):
@@ -595,7 +700,14 @@ async def live_monitor_quality_page(
     recent_limit = _quality_contract_limit_value(selected_contract_limit)
     report = None
     target_report = None
-    if scan or check_targets:
+    cached = _read_quality_report(request, user["id"], report_id)
+    if cached:
+        report = cached.get("report")
+        target_report = cached.get("target_report")
+        selected_asset = cached.get("selected_asset") or selected_asset
+        selected_timeframe = cached.get("selected_timeframe") or selected_timeframe
+        selected_contract_limit = cached.get("selected_contract_limit") or selected_contract_limit
+    elif scan or check_targets:
         category = None if selected_asset == "ALL" else selected_asset.lower()
         report, target_report = await asyncio.gather(
             asyncio.to_thread(
@@ -623,11 +735,144 @@ async def live_monitor_quality_page(
             selected_asset=selected_asset,
             selected_timeframe=selected_timeframe,
             selected_contract_limit=selected_contract_limit,
+            quality_report_id=report_id if cached else None,
             report=report,
             target_report=target_report,
-            scan=scan,
-            check_targets=check_targets or scan,
+            quality_summary=_quality_summary(report, target_report),
+            quality_timeline=(quality_timeline := _quality_timeline(report, target_report)),
+            quality_timeline_range=_quality_timeline_range(quality_timeline),
+            scan=scan or bool(cached),
+            check_targets=check_targets or scan or bool(cached),
         ),
+    )
+
+
+@router.get("/live-monitor/quality/progress")
+async def live_monitor_quality_progress(
+    request: Request,
+    asset_symbol: str = Query("all"),
+    timeframe: str = Query("5m"),
+    contract_limit: str = Query("250"),
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    recent_limit = _quality_contract_limit_value(selected_contract_limit)
+    category = None if selected_asset == "ALL" else selected_asset.lower()
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    async def publish(payload: dict) -> None:
+        await queue.put(payload)
+
+    def publish_from_thread(payload: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+    async def run_scan() -> None:
+        try:
+            await publish({
+                "stage": "local",
+                "message": "Reading saved contracts and checking local history...",
+            })
+            report = await asyncio.to_thread(
+                request.app.state.live_monitor.scan_saved_quality,
+                user["id"],
+                category=category,
+                timeframe=selected_timeframe,
+                recent_limit=recent_limit,
+                progress=publish_from_thread,
+            )
+            await publish({
+                "stage": "local",
+                "done": report.get("scanned"),
+                "total": report.get("scanned"),
+                "remaining": 0,
+                "message": (
+                    f"Local quality checked: {report.get('scanned')} scanned, "
+                    f"{report.get('problem_contracts')} problem contract(s)."
+                ),
+            })
+            await publish({
+                "stage": "gamma",
+                "done": 0,
+                "total": None,
+                "remaining": None,
+                "message": "Starting Gamma target and outcome checks...",
+            })
+            target_report = await request.app.state.live_monitor.check_saved_external_targets(
+                user["id"],
+                category=category,
+                timeframe=selected_timeframe,
+                recent_limit=recent_limit,
+                progress=publish,
+            )
+            report_id = _save_quality_report(
+                request,
+                user["id"],
+                {
+                    "report": report,
+                    "target_report": target_report,
+                    "selected_asset": selected_asset,
+                    "selected_timeframe": selected_timeframe,
+                    "selected_contract_limit": selected_contract_limit,
+                },
+            )
+            report_url = "/live-monitor/quality?" + urlencode({
+                "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+                "timeframe": selected_timeframe,
+                "contract_limit": selected_contract_limit,
+                "report_id": report_id,
+            })
+            await publish({
+                "stage": "complete",
+                "done": target_report.get("unique_slugs"),
+                "total": target_report.get("unique_slugs"),
+                "remaining": 0,
+                "report_url": report_url,
+                "message": "Quality scan complete. Opening report...",
+            })
+        except Exception as exc:
+            await publish({
+                "stage": "error",
+                "message": str(exc) or exc.__class__.__name__,
+            })
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(run_scan())
+
+    async def stream():
+        try:
+            yield "retry: 1000\n\n"
+            while True:
+                if await request.is_disconnected():
+                    task.cancel()
+                    break
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=2)
+                except asyncio.TimeoutError:
+                    yield (
+                        "event: ping\n"
+                        f"data: {json.dumps({'server_time': time.time()})}\n\n"
+                    )
+                    continue
+                if message is None:
+                    break
+                yield (
+                    "event: progress\n"
+                    f"data: {json.dumps(message, ensure_ascii=False)}\n\n"
+                )
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -637,6 +882,7 @@ async def delete_live_monitor_quality_problems(
     asset_symbol: Annotated[str, Form()] = "all",
     timeframe: Annotated[str, Form()] = "5m",
     contract_limit: Annotated[str, Form()] = "250",
+    report_id: Annotated[str, Form()] = "",
 ):
     user = _require_user(request)
     selected_asset = asset_symbol.upper()
@@ -663,13 +909,10 @@ async def delete_live_monitor_quality_problems(
 
     problem_ids = form.getlist("problem_ids")
     if problem_ids:
-        deleted = 0
-        for record_id in dict.fromkeys(str(value).strip() for value in problem_ids):
-            if record_id and request.app.state.live_monitor.delete_saved(
-                user["id"],
-                record_id,
-            ):
-                deleted += 1
+        deleted = request.app.state.live_monitor.delete_saved_items(
+            user["id"],
+            problem_ids,
+        )
         request.session["message"] = (
             f"Deleted {deleted} problematic saved live-monitor contract(s)."
         )
@@ -685,16 +928,9 @@ async def delete_live_monitor_quality_problems(
         category=None if selected_asset == "ALL" else selected_asset.lower(),
         timeframe=selected_timeframe,
     )
-    gamma_deleted = await request.app.state.live_monitor.delete_saved_external_target_issues(
-        user["id"],
-        category=None if selected_asset == "ALL" else selected_asset.lower(),
-        timeframe=selected_timeframe,
-        recent_limit=_quality_contract_limit_value(selected_contract_limit),
-    )
-    deleted = quality_deleted + gamma_deleted
     request.session["message"] = (
-        f"Deleted {deleted} problematic saved live-monitor contract(s): "
-        f"{quality_deleted} quality issue(s), {gamma_deleted} Gamma issue(s)."
+        f"Deleted {quality_deleted} local quality issue contract(s). "
+        "No Gamma problem ids were submitted for deletion."
     )
     params = urlencode({
         "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
@@ -735,12 +971,75 @@ async def delete_live_monitor_gamma_results(
     return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 
 
+@router.post("/live-monitor/quality/delete-missing-data")
+async def delete_live_monitor_missing_data(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
+    report_id: Annotated[str, Form()] = "",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    form = await request.form()
+    missing_ids = form.getlist("missing_data_ids")
+    deleted = request.app.state.live_monitor.delete_saved_items(
+        user["id"],
+        missing_ids,
+    )
+    request.session["message"] = (
+        f"Deleted {deleted} saved live-monitor contract(s) with missing data."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
+@router.post("/live-monitor/quality/delete-gamma-target-missing")
+async def delete_live_monitor_gamma_target_missing(
+    request: Request,
+    asset_symbol: Annotated[str, Form()] = "all",
+    timeframe: Annotated[str, Form()] = "5m",
+    contract_limit: Annotated[str, Form()] = "250",
+    report_id: Annotated[str, Form()] = "",
+):
+    user = _require_user(request)
+    selected_asset = asset_symbol.upper()
+    if selected_asset != "ALL" and selected_asset not in ASSETS:
+        selected_asset = "ALL"
+    selected_timeframe = timeframe if timeframe in {"5m"} else "5m"
+    selected_contract_limit = _normalize_quality_contract_limit(contract_limit)
+    form = await request.form()
+    target_missing_ids = form.getlist("gamma_target_missing_ids")
+    deleted = request.app.state.live_monitor.delete_saved_items(
+        user["id"],
+        target_missing_ids,
+    )
+    request.session["message"] = (
+        f"Deleted {deleted} saved live-monitor contract(s) where Gamma did not provide priceToBeat."
+    )
+    params = urlencode({
+        "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
+        "timeframe": selected_timeframe,
+        "contract_limit": selected_contract_limit,
+    })
+    return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
+
+
 @router.post("/live-monitor/quality/update-gamma-outcomes")
 async def update_live_monitor_gamma_outcomes(
     request: Request,
     asset_symbol: Annotated[str, Form()] = "all",
     timeframe: Annotated[str, Form()] = "5m",
     contract_limit: Annotated[str, Form()] = "250",
+    report_id: Annotated[str, Form()] = "",
 ):
     user = _require_user(request)
     selected_asset = asset_symbol.upper()
@@ -769,6 +1068,7 @@ async def update_live_monitor_gamma_outcomes(
         "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
         "timeframe": selected_timeframe,
         "contract_limit": selected_contract_limit,
+        **({"report_id": report_id} if report_id else {}),
     })
     return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 
@@ -779,6 +1079,7 @@ async def update_live_monitor_gamma_targets(
     asset_symbol: Annotated[str, Form()] = "all",
     timeframe: Annotated[str, Form()] = "5m",
     contract_limit: Annotated[str, Form()] = "250",
+    report_id: Annotated[str, Form()] = "",
 ):
     user = _require_user(request)
     selected_asset = asset_symbol.upper()
@@ -803,6 +1104,7 @@ async def update_live_monitor_gamma_targets(
         "asset_symbol": selected_asset.lower() if selected_asset == "ALL" else selected_asset,
         "timeframe": selected_timeframe,
         "contract_limit": selected_contract_limit,
+        **({"report_id": report_id} if report_id else {}),
     })
     return RedirectResponse(f"/live-monitor/quality?{params}", status_code=303)
 

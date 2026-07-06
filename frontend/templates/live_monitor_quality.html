@@ -41,15 +41,52 @@
 
 {% if report %}
 <section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5" aria-live="polite">
-  <div class="metric-card"><p>Matching</p><strong>{{ report.matching }}</strong></div>
-  <div class="metric-card"><p>Scanned</p><strong>{{ report.scanned }}</strong></div>
-  <div class="metric-card"><p>Problem contracts</p><strong class="{{ 'loss' if report.problem_contracts else 'profit' }}">{{ report.problem_contracts }}</strong></div>
-  <div class="metric-card"><p>Target issues</p><strong class="{{ 'loss' if report.target_issue_contracts else 'profit' }}">{{ report.target_issue_contracts }}</strong></div>
-  <div class="metric-card"><p>History issues</p><strong class="{{ 'loss' if report.history_issue_contracts else 'profit' }}">{{ report.history_issue_contracts }}</strong></div>
+  <div class="metric-card"><p>Scanned</p><strong>{{ quality_summary.scanned }}</strong><p class="muted">{{ quality_summary.matching }} matching</p></div>
+  <div class="metric-card"><p>Problem contracts</p><strong class="{{ 'loss' if quality_summary.local_problem_contracts else 'profit' }}">{{ quality_summary.local_problem_contracts }}</strong><p class="muted">local quality</p></div>
+  <div class="metric-card"><p>Target mismatches</p><strong class="{{ 'loss' if quality_summary.target_mismatches else 'profit' }}">{{ quality_summary.target_mismatches }}</strong><p class="muted">{{ target_report.checked if target_report else 0 }} checked</p></div>
+  <div class="metric-card"><p>Outcome mismatches</p><strong class="{{ 'loss' if quality_summary.outcome_mismatches else 'profit' }}">{{ quality_summary.outcome_mismatches }}</strong><p class="muted">{{ target_report.outcome_checked if target_report else 0 }} checked</p></div>
+  <div class="metric-card"><p>Missing data</p><strong class="{{ 'loss' if quality_summary.missing_data else 'profit' }}">{{ quality_summary.missing_data }}</strong><p class="muted">{{ quality_summary.rate_limited }} rate limited</p></div>
 </section>
 
+{% if quality_timeline %}
+<section class="panel mt-6">
+  <div class="section-title"><div><p class="eyebrow">Timeline</p><h2>Problem density</h2><p class="muted">Left is the earliest problem bucket, right is the latest. Bar color shows the problem type mix.</p></div></div>
+  <div class="mb-3 flex flex-wrap gap-3 text-sm text-slate-300">
+    <span><span class="inline-block h-3 w-3 rounded-sm bg-cyan-400 align-middle"></span> Local</span>
+    <span><span class="inline-block h-3 w-3 rounded-sm bg-amber-400 align-middle"></span> Target</span>
+    <span><span class="inline-block h-3 w-3 rounded-sm bg-fuchsia-400 align-middle"></span> Outcome</span>
+    <span><span class="inline-block h-3 w-3 rounded-sm bg-rose-500 align-middle"></span> Missing data</span>
+  </div>
+  <div class="relative h-52 rounded border border-slate-700 bg-slate-950/60 px-3 pb-8 pt-5">
+    <div class="absolute inset-x-3 bottom-8 h-px bg-slate-700"></div>
+    {% for bucket in quality_timeline %}
+    <div class="absolute bottom-8 flex flex-col-reverse overflow-hidden rounded-t shadow-sm" style="left: {{ bucket.offset_pct }}%; width: {{ bucket.width_pct }}%; height: {{ bucket.height_pct }}%;" title="{{ bucket.time }} - {{ bucket.total }} total; local {{ bucket.local }}, target {{ bucket.target }}, outcome {{ bucket.outcome }}, missing {{ bucket.missing }}">
+      {% if bucket.missing %}<div class="bg-rose-500" style="height: {{ (bucket.missing / bucket.total * 100)|round(1) }}%"></div>{% endif %}
+      {% if bucket.outcome %}<div class="bg-fuchsia-400" style="height: {{ (bucket.outcome / bucket.total * 100)|round(1) }}%"></div>{% endif %}
+      {% if bucket.target %}<div class="bg-amber-400" style="height: {{ (bucket.target / bucket.total * 100)|round(1) }}%"></div>{% endif %}
+      {% if bucket.local %}<div class="bg-cyan-400" style="height: {{ (bucket.local / bucket.total * 100)|round(1) }}%"></div>{% endif %}
+    </div>
+    {% endfor %}
+    <div class="absolute bottom-2 left-3 text-xs text-slate-400">{{ quality_timeline_range.start }}</div>
+    <div class="absolute bottom-2 right-3 text-xs text-slate-400">{{ quality_timeline_range.end }}</div>
+  </div>
+  <details class="mt-3">
+    <summary class="cursor-pointer text-sm text-slate-300">Bucket details</summary>
+    <div class="mt-3 grid gap-2">
+    {% for bucket in quality_timeline %}
+    <div class="grid items-center gap-3 md:grid-cols-[120px_1fr_220px]">
+      <p class="muted whitespace-nowrap">{{ bucket.time }}</p>
+      <div class="h-3 overflow-hidden rounded bg-slate-800"><div class="h-full bg-neon" style="width: {{ bucket.pct }}%"></div></div>
+      <p class="muted whitespace-nowrap">{{ bucket.total }} total · local {{ bucket.local }} · target {{ bucket.target }} · outcome {{ bucket.outcome }} · missing {{ bucket.missing }}</p>
+    </div>
+    {% endfor %}
+    </div>
+  </details>
+</section>
+{% endif %}
+
 <section class="panel mt-6 overflow-x-auto">
-  <div class="section-title"><div><p class="eyebrow">Results</p><h2>Suspicious contracts</h2><p class="muted">{{ report.issues_shown }} local issue(s) shown{% if report.issues_limited %}; result list was limited{% endif %}. Gamma target comparison and resolution comparison results are included in this same list.</p></div><div class="flex items-center gap-3"><span class="badge">{{ report.history_interval_seconds }}s cadence</span>{% if target_report and (target_report.mismatches or []) %}<form method="post" action="/live-monitor/quality/update-gamma-targets" data-quality-update-form data-confirm="Replace saved target prices with Gamma target prices for this filter? Resolution outcomes will not be changed."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% for item in target_report.mismatches %}{% if item.id %}<input type="hidden" name="target_updates" value="{{ item.id }}|{{ item.external_target_price }}">{% endif %}{% endfor %}<button class="secondary" type="submit">Update Gamma targets</button></form>{% endif %}{% if target_report and (target_report.outcome_problem_ids or []) %}<form method="post" action="/live-monitor/quality/update-gamma-outcomes" data-quality-update-form data-confirm="Replace saved resolution outcomes with Gamma outcomes for this filter? Target prices will not be changed."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% for item in target_report.outcome_mismatches %}{% if item.id %}<input type="hidden" name="outcome_updates" value="{{ item.id }}|{{ item.external_outcome }}">{% endif %}{% endfor %}<button class="secondary" type="submit">Update Gamma outcomes</button></form>{% endif %}{% if (report.problem_ids or []) or (target_report and (target_report.problem_ids or [])) %}<form method="post" action="/live-monitor/quality/delete-problems" data-quality-delete-form data-confirm="Delete all deletable local quality and Gamma problem contracts for this filter? This cannot be undone."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% for record_id in report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% if target_report %}{% for record_id in target_report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% endif %}<button class="danger" type="submit">Delete all problems</button></form>{% endif %}</div></div>
+  <div class="section-title"><div><p class="eyebrow">Results</p><h2>Suspicious contracts</h2><p class="muted">{{ report.issues_shown }} local issue(s) shown{% if report.issues_limited %}; result list was limited{% endif %}. Gamma target comparison and resolution comparison results are included in this same list.</p></div><div class="flex flex-wrap items-center gap-3"><span class="badge">{{ report.history_interval_seconds }}s cadence</span>{% if (report.missing_data_problem_ids or []) or (target_report and (target_report.unavailable_problem_ids or [])) %}<form method="post" action="/live-monitor/quality/delete-missing-data" data-quality-delete-form data-confirm="Delete only contracts with missing local/Gamma data for this filter? Target and outcome mismatch contracts will not be deleted by this action."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% if quality_report_id %}<input type="hidden" name="report_id" value="{{ quality_report_id }}">{% endif %}{% for record_id in report.missing_data_problem_ids or [] %}<input type="hidden" name="missing_data_ids" value="{{ record_id }}">{% endfor %}{% if target_report %}{% for record_id in target_report.unavailable_problem_ids or [] %}<input type="hidden" name="missing_data_ids" value="{{ record_id }}">{% endfor %}{% endif %}<button class="danger" type="submit">Delete missing data</button></form>{% endif %}{% if target_report and (target_report.gamma_target_missing_problem_ids or []) %}<form method="post" action="/live-monitor/quality/delete-gamma-target-missing" data-quality-delete-form data-confirm="Delete only contracts where Gamma did not provide priceToBeat? Target/outcome mismatch contracts with a readable Gamma target will not be deleted by this action."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% if quality_report_id %}<input type="hidden" name="report_id" value="{{ quality_report_id }}">{% endif %}{% for record_id in target_report.gamma_target_missing_problem_ids or [] %}<input type="hidden" name="gamma_target_missing_ids" value="{{ record_id }}">{% endfor %}<button class="danger" type="submit">Delete missing Gamma target</button></form>{% endif %}{% if target_report and (target_report.mismatches or []) %}<form method="post" action="/live-monitor/quality/update-gamma-targets" data-quality-update-form data-confirm="Replace saved target prices with Gamma target prices for this filter? Resolution outcomes will not be changed."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% if quality_report_id %}<input type="hidden" name="report_id" value="{{ quality_report_id }}">{% endif %}{% for item in target_report.mismatches %}{% if item.id %}<input type="hidden" name="target_updates" value="{{ item.id }}|{{ item.external_target_price }}">{% endif %}{% endfor %}<button class="secondary" type="submit">Update Gamma targets</button></form>{% endif %}{% if target_report and (target_report.outcome_problem_ids or []) %}<form method="post" action="/live-monitor/quality/update-gamma-outcomes" data-quality-update-form data-confirm="Replace saved resolution outcomes with Gamma outcomes for this filter? Target prices will not be changed."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% if quality_report_id %}<input type="hidden" name="report_id" value="{{ quality_report_id }}">{% endif %}{% for item in target_report.outcome_mismatches %}{% if item.id %}<input type="hidden" name="outcome_updates" value="{{ item.id }}|{{ item.external_outcome }}">{% endif %}{% endfor %}<button class="secondary" type="submit">Update Gamma outcomes</button></form>{% endif %}{% if (report.problem_ids or []) or (target_report and (target_report.problem_ids or [])) %}<form method="post" action="/live-monitor/quality/delete-problems" data-quality-delete-form data-confirm="Delete all deletable local quality and Gamma problem contracts for this filter? This cannot be undone."><input type="hidden" name="asset_symbol" value="{{ selected_asset }}"><input type="hidden" name="timeframe" value="{{ selected_timeframe }}"><input type="hidden" name="contract_limit" value="{{ selected_contract_limit }}">{% if quality_report_id %}<input type="hidden" name="report_id" value="{{ quality_report_id }}">{% endif %}{% for record_id in report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% if target_report %}{% for record_id in target_report.problem_ids or [] %}<input type="hidden" name="problem_ids" value="{{ record_id }}">{% endfor %}{% endif %}<button class="danger" type="submit">Delete all problems</button></form>{% endif %}</div></div>
   <table>
     <thead><tr><th>Contract</th><th>Window</th><th>Target</th><th>History</th><th>Issues</th><th></th></tr></thead>
     <tbody>
@@ -113,13 +150,14 @@
 {% endif %}
 
 {% if target_report %}
-<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-7 mt-8" aria-live="polite">
+<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-8 mt-8" aria-live="polite">
   <div class="metric-card"><p>Matching</p><strong>{{ target_report.matching }}</strong></div>
   <div class="metric-card"><p>Target checked</p><strong>{{ target_report.checked }}</strong></div>
   <div class="metric-card"><p>Outcome checked</p><strong>{{ target_report.outcome_checked }}</strong></div>
   <div class="metric-card"><p>Target mismatches</p><strong class="{{ 'loss' if target_report.mismatch_contracts else 'profit' }}">{{ target_report.mismatch_contracts }}</strong></div>
   <div class="metric-card"><p>Outcome mismatches</p><strong class="{{ 'loss' if target_report.outcome_mismatch_contracts else 'profit' }}">{{ target_report.outcome_mismatch_contracts }}</strong></div>
   <div class="metric-card"><p>Unavailable</p><strong class="{{ 'loss' if target_report.unavailable_contracts else 'profit' }}">{{ target_report.unavailable_contracts }}</strong></div>
+  <div class="metric-card"><p>Rate limited</p><strong class="{{ 'loss' if target_report.rate_limited else 'profit' }}">{{ target_report.rate_limited }}</strong></div>
   <div class="metric-card"><p>Unique slugs</p><strong>{{ target_report.unique_slugs }}</strong></div>
 </section>
 {% endif %}
@@ -132,6 +170,64 @@
   const title = panel.querySelector('[data-quality-progress-title]');
   const message = panel.querySelector('[data-quality-progress-message]');
   const log = panel.querySelector('[data-quality-progress-log]');
+  let progressSource = null;
+  const appendLog = (text) => {
+    if (!log) return;
+    const row = document.createElement('p');
+    row.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+    log.appendChild(row);
+    while (log.childElementCount > 200) log.firstElementChild.remove();
+    log.scrollTop = log.scrollHeight;
+  };
+  const formatEta = (seconds) => {
+    if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '';
+    const total = Math.max(0, Math.round(Number(seconds)));
+    const minutes = Math.floor(total / 60);
+    const rest = total % 60;
+    return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
+  };
+  const showLiveProgress = (form) => {
+    if (progressSource) progressSource.close();
+    panel.classList.remove('hidden');
+    if (title) title.textContent = 'Checking saved contracts';
+    if (message) message.textContent = 'Starting live progress...';
+    if (log) log.innerHTML = '';
+    appendLog('Preparing quality scan...');
+    const params = new URLSearchParams(new FormData(form));
+    params.delete('scan');
+    const source = new EventSource(`/live-monitor/quality/progress?${params.toString()}`);
+    progressSource = source;
+    source.addEventListener('progress', event => {
+      const data = JSON.parse(event.data);
+      const done = data.done === null || data.done === undefined ? null : Number(data.done);
+      const total = data.total === null || data.total === undefined ? null : Number(data.total);
+      const remaining = data.remaining === null || data.remaining === undefined ? null : Number(data.remaining);
+      const parts = [];
+      if (data.message) parts.push(data.message);
+      if (done !== null && total !== null) parts.push(`${done}/${total} done`);
+      if (remaining !== null) parts.push(`${remaining} remaining`);
+      const eta = formatEta(data.eta_seconds);
+      if (eta) parts.push(`ETA ${eta}`);
+      const line = parts.join(' - ');
+      if (message) message.textContent = line || 'Working...';
+      appendLog(line || data.stage || 'Progress update');
+      if (data.stage === 'complete') {
+        source.close();
+        progressSource = null;
+        window.location.href = data.report_url;
+      } else if (data.stage === 'error') {
+        source.close();
+        progressSource = null;
+        if (message) message.textContent = data.message || 'Quality scan failed.';
+      }
+    });
+    source.onerror = () => {
+      appendLog('Live progress connection interrupted.');
+      if (message) message.textContent = 'Live progress connection interrupted.';
+      source.close();
+      progressSource = null;
+    };
+  };
   const showProgress = (mode) => {
     panel.classList.remove('hidden');
     if (title) title.textContent = mode === 'scan' ? 'Checking saved contracts' : mode === 'update' ? 'Updating saved contracts' : 'Deleting problem contracts';
@@ -140,7 +236,7 @@
       : mode === 'update'
         ? ['Writing saved contract fixes...', 'Refreshing quality page...']
       : mode === 'delete'
-        ? ['Preparing cleanup...', 'Deleting local quality problems...', 'Checking Gamma results before cleanup...', 'Deleting Gamma problem contracts...']
+        ? ['Deleting selected saved contracts...', 'Returning to quality page...']
         : ['Reading saved contracts...', 'Checking local history quality...', 'Fetching Gamma results...', 'Comparing saved targets and outcomes with Gamma...'];
     if (message) message.textContent = lines[0];
     if (log) log.innerHTML = lines.map((line, index) => `<p>${index === 0 ? 'Now' : 'Queued'}: ${line}</p>`).join('');
@@ -157,13 +253,14 @@
     }, 1400);
   };
   document.querySelectorAll('[data-quality-scan-form]').forEach(form => {
-    form.addEventListener('submit', () => {
+    form.addEventListener('submit', event => {
+      event.preventDefault();
       const button = form.querySelector('button[type="submit"]');
       if (button) {
         button.disabled = true;
         button.textContent = 'Scanning...';
       }
-      showProgress('scan');
+      showLiveProgress(form);
     });
   });
   document.querySelectorAll('[data-quality-delete-form]').forEach(form => {

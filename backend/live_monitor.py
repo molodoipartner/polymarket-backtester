@@ -45,8 +45,10 @@ CRYPTO_FAST_RECONNECT_DELAY_SECONDS = 0.1
 TRANSIENT_DISCONNECT_GRACE_SECONDS = 30.0
 GAMMA_REQUEST_MAX_ATTEMPTS = 6
 GAMMA_REQUEST_BASE_DELAY_SECONDS = 0.75
-GAMMA_TARGET_CHECK_CONCURRENCY = 2
-GAMMA_TARGET_CHECK_REQUEST_SPACING_SECONDS = 0.35
+GAMMA_TARGET_CHECK_CONCURRENCY = 8
+GAMMA_TARGET_CHECK_RECOVERY_CONCURRENCY = 2
+GAMMA_TARGET_CHECK_RECOVERY_SPACING_SECONDS = 0.4
+GAMMA_TARGET_CHECK_CACHE_TTL_SECONDS = 6 * 60 * 60
 NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
@@ -213,6 +215,13 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         except ValueError:
             return None
         return max(0.0, retry_at.timestamp() - time.time())
+
+
+def _is_gamma_rate_limit_error(error: Exception) -> bool:
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and getattr(error.response, "status_code", None) == 429
+    )
 
 
 def _gamma_retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
@@ -2834,6 +2843,7 @@ class LiveMonitorManager:
         self.data_root = data_root
         self.sessions: dict[str, LiveMonitorSession] = {}
         self.active_by_user: dict[str, list[str]] = {}
+        self._gamma_quality_cache: dict[str, tuple[float, dict]] = {}
         self.data_root.mkdir(parents=True, exist_ok=True)
         (self.data_root / "sessions").mkdir(exist_ok=True)
         (self.data_root / "samples").mkdir(exist_ok=True)
@@ -2935,6 +2945,7 @@ class LiveMonitorManager:
         timeframe: str | None = "5m",
         recent_limit: int | None = None,
         limit: int = 500,
+        progress=None,
     ) -> dict:
         record_paths = _read_saved_record_preview_paths(
             _saved_records_dir(self.data_root, user_id),
@@ -2956,6 +2967,9 @@ class LiveMonitorManager:
         target_issue_count = 0
         history_issue_count = 0
         problem_ids: set[str] = set()
+        missing_data_problem_ids: set[str] = set()
+        local_started_at = time.time()
+        total_selected = len(selected_paths)
         for path, preview in selected_paths:
             record = _with_saved_category(preview)
             scanned += 1
@@ -2973,6 +2987,12 @@ class LiveMonitorManager:
                 problem_count += 1
                 if history_issues or _quality_issues_are_deletable(target_issues):
                     _add_record_id(problem_ids, record)
+                if history_issues or any(
+                    str(issue.get("type") or "") in MISSING_DATA_QUALITY_ISSUE_TYPES
+                    for issue in target_issues
+                    if isinstance(issue, dict)
+                ):
+                    _add_record_id(missing_data_problem_ids, record)
                 if len(issues) < limit:
                     issues.append({
                         "id": record.get("id"),
@@ -3006,6 +3026,24 @@ class LiveMonitorManager:
                         "target_issues": target_issues,
                         "history_issues": history_issues,
                     })
+            if progress is not None and (
+                scanned == 1
+                or scanned == total_selected
+                or scanned % 10 == 0
+            ):
+                elapsed = max(0.001, time.time() - local_started_at)
+                remaining = max(0, total_selected - scanned)
+                progress({
+                    "stage": "local",
+                    "done": scanned,
+                    "total": total_selected,
+                    "remaining": remaining,
+                    "eta_seconds": round((elapsed / scanned) * remaining, 1),
+                    "message": (
+                        f"Local history {scanned}/{total_selected}; "
+                        f"{remaining} remaining."
+                    ),
+                })
         return {
             "asset": normalized_category or "all",
             "timeframe": timeframe or "all",
@@ -3019,6 +3057,7 @@ class LiveMonitorManager:
             "issues_shown": len(issues),
             "issues_limited": problem_count > len(issues),
             "problem_ids": sorted(problem_ids),
+            "missing_data_problem_ids": sorted(missing_data_problem_ids),
             "history_initial_grace_seconds": HISTORY_INITIAL_MISSING_GRACE_SECONDS,
             "history_interval_seconds": HISTORY_CAPTURE_INTERVAL_SECONDS,
         }
@@ -3030,6 +3069,7 @@ class LiveMonitorManager:
         timeframe: str | None = "5m",
         recent_limit: int | None = None,
         limit: int = 1000,
+        progress=None,
     ) -> dict:
         record_paths = _read_saved_record_preview_paths(
             _saved_records_dir(self.data_root, user_id),
@@ -3052,45 +3092,175 @@ class LiveMonitorManager:
             for record in matching_records
             if str(record.get("slug") or "").strip()
         })
-        semaphore = asyncio.Semaphore(GAMMA_TARGET_CHECK_CONCURRENCY)
-        request_spacing_lock = asyncio.Lock()
-        next_request_at = 0.0
+        gamma_started_at = time.time()
+        completed_slugs = 0
+        retry_completed_slugs = 0
 
-        async def fetch_slug(client: httpx.AsyncClient, slug: str) -> tuple[str, dict]:
-            nonlocal next_request_at
+        def cached_slug(slug: str) -> dict | None:
+            cached = self._gamma_quality_cache.get(slug)
+            if cached is None:
+                return None
+            cached_at, cached_result = cached
+            if time.time() - cached_at > GAMMA_TARGET_CHECK_CACHE_TTL_SECONDS:
+                self._gamma_quality_cache.pop(slug, None)
+                return None
+            return dict(cached_result)
+
+        def cache_slug(slug: str, result: dict) -> None:
+            if result.get("ok"):
+                self._gamma_quality_cache[slug] = (time.time(), dict(result))
+
+        async def publish_gamma_progress(
+            slug: str,
+            result: dict,
+            *,
+            stage: str = "gamma",
+            message_prefix: str = "Gamma",
+            retry_total: int | None = None,
+        ) -> None:
+            nonlocal completed_slugs
+            nonlocal retry_completed_slugs
+            if retry_total is not None:
+                retry_completed_slugs += 1
+                done = retry_completed_slugs
+                total = retry_total
+            else:
+                completed_slugs += 1
+                done = completed_slugs
+                total = len(slugs)
+            if progress is None:
+                return
+            elapsed = max(0.001, time.time() - gamma_started_at)
+            remaining = max(0, total - done)
+            await progress({
+                "stage": stage,
+                "slug": slug,
+                "done": done,
+                "total": total,
+                "remaining": remaining,
+                "errors": 0 if result.get("ok") else 1,
+                "eta_seconds": round((elapsed / max(1, done)) * remaining, 1),
+                "message": (
+                    f"{message_prefix} {done}/{total}; "
+                    f"{remaining} remaining."
+                ),
+            })
+
+        async def fetch_slug(
+            client: httpx.AsyncClient,
+            slug: str,
+            semaphore: asyncio.Semaphore,
+            *,
+            stage: str = "gamma",
+            message_prefix: str = "Gamma",
+            spacing_seconds: float = 0.0,
+            spacing_lock: asyncio.Lock | None = None,
+            next_request_at: list[float] | None = None,
+            retry_total: int | None = None,
+        ) -> tuple[str, dict]:
+            cached = cached_slug(slug)
+            if cached is not None:
+                await publish_gamma_progress(
+                    slug,
+                    cached,
+                    stage=stage,
+                    message_prefix=f"{message_prefix} cached",
+                    retry_total=retry_total,
+                )
+                return slug, cached
             async with semaphore:
                 try:
-                    async with request_spacing_lock:
-                        now = time.monotonic()
-                        if now < next_request_at:
-                            await asyncio.sleep(next_request_at - now)
-                        next_request_at = time.monotonic() + GAMMA_TARGET_CHECK_REQUEST_SPACING_SECONDS
+                    if spacing_seconds > 0 and spacing_lock is not None and next_request_at is not None:
+                        async with spacing_lock:
+                            now = time.monotonic()
+                            if now < next_request_at[0]:
+                                await asyncio.sleep(next_request_at[0] - now)
+                            next_request_at[0] = (
+                                time.monotonic() + spacing_seconds
+                            )
                     payload = await _fetch_gamma_event_payload(client, slug)
                     target = _external_target_from_gamma_payload(payload)
                     outcome = _external_outcome_from_gamma_payload(payload)
-                    return slug, {
+                    result = {
                         "ok": True,
                         "target": target,
                         "outcome": outcome,
                         "error": None,
                     }
+                    cache_slug(slug, result)
                 except Exception as exc:
-                    return slug, {
+                    result = {
                         "ok": False,
                         "target": None,
                         "outcome": None,
                         "error": str(exc),
+                        "rate_limited": _is_gamma_rate_limit_error(exc),
                     }
+                await publish_gamma_progress(
+                    slug,
+                    result,
+                    stage=stage,
+                    message_prefix=message_prefix,
+                    retry_total=retry_total,
+                )
+                return slug, result
 
         async with httpx.AsyncClient(
             timeout=15,
             follow_redirects=True,
             trust_env=True,
         ) as client:
+            primary_semaphore = asyncio.Semaphore(GAMMA_TARGET_CHECK_CONCURRENCY)
             results = await asyncio.gather(
-                *(fetch_slug(client, slug) for slug in slugs),
+                *(
+                    fetch_slug(client, slug, primary_semaphore)
+                    for slug in slugs
+                ),
                 return_exceptions=False,
             )
+            retry_slugs = [
+                slug
+                for slug, result in results
+                if result.get("rate_limited")
+            ]
+            if retry_slugs and progress is not None:
+                await progress({
+                    "stage": "gamma_retry",
+                    "done": 0,
+                    "total": len(retry_slugs),
+                    "remaining": len(retry_slugs),
+                    "message": (
+                        f"Retrying {len(retry_slugs)} rate-limited Gamma request(s)."
+                    ),
+                })
+            if retry_slugs:
+                recovery_semaphore = asyncio.Semaphore(
+                    GAMMA_TARGET_CHECK_RECOVERY_CONCURRENCY
+                )
+                spacing_lock = asyncio.Lock()
+                next_request_at = [0.0]
+                retry_results = await asyncio.gather(
+                    *(
+                        fetch_slug(
+                            client,
+                            slug,
+                            recovery_semaphore,
+                            stage="gamma_retry",
+                            message_prefix="Gamma retry",
+                            spacing_seconds=GAMMA_TARGET_CHECK_RECOVERY_SPACING_SECONDS,
+                            spacing_lock=spacing_lock,
+                            next_request_at=next_request_at,
+                            retry_total=len(retry_slugs),
+                        )
+                        for slug in retry_slugs
+                    ),
+                    return_exceptions=False,
+                )
+                retry_by_slug = dict(retry_results)
+                results = [
+                    (slug, retry_by_slug.get(slug, result))
+                    for slug, result in results
+                ]
         slug_cache.update(dict(results))
 
         mismatches = []
@@ -3098,6 +3268,8 @@ class LiveMonitorManager:
         outcome_mismatches = []
         problem_ids: set[str] = set()
         outcome_problem_ids: set[str] = set()
+        unavailable_problem_ids: set[str] = set()
+        gamma_target_missing_problem_ids: set[str] = set()
         checked = 0
         outcome_checked = 0
         mismatch_count = 0
@@ -3105,6 +3277,7 @@ class LiveMonitorManager:
         saved_missing = 0
         external_missing = 0
         fetch_failed = 0
+        rate_limited = 0
         saved_outcome_missing = 0
         external_outcome_missing = 0
         for record in matching_records:
@@ -3124,6 +3297,7 @@ class LiveMonitorManager:
             )
             if saved_target is None:
                 saved_missing += 1
+                _add_record_id(unavailable_problem_ids, record)
                 if len(unavailable) < limit:
                     unavailable.append(_external_target_unavailable_summary(
                         record,
@@ -3131,6 +3305,7 @@ class LiveMonitorManager:
                     ))
             if not slug:
                 external_missing += 1
+                _add_record_id(unavailable_problem_ids, record)
                 if len(unavailable) < limit:
                     unavailable.append(_external_target_unavailable_summary(
                         record,
@@ -3138,6 +3313,9 @@ class LiveMonitorManager:
                     ))
                 continue
             if not external_result or not external_result.get("ok"):
+                if external_result and external_result.get("rate_limited"):
+                    rate_limited += 1
+                    continue
                 fetch_failed += 1
                 if len(unavailable) < limit:
                     unavailable.append(_external_target_unavailable_summary(
@@ -3147,16 +3325,19 @@ class LiveMonitorManager:
                 continue
             if saved_target is not None and not isinstance(external_target, dict):
                 external_missing += 1
+                _add_record_id(unavailable_problem_ids, record)
+                _add_record_id(gamma_target_missing_problem_ids, record)
                 if len(unavailable) < limit:
                     unavailable.append(_external_target_unavailable_summary(
                         record,
-                        "Gamma response did not include priceToBeat.",
+                        "Gamma target unavailable; saved target was not compared.",
                     ))
             elif saved_target is not None:
                 raw_target = _optional_float(external_target.get("value"))
                 rounded_target = _price_to_beat(raw_target, record.get("crypto_symbol"))
                 if raw_target is None or rounded_target is None:
                     external_missing += 1
+                    _add_record_id(unavailable_problem_ids, record)
                     if len(unavailable) < limit:
                         unavailable.append(_external_target_unavailable_summary(
                             record,
@@ -3231,8 +3412,11 @@ class LiveMonitorManager:
             "saved_outcome_missing": saved_outcome_missing,
             "external_outcome_missing": external_outcome_missing,
             "fetch_failed": fetch_failed,
+            "rate_limited": rate_limited,
             "problem_ids": sorted(problem_ids),
             "outcome_problem_ids": sorted(outcome_problem_ids),
+            "unavailable_problem_ids": sorted(unavailable_problem_ids),
+            "gamma_target_missing_problem_ids": sorted(gamma_target_missing_problem_ids),
             "source": "Gamma eventMetadata.priceToBeat and market resolution",
         }
 
@@ -3415,6 +3599,41 @@ class LiveMonitorManager:
             return False
         path.unlink()
         return True
+
+    def delete_saved_items(self, user_id: str, record_ids: list[str]) -> int:
+        wanted = {
+            str(record_id).strip()
+            for record_id in record_ids
+            if str(record_id).strip()
+        }
+        if not wanted:
+            return 0
+        directory = _saved_records_dir(self.data_root, user_id)
+        if not directory.exists():
+            return 0
+        paths_by_id: dict[str, Path] = {}
+        for path in directory.glob("*.json"):
+            direct_id = path.stem
+            if direct_id in wanted:
+                paths_by_id.setdefault(direct_id, path)
+                continue
+            try:
+                payload = _read_saved_record_metadata(path)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            record_id = str(payload.get("id") or "").strip()
+            if record_id in wanted:
+                paths_by_id.setdefault(record_id, path)
+        deleted = 0
+        for path in paths_by_id.values():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            deleted += 1
+        return deleted
 
     def delete_saved_category(self, user_id: str, category: str) -> int:
         normalized_category = _normalize_saved_category(category)
@@ -4461,6 +4680,7 @@ async def _fetch_gamma_event_payload(client: httpx.AsyncClient, slug: str) -> An
 
 def _external_target_from_gamma_payload(payload: Any) -> dict | None:
     event = payload[0] if isinstance(payload, list) and payload else payload
+    event = _coerce_dict(event)
     if not isinstance(event, dict):
         return None
 
@@ -4469,6 +4689,10 @@ def _external_target_from_gamma_payload(payload: Any) -> dict | None:
         ("eventMetadata", "price_to_beat"),
         ("eventMetadata", "targetPrice"),
         ("eventMetadata", "target_price"),
+        ("metadata", "priceToBeat"),
+        ("metadata", "price_to_beat"),
+        ("metadata", "targetPrice"),
+        ("metadata", "target_price"),
         ("priceToBeat",),
         ("price_to_beat",),
         ("targetPrice",),
@@ -4479,15 +4703,22 @@ def _external_target_from_gamma_payload(payload: Any) -> dict | None:
         if parsed is not None and parsed > 0:
             return {"value": parsed, "source": ".".join(path)}
 
-    markets = event.get("markets")
+    markets = parse_list(event.get("markets"))
     if not isinstance(markets, list):
         return None
     for market in markets:
+        market = _coerce_dict(market)
         if not isinstance(market, dict):
             continue
         for path in (
             ("eventMetadata", "priceToBeat"),
             ("eventMetadata", "price_to_beat"),
+            ("eventMetadata", "targetPrice"),
+            ("eventMetadata", "target_price"),
+            ("metadata", "priceToBeat"),
+            ("metadata", "price_to_beat"),
+            ("metadata", "targetPrice"),
+            ("metadata", "target_price"),
             ("priceToBeat",),
             ("price_to_beat",),
             ("targetPrice",),
@@ -4502,6 +4733,7 @@ def _external_target_from_gamma_payload(payload: Any) -> dict | None:
 
 def _external_outcome_from_gamma_payload(payload: Any) -> dict | None:
     event = payload[0] if isinstance(payload, list) and payload else payload
+    event = _coerce_dict(event)
     if not isinstance(event, dict):
         return None
 
@@ -4518,10 +4750,11 @@ def _external_outcome_from_gamma_payload(payload: Any) -> dict | None:
         if normalized is not None:
             return {"value": normalized, "source": ".".join(path)}
 
-    markets = event.get("markets")
+    markets = parse_list(event.get("markets"))
     if not isinstance(markets, list):
         return None
     for market in markets:
+        market = _coerce_dict(market)
         if not isinstance(market, dict):
             continue
         for path in (
@@ -4564,9 +4797,22 @@ def _normalize_external_outcome(value: Any) -> str | None:
     return None
 
 
+def _coerce_dict(value: Any) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def _value_at_path(payload: dict, path: tuple[str, ...]) -> Any:
     current: Any = payload
     for key in path:
+        current = _coerce_dict(current)
         if not isinstance(current, dict) or key not in current:
             return None
         current = current[key]
@@ -4621,6 +4867,7 @@ def _add_record_id(record_ids: set[str], record: dict) -> None:
 
 
 NON_DELETABLE_QUALITY_ISSUE_TYPES = {"target_timestamp_missing"}
+MISSING_DATA_QUALITY_ISSUE_TYPES = {"target_timestamp_missing"}
 
 
 def _quality_issues_are_deletable(issues: list[dict]) -> bool:
