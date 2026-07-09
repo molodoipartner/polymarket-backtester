@@ -31,6 +31,19 @@
     </label>
     <label class="market-choice self-end"><input type="checkbox" name="include_partial_contracts" value="true" {{ 'checked' if include_partial_contracts }}><span><strong>Include partial</strong><small>Full and partial suitable contracts</small></span></label>
   </div>
+  <div class="mt-5">
+    <div class="section-title"><div><h2>Strategy families</h2><p class="muted">Only checked families will be included in generation.</p></div><span class="badge">Selectable</span></div>
+    {% for mode, options in strategy_family_options_by_mode.items() %}
+      <div class="strategy-family-grid {{ 'hidden' if mode != selected_strategy_mode }}" data-strategy-family-group="{{ mode }}">
+        {% for option in options %}
+          <label class="market-choice">
+            <input type="checkbox" name="strategy_families" value="{{ option.id }}" {{ 'checked' if option.id in selected_strategy_families }}>
+            <span><strong>{{ option.label }}</strong><small>{{ option.id }}</small></span>
+          </label>
+        {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
 </form>
 
 <section id="live-analysis-summary-loading" class="panel mb-6" aria-live="polite">
@@ -48,6 +61,8 @@
   <input type="hidden" name="asset_symbol" value="{{ selected_asset }}">
   <input type="hidden" name="timeframe" value="{{ selected_timeframe }}">
   <input type="hidden" name="strategy_mode" value="{{ selected_strategy_mode }}">
+  <input type="hidden" name="strategy_family_filter_enabled" value="true">
+  <div data-live-analysis-family-hidden></div>
   {% if include_partial_contracts %}<input type="hidden" name="include_partial_contracts" value="true">{% endif %}
   <div class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-ink p-4">
     <div><h2>Contract time window</h2><p class="muted">Load the detailed contract list only when you need to narrow the range.</p></div>

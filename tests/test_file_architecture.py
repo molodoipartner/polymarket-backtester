@@ -79,6 +79,7 @@ def write_live_monitor_record(
     partial: bool = False,
     unsuitable: bool = False,
     target_price_ts: float | None = None,
+    session_id: str | None = None,
 ) -> None:
     start_ts = 1782639600 + index * 300
     end_ts = start_ts + 300
@@ -99,6 +100,7 @@ def write_live_monitor_record(
         })
     record = {
         "id": record_id,
+        "session_id": session_id or "test-session",
         "question": f"Bitcoin Up or Down {index}",
         "crypto_symbol": "btc/usd",
         "slug": f"btc-updown-5m-{start_ts}",
@@ -1042,9 +1044,19 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert detail.status_code == 200
         assert "Entry Ask" in detail.text
         assert "Exit Price" in detail.text
+        assert "Start using this strategy in live trading" in detail.text
+        assert f"/groups/{group['id']}/strategies/{strategies[0]['id']}/paper-trading" in detail.text
         assert "Run live retest" in detail.text
+        assert "data-live-retest-refresh" in detail.text
         assert "data-live-retest-loading" in detail.text
-        assert "future-up" in detail.text
+        assert "future-up" not in detail.text
+        fresh_retest_summary = client.get(
+            f"/api/groups/{group['id']}/strategies/{strategies[0]['id']}/live-retest/summary"
+        )
+        assert fresh_retest_summary.status_code == 200
+        fresh_summary = fresh_retest_summary.json()["summary"]
+        assert fresh_summary["selected_contracts"] == 3
+        assert "future-up" in fresh_summary["selected_contract_ids"]
         assert "data-trade-contract-toggle" in detail.text
         trades = store.list_user_records_filtered(
             user["id"], "transactions", {"strategy_id": strategies[0]["id"]}
@@ -1065,6 +1077,167 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         )
         assert chart_payload["trade"]["entry_yes_axis_cents"] == expected_axis
         assert chart_payload["trade"]["exit_price_cents"] in {0.0, 100.0}
+
+        paper_page = client.get(
+            f"/groups/{group['id']}/strategies/{strategies[0]['id']}/paper-trading"
+        )
+        assert paper_page.status_code == 200
+        assert "Start trading" in paper_page.text
+        assert "Starting balance" in paper_page.text
+        assert "Contracts with paper trades" in paper_page.text
+        assert f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync" not in paper_page.text
+        run_group, run_strategy = routes_module._create_paper_run_group(
+            store,
+            user["id"],
+            group,
+            strategies[0],
+            "paper-session",
+            starting_balance=750,
+        )
+        assert run_group["starting_balance"] == 750
+        write_live_monitor_record(
+            store,
+            user,
+            "paper-first-skip",
+            4,
+            outcome="Up",
+            session_id="paper-session",
+        )
+        write_live_monitor_record(
+            store,
+            user,
+            "paper-live-up",
+            5,
+            outcome="Up",
+            session_id="paper-session",
+        )
+        paper_id = "paper-live-up-paper-record"
+        trade_id = "paper-live-up-live-trade"
+        paper_start_ts = 1782639600 + 5 * 300
+        paper_end_ts = paper_start_ts + 300
+        paper_opened_at = datetime.fromtimestamp(paper_start_ts + 10, timezone.utc).isoformat()
+        paper_closed_at = datetime.fromtimestamp(paper_end_ts, timezone.utc).isoformat()
+        store.append_user_record(user["id"], "paper_trades", {
+            "id": paper_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "source_group_id": group["id"],
+            "source_strategy_id": strategies[0]["id"],
+            "session_id": "paper-session",
+            "strategy_name": run_strategy["name"],
+            "family": run_strategy.get("family"),
+            "saved_record_id": "paper-live-up",
+            "live_event_key": "paper-session:btc-updown-5m-1782641100:1782641100",
+            "question": "Bitcoin Up or Down 5",
+            "event_title": "Bitcoin Up or Down 5",
+            "crypto_symbol": "btc/usd",
+            "target_price": 105,
+            "final_crypto_price": 105.08,
+            "winning_outcome": "Up",
+            "window_start_ts": paper_start_ts,
+            "window_end_ts": paper_end_ts,
+            "saved_at": paper_closed_at,
+            "paper_mode": True,
+            "trade_count": 1,
+            "net_profit": 45,
+            "roi": 9,
+            "initial_capital": 500,
+            "final_capital": 545,
+            "history_count": 60,
+        })
+        store.append_user_record(user["id"], "transactions", {
+            "id": trade_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "paper_trade_id": paper_id,
+            "paper_mode": True,
+            "event_id": "paper-live-up",
+            "market_id": "condition-paper-live-up",
+            "market_question": "Bitcoin Up or Down 5",
+            "asset": "BTC",
+            "timeframe": "5m",
+            "side": "UP",
+            "resolved_outcome": "UP",
+            "opened_at": paper_opened_at,
+            "closed_at": paper_closed_at,
+            "expiration_time": paper_closed_at,
+            "entry_price": 0.55,
+            "ask_price": 0.55,
+            "exit_price": 1.0,
+            "exit_type": "settlement",
+            "contracts_volume": 100,
+            "margin_locked": 55,
+            "entry_fee": 0,
+            "pnl": 45,
+            "balance_before": 500,
+            "balance_after": 545,
+            "saved_record_id": "paper-live-up",
+        })
+        routes_module._refresh_paper_run_summary(store, user["id"], run_group, run_strategy)
+        rebalanced_trade = store.get_user_record(user["id"], "transactions", trade_id)
+        assert rebalanced_trade["balance_before"] == 750
+        assert rebalanced_trade["balance_after"] == 795
+        refreshed_run_strategy = store.get_user_record(user["id"], "strategies", run_strategy["id"])
+        assert refreshed_run_strategy["metrics"]["initial_capital"] == 750
+        assert refreshed_run_strategy["metrics"]["final_capital"] == 795
+        synced = client.post(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync"
+        )
+        assert synced.status_code == 200
+        assert synced.json()["disabled"] is True
+        assert synced.json()["created"] == 0
+        assert synced.json()["run_count"] == 0
+        paper_list = client.get(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/contracts"
+        )
+        assert paper_list.status_code == 200
+        paper_record = paper_list.json()["records"][0]
+        assert paper_record["trade_count"] >= 1
+        assert paper_record["group_id"] == run_group["id"]
+        assert paper_record["strategy_id"] == run_strategy["id"]
+        assert paper_record["saved_record_id"] == "paper-live-up"
+        assert "contract_record" not in paper_record
+        paper_detail = client.get(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/contracts/{paper_record['id']}"
+        )
+        assert paper_detail.status_code == 200
+        paper_payload = paper_detail.json()["record"]
+        assert paper_payload["trades"]
+        assert paper_payload["history"]
+        run_transactions = store.list_user_records_filtered(
+            user["id"],
+            "transactions",
+            {"group_id": run_group["id"], "strategy_id": run_strategy["id"]},
+        )
+        assert run_transactions
+        run_detail = client.get(f"/groups/{run_group['id']}/strategies/{run_strategy['id']}")
+        assert run_detail.status_code == 200
+        assert "data-trade-contract-toggle" in run_detail.text
+        run_chart = client.get(
+            f"/api/groups/{run_group['id']}/strategies/{run_strategy['id']}/trades/{run_transactions[0]['id']}/contract-chart"
+        )
+        assert run_chart.status_code == 200
+        assert run_chart.json()["record"]["id"] == "paper-live-up"
+        account = client.get("/account")
+        assert account.status_code == 200
+        assert "Paper trading run groups" in account.text
+        assert run_group["name"] in account.text
+        deleted_paper = client.delete(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/contracts/{paper_record['id']}"
+        )
+        assert deleted_paper.status_code == 200
+        assert deleted_paper.json()["removed_transactions"] >= 1
+        synced_after_delete = client.post(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync"
+        )
+        assert synced_after_delete.status_code == 200
+        assert synced_after_delete.json()["disabled"] is True
+        assert synced_after_delete.json()["created"] == 0
+        assert not store.list_user_records_filtered(
+            user["id"],
+            "transactions",
+            {"group_id": run_group["id"], "strategy_id": run_strategy["id"]},
+        )
 
         live_retest = client.post(
             f"/groups/{group['id']}/strategies/{strategies[0]['id']}/live-retest",
@@ -1189,6 +1362,29 @@ def test_live_monitor_analysis_filters_target_price_anomaly_contracts(tmp_path: 
         assert client.get("/api/live-monitor/saved/late-target-up").status_code == 404
         cleaned_page = client.get(f"/groups/{group['id']}")
         assert "Filtered target-price anomalies" not in cleaned_page.text
+
+
+def test_paper_trading_requires_target_price_at_window_start():
+    on_time = {
+        "window_start_ts": 1782639600,
+        "target_price_ts": 1782639600,
+        "target_price": 100.0,
+    }
+    late = {
+        "window_start_ts": 1782639600,
+        "target_price_ts": 1782639600.5,
+        "target_price": 100.0,
+    }
+    fallback_history = [
+        {"t": 1782639600, "target_price_ts": 1782639600, "target_price": 100.0}
+    ]
+
+    assert routes_module._paper_target_known_at_window_start(on_time)
+    assert routes_module._paper_target_known_at_window_start(
+        {"window_start_ts": 1782639600},
+        fallback_history,
+    )
+    assert not routes_module._paper_target_known_at_window_start(late)
 
 
 def test_live_monitor_quality_scan_finds_target_and_history_issues(
@@ -2384,6 +2580,110 @@ def test_live_monitor_parallel_backtests_preserve_filtered_strategy_indexes(
     assert len(results) == 2
 
 
+def test_live_monitor_events_from_saved_ids_uses_batch_loader(tmp_path: Path):
+    store, _user = populated_store(tmp_path)
+    records = []
+    for index in range(2):
+        start_ts = 1_800_000_000.0 + index * 300
+        records.append({
+            "id": f"record-{index}",
+            "window_start_ts": start_ts,
+            "window_end_ts": start_ts + 300,
+            "winning_outcome": "Up",
+            "history": [
+                {
+                    "t": start_ts + 10,
+                    "crypto_price": 100.1,
+                    "target_price": 100.0,
+                    "yes_bid": 54.0,
+                    "yes_ask": 56.0,
+                    "no_bid": 44.0,
+                    "no_ask": 46.0,
+                },
+            ],
+        })
+
+    class BatchOnlyMonitor:
+        def __init__(self):
+            self.requested_ids = []
+
+        def list_saved_by_ids(self, user_id, record_ids):
+            assert user_id == "user-1"
+            self.requested_ids = list(record_ids)
+            return records
+
+        def get_saved(self, _user_id, _record_id):
+            raise AssertionError("expected the batch saved-record loader")
+
+    monitor = BatchOnlyMonitor()
+    generator = LiveMonitorStrategyGenerator(store, monitor)
+
+    events = generator._events_from_saved_record_ids(
+        "user-1",
+        "BTC",
+        "5m",
+        False,
+        ["record-0", "record-1"],
+    )
+
+    assert monitor.requested_ids == ["record-0", "record-1"]
+    assert [event["id"] for event in events] == ["record-0", "record-1"]
+
+
+def test_live_monitor_metrics_only_backtest_matches_full_phase_metrics(tmp_path: Path):
+    store, _user = populated_store(tmp_path)
+    generator = LiveMonitorStrategyGenerator(store, None)
+    start_ts = 1_800_000_000.0
+    events = []
+    for event_index, outcome in enumerate(("up", "down")):
+        event_start = start_ts + event_index * 300
+        history = []
+        for offset in range(20):
+            history.append({
+                "t": event_start + offset * 10,
+                "crypto_price": 100 + offset * (0.05 if outcome == "up" else -0.05),
+                "target_price": 100.0,
+                "yes_bid": 54.0,
+                "yes_ask": 56.0,
+                "yes_mid": 55.0,
+                "no_bid": 44.0,
+                "no_ask": 46.0,
+            })
+        events.append({
+            "id": f"metrics-only-{event_index}",
+            "market_id": f"condition-{event_index}",
+            "question": f"Metrics only {event_index}",
+            "asset": "BTC",
+            "timeframe": "5m",
+            "start_ts": event_start,
+            "end_ts": event_start + 300,
+            "start_time": datetime.fromtimestamp(event_start, timezone.utc).isoformat(),
+            "expiration_time": datetime.fromtimestamp(event_start + 300, timezone.utc).isoformat(),
+            "history": history,
+            "resolved_outcome": outcome,
+            "partial_contract": False,
+        })
+    strategy = {
+        "family": "quote_momentum",
+        "entry_second": 10,
+        "quote_edge_cents": 2,
+        "deviation_threshold_pct": 0.03,
+        "allocation_pct": 0.1,
+        "max_allocation_pct": 0.1,
+        "fee_bps": 10.0,
+        "exit_condition": "settlement",
+        "price_source": "saved_live_monitor_ask",
+    }
+
+    full = generator._run(events, strategy, 500.0)
+    metrics_only = generator._run(events, strategy, 500.0, metrics_only=True)
+
+    for key in ("net_profit", "roi", "trade_count", "contracts_used"):
+        assert metrics_only[key] == full[key]
+    assert metrics_only["transactions"] == []
+    assert metrics_only["equity_curve"] == []
+
+
 def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: Path, monkeypatch):
     store, user = populated_store(tmp_path)
     write_live_monitor_record(store, user, "smart-up", 0, outcome="Up")
@@ -2421,6 +2721,9 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
 
         group = store.list_user_records(user["id"], "groups")[-1]
         assert group["strategy_mode"] == "smart"
+        family_reports = store.list_user_records(user["id"], "family_reports")
+        assert family_reports[-1]["group_id"] == group["id"]
+        assert family_reports[-1]["rows"]
         strategies = store.list_user_records_filtered(
             user["id"], "strategies", {"group_id": group["id"]}
         )
@@ -2492,6 +2795,55 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
         assert payload["trade"]["exit_type"] == chart_trade["exit_type"]
         assert payload["trade"]["entry_edge_cents"] == chart_trade["entry_edge_cents"]
         assert payload["trade"]["resolved_outcome"] in {"UP", "DOWN", "FLAT"}
+
+
+def test_live_monitor_analysis_filters_selected_strategy_families(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store, user = populated_store(tmp_path)
+    write_live_monitor_record(store, user, "family-up", 0, outcome="Up")
+    write_live_monitor_record(store, user, "family-down", 1, outcome="Down")
+
+    class PreparedCollector:
+        def __init__(self, current_store):
+            assert current_store is store
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", PreparedCollector)
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        page = client.get("/live-monitor/analysis?asset_symbol=BTC&timeframe=5m")
+        assert page.status_code == 200
+        assert "Quote Reversal" in page.text
+        assert "strategy_family_filter_enabled" in page.text
+
+        started = client.post(
+            "/api/live-monitor/analysis/jobs",
+            data={
+                "group_name": "Filtered family checks",
+                "asset_symbol": "BTC",
+                "timeframe": "5m",
+                "strategy_mode": "lightweight",
+                "strategy_family_filter_enabled": "true",
+                "strategy_families": "quote_reversal",
+                "strategy_count": "2",
+                "starting_balance": "500",
+            },
+        )
+        assert started.status_code == 202
+        assert '"stage": "complete"' in client.get(started.json()["events_url"]).text
+
+        group = store.list_user_records(user["id"], "groups")[-1]
+        assert group["strategy_families"] == ["quote_reversal"]
+        strategies = store.list_user_records_filtered(
+            user["id"], "strategies", {"group_id": group["id"]}
+        )
+        assert len(strategies) == 2
+        assert {strategy["family"] for strategy in strategies} == {"quote_reversal"}
 
 
 def test_favorite_and_retest_routes_persist_results(tmp_path: Path, monkeypatch):
@@ -2735,6 +3087,168 @@ def test_account_can_clear_project_cache_without_deleting_accounts(tmp_path: Pat
         assert not (new_store.root / "cache" / "polymarket" / "entry.json").exists()
         assert not (new_store.root / "jobs" / "job.json").exists()
         assert client.get("/api/state").json()["user"]["id"] == user["id"]
+
+
+def test_account_shows_aggregate_smart_family_report(tmp_path: Path, monkeypatch):
+    store, user = populated_store(tmp_path)
+    group = {
+        "id": "smart-report-group",
+        "name": "Smart report group",
+        "source": "live_monitor_saved_contracts",
+        "theme": "live_monitor_saved_contracts",
+        "strategy_mode": "smart",
+        "strategy_count": 3,
+        "assets": ["BTC"],
+        "timeframe": "5m",
+        "starting_balance": 500,
+        "event_count": 2,
+        "period": {
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-01",
+            "start_time": "2026-07-01T00:00:00+00:00",
+            "end_time_exclusive": "2026-07-01T00:10:00+00:00",
+        },
+        "phase_validation": {
+            "enabled": True,
+            "family_rankings": [
+                {
+                    "family": "smart_reversion_edge",
+                    "family_label": "Smart Reversion Edge",
+                    "generated_count": 4,
+                    "strategy_count": 4,
+                    "final_strategy_count": 0,
+                    "total_trades": 0,
+                    "phases": [
+                        {
+                            "phase": 1,
+                            "tested_count": 4,
+                            "profitable_count": 0,
+                            "average_roi": -6.0,
+                            "best_roi": -1.0,
+                            "worst_roi": -12.0,
+                            "profitable_percent": 0.0,
+                        },
+                        {
+                            "phase": 2,
+                            "tested_count": 0,
+                            "profitable_count": 0,
+                            "average_roi": 0.0,
+                            "best_roi": 0.0,
+                            "worst_roi": 0.0,
+                            "profitable_percent": 0.0,
+                        },
+                        {
+                            "phase": 3,
+                            "tested_count": 0,
+                            "profitable_count": 0,
+                            "average_roi": 0.0,
+                            "best_roi": 0.0,
+                            "worst_roi": 0.0,
+                            "profitable_percent": 0.0,
+                        },
+                    ],
+                },
+            ],
+        },
+        "summary": {"best_roi": 12.5, "average_roi": 3.6667, "profitable_strategies": 2},
+        "created_at": "2026-07-01T00:00:00+00:00",
+    }
+    base_metrics = {
+        "initial_capital": 500,
+        "final_capital": 500,
+        "net_profit": 0,
+        "roi": 0,
+        "sharpe_ratio": 0,
+        "win_rate": 0,
+        "max_drawdown": 0,
+        "profit_factor": 0,
+        "average_trade": 0,
+        "trade_count": 0,
+        "event_count": 2,
+        "contracts_used": 0,
+        "stability_score": 0,
+        "recovery_factor": 0,
+        "up_trade_count": 0,
+        "down_trade_count": 0,
+        "winning_trade_count": 0,
+        "losing_trade_count": 0,
+        "flat_trade_count": 0,
+        "skipped_contract_count": 2,
+        "average_allocation_pct": 0,
+        "max_allocation_pct_used": 0,
+    }
+    strategies = [
+        {
+            "id": "smart-value-good",
+            "group_id": group["id"],
+            "name": "Smart Value",
+            "family": "smart_value_edge",
+            "family_label": "Smart Value Edge",
+            "parameters": {},
+            "metrics": {**base_metrics, "roi": 12.5, "net_profit": 62.5, "trade_count": 3, "win_rate": 66.7},
+            "equity_curve": [],
+        },
+        {
+            "id": "smart-value-flat",
+            "group_id": group["id"],
+            "name": "Smart Value 2",
+            "family": "smart_value_edge",
+            "family_label": "Smart Value Edge",
+            "parameters": {},
+            "metrics": {**base_metrics, "roi": 2.5, "net_profit": 12.5, "trade_count": 1, "win_rate": 100},
+            "equity_curve": [],
+        },
+        {
+            "id": "smart-momentum-bad",
+            "group_id": group["id"],
+            "name": "Smart Momentum",
+            "family": "smart_momentum_edge",
+            "family_label": "Smart Momentum Edge",
+            "parameters": {},
+            "metrics": {**base_metrics, "roi": -4.0, "net_profit": -20, "trade_count": 2, "win_rate": 0},
+            "equity_curve": [],
+        },
+    ]
+    store.save_group_bundle(user["id"], group, strategies, [])
+
+    class IdleCollector:
+        def __init__(self, current_store):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", IdleCollector)
+    with TestClient(app_module.create_app()) as client:
+        client.post("/login", data={"email": user["email"], "password": "secure-pass"})
+        account = client.get("/account")
+        assert account.status_code == 200
+        assert "All-analysis family report" in account.text
+        assert "Refresh report" in account.text
+        assert "Smart Value Edge" in account.text
+        assert "Smart Momentum Edge" in account.text
+        assert "Smart Reversion Edge" in account.text
+        assert "avg ROI +7.50%" in account.text
+        assert "avg ROI -4.00%" in account.text
+        assert "avg ROI -6.00%" in account.text
+        assert "not tested yet" in account.text
+        assert "Not tested" in account.text
+        assert "Please analyze which smart strategy families look strongest" in account.text
+        refreshed = client.get("/api/account/smart-family-report")
+        assert refreshed.status_code == 200
+        payload = refreshed.json()
+        assert payload["family_count"] == len(payload["rows"])
+        assert {row["family"] for row in payload["rows"]} >= {
+            "smart_value_edge",
+            "smart_momentum_edge",
+            "smart_reversion_edge",
+        }
+        reversion = next(row for row in payload["rows"] if row["family"] == "smart_reversion_edge")
+        assert reversion["tested"] is True
+        assert reversion["average_roi"] == -6.0
+        assert reversion["final_strategy_count"] == 0
+        assert next(row for row in payload["rows"] if row["family"] == "smart_tight_spread_edge")["tested"] is False
 
 
 def test_sse_stream_reports_all_generation_stages(tmp_path: Path, monkeypatch):

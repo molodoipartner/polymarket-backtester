@@ -23,6 +23,81 @@
     <form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form>
   </div>
 </section>
+{% if account.role != 'admin' %}
+<section class="panel mt-6">
+  <div class="section-title">
+    <div>
+      <p class="eyebrow">Paper trading</p>
+      <h2>Paper trading run groups</h2>
+      <p class="muted">Each live paper launch is saved as its own strategy group with its own trades.</p>
+    </div>
+    <span class="badge">{{ paper_trading_groups|length }} runs</span>
+  </div>
+  <div class="overflow-x-auto">
+    <table>
+      <thead><tr><th>Run group</th><th>Source strategy</th><th>Status</th><th>Trades</th><th>ROI</th><th>Started</th><th></th></tr></thead>
+      <tbody>
+      {% for group in paper_trading_groups %}
+        <tr>
+          <td class="min-w-[240px]">{{ group.name }}</td>
+          <td>{{ group.get('paper_trading', {}).get('source_strategy_name', '-') }}</td>
+          <td><span class="badge">{{ group.get('paper_trading', {}).get('status', 'active') }}</span></td>
+          <td>{{ group.summary.profitable_strategies }}/{{ group.strategy_count }} strategies, {{ group.event_count }} contract(s)</td>
+          <td class="{{ 'profit' if group.summary.best_roi >= 0 else 'loss' }}">{{ '%+.2f%%'|format(group.summary.best_roi) }}</td>
+          <td>{{ group.get('paper_trading', {}).get('started_at', group.created_at) }}</td>
+          <td><a class="secondary" href="/groups/{{ group.id }}">Open group</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="empty">No paper trading runs yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+<section class="panel mt-6" id="smart-family-report" data-report-url="/api/account/smart-family-report">
+  <div class="section-title">
+    <div>
+      <p class="eyebrow">Smart families</p>
+      <h2>All-analysis family report</h2>
+      <p class="muted">Aggregated from every smart live-monitor analysis saved in this profile.</p>
+    </div>
+    <div class="flex flex-wrap gap-3">
+      <button class="secondary" type="button" id="smart-family-report-refresh">Refresh report</button>
+      <button class="secondary" type="button" data-copy-text-target="smart-family-report-copy">Copy report</button>
+    </div>
+  </div>
+  <div class="grid gap-4 sm:grid-cols-3">
+    <div class="metric-card"><p>Smart analyses</p><strong data-smart-report-metric="analysis_count">{{ smart_family_report.analysis_count }}</strong></div>
+    <div class="metric-card"><p>Smart strategies</p><strong data-smart-report-metric="strategy_count">{{ smart_family_report.strategy_count }}</strong></div>
+    <div class="metric-card"><p>Families ranked</p><strong data-smart-report-metric="family_count">{{ smart_family_report.family_count }}</strong></div>
+  </div>
+  <p id="smart-family-report-status" class="muted mt-3">Last loaded from saved analyses.</p>
+  <textarea id="smart-family-report-copy" class="copy-source mt-4" readonly>{{ smart_family_report.copy_text }}</textarea>
+  <div class="mt-5 overflow-x-auto">
+    <table>
+      <thead><tr><th>Rank</th><th>Family</th><th>Avg ROI</th><th>Profitable</th><th>Best</th><th>Worst</th><th>Tested / final</th><th>Trades</th><th>Net profit</th><th>Avg win rate</th></tr></thead>
+      <tbody id="smart-family-report-rows">
+      {% for row in smart_family_report.rows %}
+        <tr>
+          <td>{{ row.rank }}</td>
+          <td class="min-w-[230px]"><p>{{ row.family_label }}</p><p class="muted">{{ row.family }} - {{ row.analysis_count }} analysis run(s)</p></td>
+          <td class="{{ 'profit' if row.tested and row.average_roi >= 0 else 'loss' if row.tested else '' }}">{{ '%+.2f%%'|format(row.average_roi) if row.tested else 'Not tested' }}</td>
+          <td>{{ '%.1f%%'|format(row.profitable_percent) if row.tested else '-' }}</td>
+          <td class="{{ 'profit' if row.tested and row.best_roi >= 0 else 'loss' if row.tested else '' }}">{{ '%+.2f%%'|format(row.best_roi) if row.tested else '-' }}</td>
+          <td class="{{ 'profit' if row.tested and row.worst_roi >= 0 else 'loss' if row.tested else '' }}">{{ '%+.2f%%'|format(row.worst_roi) if row.tested else '-' }}</td>
+          <td>{{ row.strategy_count }} / {{ row.final_strategy_count }}</td>
+          <td>{{ row.total_trades }}</td>
+          <td class="{{ 'profit' if row.tested and row.total_net_profit >= 0 else 'loss' if row.tested else '' }}">{{ '%+.2f'|format(row.total_net_profit) if row.tested else '-' }}</td>
+          <td>{{ '%.1f%%'|format(row.average_win_rate) if row.tested else '-' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="10" class="empty">No smart live-monitor analysis has been generated yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 {% if local_data_tools %}
 <section class="panel max-w-3xl mt-6 border-red-400/40">
   <div class="section-title"><div><p class="eyebrow">Maintenance</p><h2>Project cache</h2><p class="muted">Deletes generated groups, strategies, trades, fixed-market cache, live-monitor saved contracts, jobs and local API cache. Account profiles stay untouched.</p></div></div>

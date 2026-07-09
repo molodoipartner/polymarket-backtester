@@ -1300,7 +1300,7 @@ async def test_crypto_stale_watchdog_reconnects_silent_feed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_crypto_stale_watchdog_resubscribes_and_reconnects_at_20s(monkeypatch):
+async def test_crypto_stale_watchdog_resubscribes_and_reconnects_at_10s(monkeypatch):
     updates = []
 
     async def on_update(kind, detail):
@@ -1321,7 +1321,7 @@ async def test_crypto_stale_watchdog_resubscribes_and_reconnects_at_20s(monkeypa
     feed = PolymarketCryptoPriceFeed("eth/usd", state, on_update)
     feed._connected_at = 100.0
     feed._last_price_at = 100.0
-    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 120.0)
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 110.0)
     ws = WebSocket()
 
     with pytest.raises(live_monitor.TransientWebSocketDisconnect):
@@ -1330,7 +1330,7 @@ async def test_crypto_stale_watchdog_resubscribes_and_reconnects_at_20s(monkeypa
     assert ws.closed is True
     assert len(ws.sent) == 1
     assert state.crypto_status == "reconnecting"
-    assert state.last_error == "Crypto price feed stale for 20.0s"
+    assert state.last_error == "Crypto price feed stale for 10.0s"
     assert ("status", {"source": "crypto"}) in updates
 
 
@@ -2914,6 +2914,33 @@ async def test_saved_records_are_grouped_by_crypto_category(tmp_path):
 
     assert manager.delete_saved_category("user-1", "btc") == 1
     assert [record["id"] for record in manager.list_saved("user-1")] == ["eth-record"]
+
+
+def test_saved_records_can_be_loaded_by_ids_in_requested_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIVE_MONITOR_SAVED_READ_WORKERS", "4")
+    manager = LiveMonitorManager(tmp_path)
+    saved_dir = tmp_path / "users" / "user-1" / "saved_contracts"
+    saved_dir.mkdir(parents=True)
+    for index in range(6):
+        record = {
+            "id": f"record-{index}",
+            "question": f"Contract {index}",
+            "crypto_symbol": "btc/usd",
+            "saved_at": f"2026-01-01T00:00:0{index}Z",
+            "history": [{"t": index, "crypto_price": 100 + index}],
+        }
+        (saved_dir / f"20260101-00000{index}Z__btc-updown__record-{index}.json").write_text(
+            json.dumps(record),
+            encoding="utf-8",
+        )
+
+    records = manager.list_saved_by_ids(
+        "user-1",
+        ["record-4", "missing", "record-1", "record-4", "record-5"],
+    )
+
+    assert [record["id"] for record in records] == ["record-4", "record-1", "record-5"]
+    assert all(record["category"]["id"] == "btc" for record in records)
 
 
 def test_saved_records_are_paginated_newest_first_without_history(tmp_path):

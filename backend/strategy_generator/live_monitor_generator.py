@@ -62,7 +62,8 @@ def _live_strategy_workload_units(events: list[dict], strategy_count: int) -> in
 
 
 def _live_strategy_worker_count(strategy_count: int, workload_units: int) -> int:
-    if strategy_count <= 1 or workload_units < 20_000:
+    threshold = _live_strategy_parallel_threshold()
+    if strategy_count <= 1 or workload_units < threshold:
         return 1
     configured = os.getenv("STRATEGY_BACKTEST_WORKERS", "").strip()
     if configured:
@@ -76,16 +77,29 @@ def _live_strategy_worker_count(strategy_count: int, workload_units: int) -> int
     return min(strategy_count, max(1, os.cpu_count() or 1))
 
 
+def _live_strategy_parallel_threshold() -> int:
+    configured = os.getenv("STRATEGY_BACKTEST_PARALLEL_THRESHOLD", "").strip()
+    if configured:
+        try:
+            return max(0, int(configured))
+        except ValueError:
+            return 20_000
+    return 8_000
+
+
 def _init_live_strategy_worker(events: list[dict], starting_balance: float) -> None:
     global _LIVE_WORKER_EVENTS, _LIVE_WORKER_STARTING_BALANCE
     _LIVE_WORKER_EVENTS = events
     _LIVE_WORKER_STARTING_BALANCE = starting_balance
 
 
-def _run_live_strategy_worker(task: tuple[int, dict]) -> tuple[int, dict, dict]:
-    index, specification = task
+def _run_live_strategy_worker(task: tuple[int, dict, bool]) -> tuple[int, dict, dict]:
+    index, specification, metrics_only = task
     result = LiveMonitorStrategyGenerator(None, None)._run(
-        _LIVE_WORKER_EVENTS, specification, _LIVE_WORKER_STARTING_BALANCE
+        _LIVE_WORKER_EVENTS,
+        specification,
+        _LIVE_WORKER_STARTING_BALANCE,
+        metrics_only=metrics_only,
     )
     return index, specification, result
 
@@ -176,6 +190,7 @@ class LiveMonitorStrategyGenerator:
         progress: Callable[[dict], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
         phase_contract_counts: tuple[int, int, int] | None = None,
+        strategy_families: list[str] | tuple[str, ...] | None = None,
     ) -> dict:
         name = group_name.strip()
         if not 1 <= len(name) <= 80:
@@ -209,7 +224,12 @@ class LiveMonitorStrategyGenerator:
 
         group_id = uuid.uuid4().hex
         created_at = datetime.now(timezone.utc).isoformat()
-        specifications = self.specifications(strategy_count, mode)
+        selected_families = self._validate_strategy_families(mode, strategy_families)
+        specifications = (
+            self.specifications(strategy_count, mode, selected_families)
+            if selected_families is not None
+            else self.specifications(strategy_count, mode)
+        )
         phase_plan = self._phase_plan(events, phase_contract_counts)
         if phase_plan:
             results, phase_report, used_events = self._run_phased_strategy_backtests(
@@ -318,6 +338,7 @@ class LiveMonitorStrategyGenerator:
             "starting_balance": round(starting_balance, 4),
             "strategy_count": len(strategies),
             "strategy_mode": mode,
+            "strategy_families": selected_families or self.available_families(mode),
             "event_count": len(used_events),
             "contracts_total": summary["selected_contracts"],
             "contracts_missing": summary["unsuitable_contracts"],
@@ -351,6 +372,7 @@ class LiveMonitorStrategyGenerator:
             "timeframe": timeframe,
             "include_partial": include_partial,
             "strategy_mode": mode,
+            "strategy_families": selected_families or self.available_families(mode),
             "validation_mode": group.get("validation_mode", "single_pass"),
         })
         return group
@@ -428,6 +450,7 @@ class LiveMonitorStrategyGenerator:
                 None,
                 cancel_check,
                 [index for index, _ in candidates],
+                True,
             )
             profitable = []
             for index, specification, result in phase_results:
@@ -693,6 +716,7 @@ class LiveMonitorStrategyGenerator:
         progress: Callable[[dict], None] | None,
         cancel_check: Callable[[], None] | None,
         specification_indexes: list[int] | None = None,
+        metrics_only: bool = False,
     ) -> list[tuple[int, dict, dict]]:
         total = len(specifications)
         indexes = specification_indexes or list(range(1, total + 1))
@@ -706,7 +730,12 @@ class LiveMonitorStrategyGenerator:
             ):
                 if cancel_check:
                     cancel_check()
-                result = self._run(events, specification, starting_balance)
+                result = self._run(
+                    events,
+                    specification,
+                    starting_balance,
+                    metrics_only=metrics_only,
+                )
                 results.append((index, specification, result))
                 if progress:
                     progress({
@@ -730,7 +759,10 @@ class LiveMonitorStrategyGenerator:
         )
         try:
             futures = [
-                executor.submit(_run_live_strategy_worker, (index, specification))
+                executor.submit(
+                    _run_live_strategy_worker,
+                    (index, specification, metrics_only),
+                )
                 for index, specification in zip(indexes, specifications)
             ]
             for future in as_completed(futures):
@@ -908,6 +940,9 @@ class LiveMonitorStrategyGenerator:
         include_partial: bool,
         record_ids: list[str],
     ) -> list[dict]:
+        if hasattr(self.live_monitor, "list_saved_by_ids"):
+            records = self.live_monitor.list_saved_by_ids(user_id, record_ids)
+            return self._events_from_records(records, asset, timeframe, include_partial)
         records = []
         seen = set()
         for record_id in record_ids:
@@ -1112,9 +1147,17 @@ class LiveMonitorStrategyGenerator:
             "slug": record.get("slug"),
         }
 
-    def _run(self, events: list[dict], strategy: dict, initial_capital: float) -> dict:
+    def _run(
+        self,
+        events: list[dict],
+        strategy: dict,
+        initial_capital: float,
+        metrics_only: bool = False,
+    ) -> dict:
         available_cash = initial_capital
-        equity_curve = [{"t": events[0]["start_time"], "value": round(initial_capital, 4)}]
+        equity_curve = [] if metrics_only else [
+            {"t": events[0]["start_time"], "value": round(initial_capital, 4)}
+        ]
         transactions = []
         allocation_pct = float(strategy["allocation_pct"])
         fee_rate = float(strategy["fee_bps"]) / 10_000
@@ -1123,32 +1166,42 @@ class LiveMonitorStrategyGenerator:
         for event in events:
             if strategy["family"] in SMART_LIVE_FAMILY_LABELS:
                 smart_trades, available_after_smart = self._smart_trades(
-                    event, strategy, available_cash, allocation_pct, fee_rate, prior_outcomes
+                    event,
+                    strategy,
+                    available_cash,
+                    allocation_pct,
+                    fee_rate,
+                    prior_outcomes,
+                    metrics_only=metrics_only,
                 )
                 prior_outcomes.append(event["resolved_outcome"])
                 if not smart_trades:
-                    equity_curve.append({
-                        "t": event["expiration_time"],
-                        "value": round(available_cash, 4),
-                    })
+                    if not metrics_only:
+                        equity_curve.append({
+                            "t": event["expiration_time"],
+                            "value": round(available_cash, 4),
+                        })
                     continue
                 available_cash = available_after_smart
                 transactions.extend(smart_trades)
-                equity_curve.append({
-                    "t": smart_trades[-1]["closed_at"],
-                    "value": round(available_cash, 4),
-                })
+                if not metrics_only:
+                    equity_curve.append({
+                        "t": smart_trades[-1]["closed_at"],
+                        "value": round(available_cash, 4),
+                    })
                 continue
 
             signal = self._signal(event, strategy)
             prior_outcomes.append(event["resolved_outcome"])
             if not signal or available_cash <= 0:
-                equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
+                if not metrics_only:
+                    equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
                 continue
             side, row = signal
             ask_price = self._entry_ask(row, side)
             if ask_price is None:
-                equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
+                if not metrics_only:
+                    equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
                 continue
             budget = min(available_cash, available_cash * allocation_pct)
             if budget < MIN_POSITION_BUDGET:
@@ -1162,44 +1215,67 @@ class LiveMonitorStrategyGenerator:
             pnl = settlement_value - margin_locked - entry_fee
             cash_before = available_cash + margin_locked + entry_fee
             available_cash += settlement_value
-            transaction = {
-                "event_id": event["id"],
-                "market_id": event["market_id"],
-                "market_question": event["question"],
-                "asset": event["asset"],
-                "timeframe": event["timeframe"],
-                "side": side.upper(),
-                "resolved_outcome": event["resolved_outcome"].upper(),
-                "opened_at": datetime.fromtimestamp(float(row["t"]), timezone.utc).isoformat(),
-                "closed_at": event["expiration_time"],
-                "expiration_time": event["expiration_time"],
-                "entry_price": round(ask_price, 8),
-                "ask_price": round(ask_price, 8),
-                "allocation_pct_used": round(allocation_pct, 8),
-                "analysis_history_count": len(event["history"]),
-                "contracts_volume": round(contracts_volume, 8),
-                "quantity": round(contracts_volume, 8),
-                "margin_locked": round(margin_locked, 8),
-                "entry_fee": round(entry_fee, 8),
-                "fee_bps": float(strategy["fee_bps"]),
-                "available_cash_before_entry": round(cash_before, 4),
-                "available_cash_after_entry": round(cash_before - budget, 4),
-                "available_cash_after_close": round(available_cash, 4),
-                "balance_before": round(cash_before, 4),
-                "balance_after": round(available_cash, 4),
-                "holding_seconds": round(event["end_ts"] - float(row["t"]), 3),
-                "exit_price": settlement_price,
-                "exit_type": "settlement",
-                "settlement_value": round(settlement_value, 8),
-                "pnl": round(pnl, 8),
-                "quote_source": "live_monitor_saved_history",
-                "saved_record_id": event.get("saved_record_id"),
-                "partial_contract": event.get("partial_contract", False),
-            }
+            if metrics_only:
+                transaction = {
+                    "event_id": event["id"],
+                    "side": side.upper(),
+                    "pnl": pnl,
+                    "margin_locked": margin_locked,
+                    "entry_fee": entry_fee,
+                    "allocation_pct_used": allocation_pct,
+                }
+            else:
+                transaction = {
+                    "event_id": event["id"],
+                    "market_id": event["market_id"],
+                    "market_question": event["question"],
+                    "asset": event["asset"],
+                    "timeframe": event["timeframe"],
+                    "side": side.upper(),
+                    "resolved_outcome": event["resolved_outcome"].upper(),
+                    "opened_at": datetime.fromtimestamp(float(row["t"]), timezone.utc).isoformat(),
+                    "closed_at": event["expiration_time"],
+                    "expiration_time": event["expiration_time"],
+                    "entry_price": round(ask_price, 8),
+                    "ask_price": round(ask_price, 8),
+                    "allocation_pct_used": round(allocation_pct, 8),
+                    "analysis_history_count": len(event["history"]),
+                    "contracts_volume": round(contracts_volume, 8),
+                    "quantity": round(contracts_volume, 8),
+                    "margin_locked": round(margin_locked, 8),
+                    "entry_fee": round(entry_fee, 8),
+                    "fee_bps": float(strategy["fee_bps"]),
+                    "available_cash_before_entry": round(cash_before, 4),
+                    "available_cash_after_entry": round(cash_before - budget, 4),
+                    "available_cash_after_close": round(available_cash, 4),
+                    "balance_before": round(cash_before, 4),
+                    "balance_after": round(available_cash, 4),
+                    "holding_seconds": round(event["end_ts"] - float(row["t"]), 3),
+                    "exit_price": settlement_price,
+                    "exit_type": "settlement",
+                    "settlement_value": round(settlement_value, 8),
+                    "pnl": round(pnl, 8),
+                    "quote_source": "live_monitor_saved_history",
+                    "saved_record_id": event.get("saved_record_id"),
+                    "partial_contract": event.get("partial_contract", False),
+                }
             transactions.append(transaction)
-            equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
+            if not metrics_only:
+                equity_curve.append({"t": event["expiration_time"], "value": round(available_cash, 4)})
 
         profits = [trade["pnl"] for trade in transactions]
+        if metrics_only:
+            return {
+                "initial_capital": round(initial_capital, 4),
+                "final_capital": round(available_cash, 4),
+                "net_profit": round(available_cash - initial_capital, 4),
+                "roi": round((available_cash / initial_capital - 1) * 100, 6),
+                "trade_count": len(transactions),
+                "event_count": len(events),
+                "contracts_used": len({trade["event_id"] for trade in transactions}),
+                "transactions": [],
+                "equity_curve": [],
+            }
         returns = [
             trade["pnl"] / max(trade["margin_locked"] + trade["entry_fee"], 1e-9)
             for trade in transactions
@@ -1250,6 +1326,7 @@ class LiveMonitorStrategyGenerator:
         allocation_pct: float,
         fee_rate: float,
         prior_outcomes: list[str],
+        metrics_only: bool = False,
     ) -> tuple[list[dict], float]:
         if available_cash <= 0:
             return [], available_cash
@@ -1282,7 +1359,9 @@ class LiveMonitorStrategyGenerator:
         average_entry_price = None
 
         for index, row in enumerate(rows):
-            current_ts = float(row["t"])
+            current_ts = self._cached_float(row, "t")
+            if current_ts is None:
+                continue
             if current_ts < min_entry_ts or current_ts > latest_entry_ts:
                 continue
             if len(entries) >= max_entries:
@@ -1366,6 +1445,16 @@ class LiveMonitorStrategyGenerator:
         transactions = []
         for entry, settlement_value in zip(entries, settlement_values):
             pnl = settlement_value - entry["margin_locked"] - entry["entry_fee"]
+            if metrics_only:
+                transactions.append({
+                    "event_id": event["id"],
+                    "side": entry["side"].upper(),
+                    "pnl": pnl,
+                    "margin_locked": entry["margin_locked"],
+                    "entry_fee": entry["entry_fee"],
+                    "allocation_pct_used": entry["budget"] / max(available_cash, 1e-9),
+                })
+                continue
             holding_seconds = (
                 (float(exit_row["t"]) if exit_row else event["end_ts"])
                 - float(entry["row"]["t"])
@@ -1558,7 +1647,9 @@ class LiveMonitorStrategyGenerator:
         )
         best_bid_cents = entry_price * 100
         for index, row in enumerate(rows):
-            current_ts = float(row["t"])
+            current_ts = self._cached_float(row, "t")
+            if current_ts is None:
+                continue
             if current_ts <= entry_ts or current_ts < min_exit_ts:
                 continue
             bid_price = self._side_bid(row, side)
@@ -1644,7 +1735,7 @@ class LiveMonitorStrategyGenerator:
     @staticmethod
     def _entry_ask(row: dict, side: str) -> float | None:
         key = "yes_ask" if side == "up" else "no_ask"
-        value = LiveMonitorStrategyGenerator._float_or_none(row.get(key))
+        value = LiveMonitorStrategyGenerator._cached_float(row, key)
         if value is None:
             return None
         price = value / 100
@@ -1653,11 +1744,11 @@ class LiveMonitorStrategyGenerator:
     @staticmethod
     def _side_ask(row: dict, side: str) -> float | None:
         if side == "up":
-            value = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_ask"))
+            value = LiveMonitorStrategyGenerator._cached_float(row, "yes_ask")
         else:
-            value = LiveMonitorStrategyGenerator._float_or_none(row.get("no_ask"))
+            value = LiveMonitorStrategyGenerator._cached_float(row, "no_ask")
             if value is None:
-                yes_bid = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_bid"))
+                yes_bid = LiveMonitorStrategyGenerator._cached_float(row, "yes_bid")
                 value = 100 - yes_bid if yes_bid is not None else None
         if value is None:
             return None
@@ -1667,11 +1758,11 @@ class LiveMonitorStrategyGenerator:
     @staticmethod
     def _side_bid(row: dict, side: str) -> float | None:
         if side == "up":
-            value = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_bid"))
+            value = LiveMonitorStrategyGenerator._cached_float(row, "yes_bid")
         else:
-            value = LiveMonitorStrategyGenerator._float_or_none(row.get("no_bid"))
+            value = LiveMonitorStrategyGenerator._cached_float(row, "no_bid")
             if value is None:
-                yes_ask = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_ask"))
+                yes_ask = LiveMonitorStrategyGenerator._cached_float(row, "yes_ask")
                 value = 100 - yes_ask if yes_ask is not None else None
         if value is None:
             return None
@@ -1708,15 +1799,17 @@ class LiveMonitorStrategyGenerator:
         strategy: dict,
         prior_outcomes: list[str],
     ) -> float | None:
-        target = self._float_or_none(row.get("target_price"))
-        crypto = self._float_or_none(row.get("crypto_price"))
+        target = self._cached_float(row, "target_price")
+        crypto = self._cached_float(row, "crypto_price")
         if target is None or crypto is None or target <= 0:
             return None
         distance_pct = (crypto - target) / target * 100
         momentum_pct = self._crypto_momentum_pct_at(
             rows, row_index, float(strategy["momentum_lookback_seconds"])
         ) or 0.0
-        current_ts = float(row["t"])
+        current_ts = self._cached_float(row, "t")
+        if current_ts is None:
+            return None
         elapsed_ratio = max(
             0.0,
             min(1.0, (current_ts - event["start_ts"]) / max(event["end_ts"] - event["start_ts"], 1)),
@@ -1763,11 +1856,11 @@ class LiveMonitorStrategyGenerator:
 
     @staticmethod
     def _yes_mid(row: dict) -> float | None:
-        value = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_mid"))
+        value = LiveMonitorStrategyGenerator._cached_float(row, "yes_mid")
         if value is not None:
             return value if 0 <= value <= 100 else None
-        bid = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_bid"))
-        ask = LiveMonitorStrategyGenerator._float_or_none(row.get("yes_ask"))
+        bid = LiveMonitorStrategyGenerator._cached_float(row, "yes_bid")
+        ask = LiveMonitorStrategyGenerator._cached_float(row, "yes_ask")
         if bid is None or ask is None:
             return None
         return (bid + ask) / 2 if 0 <= bid <= ask <= 100 else None
@@ -1787,35 +1880,56 @@ class LiveMonitorStrategyGenerator:
         if current_index < 1 or current_index >= len(rows):
             return None
         current = rows[current_index]
-        current_ts = LiveMonitorStrategyGenerator._float_or_none(current.get("t"))
-        current_price = LiveMonitorStrategyGenerator._float_or_none(current.get("crypto_price"))
+        lookback_key = round(max(float(lookback_seconds), 0.0), 6)
+        momentum_cache = current.setdefault("_live_momentum_cache", {})
+        if lookback_key in momentum_cache:
+            return momentum_cache[lookback_key]
+        current_ts = LiveMonitorStrategyGenerator._cached_float(current, "t")
+        current_price = LiveMonitorStrategyGenerator._cached_float(current, "crypto_price")
         if current_ts is None or current_price is None or current_price <= 0:
+            momentum_cache[lookback_key] = None
             return None
-        target_ts = current_ts - max(lookback_seconds, 0)
+        target_ts = current_ts - lookback_key
         previous = None
         for index in range(current_index - 1, -1, -1):
             row = rows[index]
-            row_ts = LiveMonitorStrategyGenerator._float_or_none(row.get("t"))
-            row_price = LiveMonitorStrategyGenerator._float_or_none(row.get("crypto_price"))
+            row_ts = LiveMonitorStrategyGenerator._cached_float(row, "t")
+            row_price = LiveMonitorStrategyGenerator._cached_float(row, "crypto_price")
             if row_ts is None or row_price is None or row_price <= 0:
                 continue
             previous = row
             if row_ts <= target_ts:
                 break
         if previous is None:
+            momentum_cache[lookback_key] = None
             return None
-        previous_price = LiveMonitorStrategyGenerator._float_or_none(previous.get("crypto_price"))
+        previous_price = LiveMonitorStrategyGenerator._cached_float(previous, "crypto_price")
         if previous_price is None or previous_price <= 0:
+            momentum_cache[lookback_key] = None
             return None
-        return (current_price - previous_price) / previous_price * 100
+        result = (current_price - previous_price) / previous_price * 100
+        momentum_cache[lookback_key] = result
+        return result
 
     @staticmethod
     def _target_deviation_pct(row: dict) -> float | None:
-        target = LiveMonitorStrategyGenerator._float_or_none(row.get("target_price"))
-        crypto = LiveMonitorStrategyGenerator._float_or_none(row.get("crypto_price"))
+        if "_live_target_deviation_pct" in row:
+            return row["_live_target_deviation_pct"]
+        target = LiveMonitorStrategyGenerator._cached_float(row, "target_price")
+        crypto = LiveMonitorStrategyGenerator._cached_float(row, "crypto_price")
         if target is None or crypto is None or target <= 0:
+            row["_live_target_deviation_pct"] = None
             return None
-        return (crypto - target) / target * 100
+        result = (crypto - target) / target * 100
+        row["_live_target_deviation_pct"] = result
+        return result
+
+    @staticmethod
+    def _cached_float(row: dict, key: str) -> float | None:
+        cache = row.setdefault("_live_float_cache", {})
+        if key not in cache:
+            cache[key] = LiveMonitorStrategyGenerator._float_or_none(row.get(key))
+        return cache[key]
 
     @staticmethod
     def _prior_outcome_bias(outcomes: list[str], window: int) -> float:
@@ -1827,11 +1941,19 @@ class LiveMonitorStrategyGenerator:
         return (recent.count("up") - recent.count("down")) / len(recent)
 
     @staticmethod
-    def specifications(count: int, strategy_mode: str = "lightweight") -> list[dict]:
+    def specifications(
+        count: int,
+        strategy_mode: str = "lightweight",
+        strategy_families: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
         mode = LiveMonitorStrategyGenerator._validate_strategy_mode(strategy_mode)
+        families = LiveMonitorStrategyGenerator._validate_strategy_families(
+            mode,
+            strategy_families,
+        )
         if mode == "smart":
-            return LiveMonitorStrategyGenerator._smart_specifications(count)
-        families = tuple(LIVE_FAMILY_LABELS)
+            return LiveMonitorStrategyGenerator._smart_specifications(count, families)
+        families = tuple(families or LIVE_FAMILY_LABELS)
         entry_seconds = (10, 20, 30, 45, 60, 90, 120, 180)
         quote_edges = (2, 4, 6, 8, 10, 12)
         deviation_thresholds = (0.01, 0.02, 0.03, 0.05, 0.08, 0.12)
@@ -1880,8 +2002,11 @@ class LiveMonitorStrategyGenerator:
         return ordered[:count]
 
     @staticmethod
-    def _smart_specifications(count: int) -> list[dict]:
-        families = ACTIVE_SMART_LIVE_FAMILIES
+    def _smart_specifications(
+        count: int,
+        strategy_families: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        families = tuple(strategy_families or ACTIVE_SMART_LIVE_FAMILIES)
         if count > LiveMonitorStrategyGenerator.MAX_STRATEGIES:
             raise ValueError("Requested more unique smart strategies than the generator supports")
 
@@ -2202,6 +2327,35 @@ class LiveMonitorStrategyGenerator:
         if mode not in {"lightweight", "smart"}:
             raise ValueError("Strategy intelligence must be lightweight or smart")
         return mode
+
+    @staticmethod
+    def available_families(strategy_mode: str = "lightweight") -> tuple[str, ...]:
+        mode = LiveMonitorStrategyGenerator._validate_strategy_mode(strategy_mode)
+        if mode == "smart":
+            return ACTIVE_SMART_LIVE_FAMILIES
+        return tuple(LIVE_FAMILY_LABELS)
+
+    @staticmethod
+    def _validate_strategy_families(
+        strategy_mode: str,
+        strategy_families: list[str] | tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if strategy_families is None:
+            return None
+        available = LiveMonitorStrategyGenerator.available_families(strategy_mode)
+        selected = []
+        seen = set()
+        for value in strategy_families:
+            family = str(value or "").strip()
+            if not family or family in seen:
+                continue
+            if family not in available:
+                raise ValueError(f"Unsupported live-monitor strategy family: {family}")
+            selected.append(family)
+            seen.add(family)
+        if not selected:
+            raise ValueError("Select at least one strategy family")
+        return tuple(selected)
 
     @staticmethod
     def _float_or_none(value) -> float | None:

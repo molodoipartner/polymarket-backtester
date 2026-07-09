@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Paper trading - {{ strategy.name }} - {{ app_name }}{% endblock %}
+{% block content %}
+<a class="muted hover:text-neon" href="/groups/{{ group.id }}/strategies/{{ strategy.id }}">Back to {{ strategy.name }}</a>
+<div class="mb-8 mt-6 flex flex-wrap items-end justify-between gap-5">
+  <div class="max-w-3xl">
+    <p class="eyebrow">Virtual live trading</p>
+    <h1>Start using this strategy in live trading</h1>
+    <p class="mt-3 text-slate-300">Paper mode uses the same Live event monitor listener and saves virtual strategy trades into persistent run groups.</p>
+  </div>
+  <a class="secondary" href="/live-monitor">Live event monitor</a>
+</div>
+
+<section class="panel mb-6">
+  <div class="section-title">
+    <div>
+      <p class="eyebrow">{{ strategy.family_label }}</p>
+      <h2>{{ strategy.name }}</h2>
+      <p class="muted">{{ strategy.description }}</p>
+    </div>
+    <span class="badge">Paper only</span>
+  </div>
+  <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    {% for key,value in strategy.parameters.items() %}
+    <div class="metric-card"><p>{{ key|replace('_',' ')|title }}</p><strong>{{ value }}</strong></div>
+    {% endfor %}
+  </div>
+</section>
+
+<section
+  class="panel live-monitor"
+  id="live-monitor"
+  data-start-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/monitors"
+  data-active-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/active"
+  data-saved-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts"
+  data-saved-detail-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts/{id}"
+  data-delete-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts/{id}"
+  data-saved-mode="paper"
+>
+  <form id="live-monitor-form" class="live-monitor-form">
+    <label>
+      Polymarket event URL
+      <input name="event_url" type="url" required placeholder="https://polymarket.com/event/bitcoin-up-or-down-..." autocomplete="off">
+    </label>
+    <label>
+      Starting balance
+      <input name="starting_balance" type="number" min="1" step="0.01" value="{{ '%.2f'|format(group.starting_balance) }}" required>
+    </label>
+    <div class="live-monitor-actions">
+      <button class="primary paper-start-button" type="submit">Start trading</button>
+    </div>
+  </form>
+  <p class="muted mt-3" id="live-monitor-start-status">Monitoring and automatic trading can be paused with Stop on the live session card.</p>
+</section>
+
+<div class="live-monitor-sessions" id="live-monitor-sessions"></div>
+
+<section class="panel mt-6 live-saved" id="live-monitor-saved">
+  <div class="section-title">
+    <div>
+      <p class="eyebrow">Virtual trades</p>
+      <h2 class="text-xl">Contracts with paper trades</h2>
+      <p class="muted">Refresh shows trades recorded by the live listener for the current paper run.</p>
+    </div>
+    <div class="live-saved-toolbar">
+      <select id="live-saved-category" class="hidden"><option value="all">All contracts</option></select>
+      <button class="secondary" id="live-saved-refresh" type="button">Refresh</button>
+    </div>
+  </div>
+  <button class="danger hidden" id="live-saved-delete-category" type="button">Delete category</button>
+  <div class="live-saved-loading hidden" id="live-saved-loading" role="status" aria-live="polite">
+    <span class="live-saved-spinner" aria-hidden="true"></span>
+    <span id="live-saved-loading-text">Loading paper trades...</span>
+  </div>
+  <div class="live-saved-detail hidden" id="live-saved-detail">
+    <div class="section-title">
+      <div>
+        <p class="eyebrow" id="live-saved-detail-category">Paper-traded contract</p>
+        <h2 class="text-xl" id="live-saved-detail-title">Select a contract</h2>
+        <p class="muted" id="live-saved-detail-meta">Open a row to inspect virtual executions on the saved contract chart.</p>
+        <p class="live-saved-warning hidden" id="live-saved-partial-warning"></p>
+        <div class="live-saved-gaps hidden" id="live-saved-gap-list"></div>
+      </div>
+      <button class="secondary" id="live-saved-detail-close" type="button">Close</button>
+    </div>
+    <div class="live-saved-metrics">
+      <div class="metric-card"><p>Target</p><strong id="live-saved-target">-</strong></div>
+      <div class="metric-card"><p>Final crypto</p><strong id="live-saved-final">-</strong></div>
+      <div class="metric-card"><p>Outcome</p><strong id="live-saved-outcome">-</strong></div>
+      <div class="metric-card"><p>History rows</p><strong id="live-saved-history-count">-</strong></div>
+      <div class="metric-card"><p>Coverage</p><strong id="live-saved-coverage">-</strong></div>
+      <div class="metric-card"><p>Average spread</p><strong id="live-saved-average-spread">-</strong></div>
+      <div class="metric-card"><p>Paper PnL</p><strong id="live-saved-final-deviation">-</strong></div>
+      <div class="metric-card"><p>Trades</p><strong id="live-saved-yes-range">-</strong></div>
+      <div class="metric-card"><p>Disconnects</p><strong id="live-saved-disconnect-count">-</strong></div>
+      <div class="metric-card"><p>Disconnected</p><strong id="live-saved-disconnected-seconds">-</strong></div>
+      <div class="metric-card"><p>Crypto disconnects</p><strong id="live-saved-crypto-disconnect-count">-</strong></div>
+      <div class="metric-card"><p>Crypto disconnected</p><strong id="live-saved-crypto-disconnected-seconds">-</strong></div>
+    </div>
+    <div class="live-chart-wrap live-saved-chart-wrap">
+      <canvas id="live-saved-chart" height="120"></canvas>
+    </div>
+    <div class="mt-4 overflow-x-auto">
+      <table>
+        <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Volume</th><th>PnL</th><th>Opened</th><th>Closed</th><th></th></tr></thead>
+        <tbody id="paper-trade-rows"><tr><td colspan="8" class="empty">No paper trades loaded.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="live-saved-table">
+      <thead>
+        <tr>
+          <th>Category</th>
+          <th>Question</th>
+          <th>Window</th>
+          <th>Target</th>
+          <th>Final</th>
+          <th>Result</th>
+          <th>Trades</th>
+          <th>Saved</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="live-saved-rows">
+        <tr><td colspan="9" class="empty">No paper-traded contracts yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="live-saved-pagination">
+    <button class="secondary" id="live-saved-prev" type="button">Previous</button>
+    <span class="muted" id="live-saved-page-summary">Page 1</span>
+    <button class="secondary" id="live-saved-next" type="button">Next</button>
+  </div>
+</section>
+{% endblock %}

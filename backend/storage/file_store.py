@@ -25,7 +25,14 @@ def utc_iso() -> str:
 class FileStore:
     """Process-safe JSON/JSONL repository for application data."""
 
-    COLLECTIONS = ("groups", "strategies", "transactions", "logs")
+    COLLECTIONS = (
+        "groups",
+        "strategies",
+        "transactions",
+        "logs",
+        "family_reports",
+        "paper_trades",
+    )
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root or ROOT_DIR / "server_data").resolve()
@@ -499,6 +506,35 @@ class FileStore:
             self._write_jsonl(self._user_dir(user_id) / f"{collection}.jsonl", records)
             return updated
 
+    def delete_user_record(self, user_id: str, collection: str, record_id: str) -> bool:
+        self._validate_collection(collection)
+        self._safe_id(record_id)
+        path = self._user_dir(user_id) / f"{collection}.jsonl"
+        removed = False
+
+        def keep(record: dict) -> bool:
+            nonlocal removed
+            match = record.get("id") == record_id
+            removed = removed or match
+            return not match
+
+        with self._guard():
+            self._filter_jsonl(path, keep)
+        return removed
+
+    def delete_user_records_filtered(
+        self, user_id: str, collection: str, filters: dict[str, Any]
+    ) -> int:
+        self._validate_collection(collection)
+        path = self._user_dir(user_id) / f"{collection}.jsonl"
+
+        def matches(item: dict) -> bool:
+            return all(item.get(key) == value for key, value in filters.items())
+
+        with self._guard():
+            _kept, removed = self._filter_jsonl(path, lambda item: not matches(item))
+        return removed
+
     def set_strategy_favorite(
         self, user_id: str, strategy_id: str, favorite: bool, comment: str | None = None
     ) -> bool:
@@ -573,10 +609,12 @@ class FileStore:
                 self._append_jsonl_many(self._user_dir(user_id) / f"{collection}.jsonl", records)
 
     def delete_group(self, user_id: str, group_id: str) -> bool:
+        self._safe_id(group_id)
         with self._guard():
             groups_path = self._user_dir(user_id) / "groups.jsonl"
             strategies_path = self._user_dir(user_id) / "strategies.jsonl"
             transactions_path = self._user_dir(user_id) / "transactions.jsonl"
+            paper_trades_path = self._user_dir(user_id) / "paper_trades.jsonl"
             group_seen = False
 
             def keep_group(group: dict) -> bool:
@@ -589,22 +627,11 @@ class FileStore:
             if not group_seen:
                 return False
 
-            removed_ids = set()
-
-            def keep_strategy(strategy: dict) -> bool:
-                remove = strategy.get("group_id") == group_id
-                if remove and strategy.get("id"):
-                    removed_ids.add(strategy["id"])
-                return not remove
-
-            self._filter_jsonl(strategies_path, keep_strategy)
-            self._filter_jsonl(
-                transactions_path,
-                lambda transaction: (
-                    transaction.get("group_id") != group_id
-                    and transaction.get("strategy_id") not in removed_ids
-                ),
+            _kept, _removed, removed_ids = self._filter_jsonl_field_value(
+                strategies_path, "group_id", group_id, collect_ids=True
             )
+            self._filter_jsonl_field_value(transactions_path, "group_id", group_id)
+            self._filter_jsonl_field_value(paper_trades_path, "group_id", group_id)
             self._remove_strategy_favorites(user_id, removed_ids)
             self.log(user_id, "strategy_group_deleted", {"group_id": group_id, "permanent": True})
             return True
@@ -613,7 +640,7 @@ class FileStore:
         with self._guard():
             if not self.get_user(user_id):
                 raise ValueError("User does not exist")
-            for collection in ("groups", "strategies", "transactions"):
+            for collection in ("groups", "strategies", "transactions", "paper_trades"):
                 self._write_jsonl(self._user_dir(user_id) / f"{collection}.jsonl", [])
             self._write_json(self._favorites_path(user_id), {})
             self.log(user_id, "strategy_groups_deleted", {"permanent": True})
@@ -1196,6 +1223,48 @@ class FileStore:
         temporary.replace(path)
         self._invalidate_jsonl_cache(path)
         return kept, removed
+
+    def _filter_jsonl_field_value(
+        self,
+        path: Path,
+        field: str,
+        value: str,
+        collect_ids: bool = False,
+    ) -> tuple[int, int, set[str]]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.touch()
+            return 0, 0, set()
+        field_token = json.dumps(field, ensure_ascii=False, separators=(",", ":"))
+        value_token = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        compact_match = f"{field_token}:{value_token}"
+        temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+        kept = removed = 0
+        removed_ids: set[str] = set()
+        with path.open("r", encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as target:
+            for line in source:
+                if not line.strip():
+                    continue
+                item = None
+                remove = compact_match in line
+                if not remove and value_token in line:
+                    item = json.loads(line)
+                    remove = item.get(field) == value
+                if remove:
+                    removed += 1
+                    if collect_ids:
+                        item = item or json.loads(line)
+                        if item.get("id"):
+                            removed_ids.add(item["id"])
+                    continue
+                target.write(line if line.endswith("\n") else line + "\n")
+                kept += 1
+        if removed:
+            temporary.replace(path)
+            self._invalidate_jsonl_cache(path)
+        else:
+            temporary.unlink(missing_ok=True)
+        return kept, removed, removed_ids
 
     @staticmethod
     def _jsonl_signature(path: Path) -> tuple[int, int] | None:

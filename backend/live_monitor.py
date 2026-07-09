@@ -9,6 +9,7 @@ import random
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -36,8 +37,8 @@ REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 8.0
 REST_QUOTE_FAILURE_COOLDOWN_SECONDS = 15.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
-CRYPTO_RESUBSCRIBE_STALE_AFTER_SECONDS = 20.0
-CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 20.0
+CRYPTO_RESUBSCRIBE_STALE_AFTER_SECONDS = 10.0
+CRYPTO_RECONNECT_STALE_AFTER_SECONDS = 10.0
 CRYPTO_HEARTBEAT_INTERVAL_SECONDS = 5.0
 CRYPTO_HEARTBEAT_TIMEOUT_SECONDS = 5.0
 CRYPTO_PROVIDER_TIMESTAMP_MAX_AGE_SECONDS = 20.0
@@ -49,6 +50,7 @@ GAMMA_TARGET_CHECK_CONCURRENCY = 8
 GAMMA_TARGET_CHECK_RECOVERY_CONCURRENCY = 2
 GAMMA_TARGET_CHECK_RECOVERY_SPACING_SECONDS = 0.4
 GAMMA_TARGET_CHECK_CACHE_TTL_SECONDS = 6 * 60 * 60
+SAVED_RECORD_READ_WORKER_LIMIT = 32
 NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
@@ -2938,6 +2940,64 @@ class LiveMonitorManager:
             ]
         return [_with_saved_category(record) for record in records]
 
+    def list_saved_by_ids(self, user_id: str, record_ids: list[str]) -> list[dict]:
+        ordered_ids = []
+        seen = set()
+        for record_id in record_ids:
+            normalized = str(record_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            ordered_ids.append(normalized)
+            seen.add(normalized)
+        if not ordered_ids:
+            return []
+
+        directory = _saved_records_dir(self.data_root, user_id)
+        path_by_id: dict[str, Path] = {}
+        for path, preview in _read_saved_record_preview_paths(
+            directory,
+            include_history_stats=False,
+        ):
+            preview_id = str(preview.get("id") or "").strip()
+            filename_id = _saved_record_id_from_filename(path)
+            if preview_id:
+                path_by_id[preview_id] = path
+            if filename_id:
+                path_by_id.setdefault(filename_id, path)
+
+        paths = []
+        for record_id in ordered_ids:
+            path = path_by_id.get(record_id)
+            if path is None:
+                path = _find_saved_record_path(self.data_root, user_id, record_id)
+            if path is not None:
+                paths.append((record_id, path))
+        if not paths:
+            return []
+
+        worker_count = _saved_record_read_worker_count(len(paths))
+        records_by_id: dict[str, dict] = {}
+        if worker_count == 1:
+            for record_id, path in paths:
+                record = _read_saved_record_payload(path)
+                if record is not None:
+                    records_by_id[record_id] = _with_saved_category(record)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(_read_saved_record_payload, path): record_id
+                    for record_id, path in paths
+                }
+                for future in as_completed(futures):
+                    record = future.result()
+                    if record is not None:
+                        records_by_id[futures[future]] = _with_saved_category(record)
+        return [
+            records_by_id[record_id]
+            for record_id in ordered_ids
+            if record_id in records_by_id
+        ]
+
     def scan_saved_quality(
         self,
         user_id: str,
@@ -4234,13 +4294,34 @@ def _read_saved_records(directory: Path) -> list[dict]:
         return []
     records = []
     for path in directory.glob("*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+        payload = _read_saved_record_payload(path)
         if isinstance(payload, dict):
             records.append(payload)
     return sorted(records, key=lambda item: str(item.get("saved_at", "")))
+
+
+def _read_saved_record_payload(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _saved_record_read_worker_count(record_count: int) -> int:
+    if record_count < 4:
+        return 1
+    configured = os.getenv("LIVE_MONITOR_SAVED_READ_WORKERS", "").strip()
+    if configured:
+        try:
+            requested = int(configured)
+        except ValueError:
+            requested = 0
+        if requested <= 1:
+            return 1
+        return min(record_count, requested)
+    default_workers = min(SAVED_RECORD_READ_WORKER_LIMIT, max(4, (os.cpu_count() or 1) * 4))
+    return min(record_count, default_workers)
 
 
 def _read_saved_record_previews(

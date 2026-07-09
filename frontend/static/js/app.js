@@ -191,6 +191,39 @@ function initLiveRetestLoading(){
     });
   });
 }
+function initLiveRetestRefresh(){
+  document.querySelectorAll('[data-live-retest-refresh]').forEach(button=>{
+    const form=button.closest('section')?.querySelector('[data-live-retest-form]');
+    const panel=form?.querySelector('[data-live-time-range]');
+    if(!form||!panel)return;
+    button.addEventListener('click',async()=>{
+      const original=button.textContent;
+      button.disabled=true;
+      button.textContent='Refreshing...';
+      try{
+        const response=await fetch(button.dataset.summaryUrl,{headers:{Accept:'application/json'}});
+        const payload=await response.json();
+        if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to refresh live retest contracts'));
+        const summary=payload.summary||{};
+        if(!summary.range_start_ts||!summary.range_end_ts)throw new Error('No suitable saved contracts found');
+        panel.dataset.contracts=JSON.stringify(summary.contracts||[]);
+        panel.dataset.minTs=String(summary.range_start_ts);
+        panel.dataset.maxTs=String(summary.range_end_ts);
+        panel.dataset.selectedStartTs=String(summary.range_start_ts);
+        panel.dataset.selectedEndTs=String(summary.range_end_ts);
+        if(setupLiveTimeRange(panel))button.textContent='Refreshed';
+        else throw new Error('Unable to render refreshed range');
+        setTimeout(()=>{button.textContent=original},1200);
+      }catch(error){
+        button.textContent='Refresh failed';
+        setTimeout(()=>{button.textContent=original},1600);
+        console.error('[live-retest] refresh failed',error);
+      }finally{
+        button.disabled=false;
+      }
+    });
+  });
+}
 
 function initGroupGeneration(){
   const form=document.getElementById('group-generation-form');if(!form)return;
@@ -389,7 +422,35 @@ function initLiveAnalysis(){
   const setSummaryStatus=(text,mode='')=>{if(summaryStatus){summaryStatus.textContent=text;summaryStatus.className='badge '+mode}};
   const appendProgress=message=>{if(!progressLog||!message)return;const row=document.createElement('p');row.textContent=new Date().toLocaleTimeString()+'  '+message;progressLog.appendChild(row);while(progressLog.childElementCount>250)progressLog.firstElementChild.remove();progressLog.scrollTop=progressLog.scrollHeight};
   const closeSource=()=>{if(activeSource){activeSource.close();activeSource=null}};
+  const activeFamilyInputs=()=>{
+    const strategyMode=filterForm.querySelector('[name="strategy_mode"]')?.value||'lightweight';
+    return Array.from(filterForm.querySelectorAll('[data-strategy-family-group="'+strategyMode+'"] input[name="strategy_families"]'));
+  };
+  const syncFamilyGroups=(ensureDefault=false)=>{
+    const strategyMode=filterForm.querySelector('[name="strategy_mode"]')?.value||'lightweight';
+    filterForm.querySelectorAll('[data-strategy-family-group]').forEach(group=>{
+      const active=group.dataset.strategyFamilyGroup===strategyMode;
+      group.classList.toggle('hidden',!active);
+      group.querySelectorAll('input[name="strategy_families"]').forEach(input=>{input.disabled=!active});
+      if(ensureDefault&&active&&!group.querySelector('input[name="strategy_families"]:checked')){
+        group.querySelectorAll('input[name="strategy_families"]').forEach(input=>{input.checked=true});
+      }
+    });
+  };
+  const syncGenerationFamilies=()=>{
+    const container=generationForm.querySelector('[data-live-analysis-family-hidden]');
+    if(!container)return;
+    container.textContent='';
+    activeFamilyInputs().filter(input=>input.checked).forEach(input=>{
+      const hidden=document.createElement('input');
+      hidden.type='hidden';
+      hidden.name='strategy_families';
+      hidden.value=input.value;
+      container.appendChild(hidden);
+    });
+  };
   const syncGenerationFields=()=>{
+    syncFamilyGroups();
     const asset=filterForm.querySelector('[name="asset_symbol"]')?.value||'BTC';
     const timeframe=filterForm.querySelector('[name="timeframe"]')?.value||'5m';
     const strategyMode=filterForm.querySelector('[name="strategy_mode"]')?.value||'lightweight';
@@ -405,6 +466,7 @@ function initLiveAnalysis(){
     else if(!include&&hidden)hidden.remove();
     const mode=generationForm.querySelector('[data-live-analysis-contract-mode]');
     if(mode)mode.value=include?'Full + partial suitable contracts':'Full suitable contracts only';
+    syncGenerationFamilies();
   };
   const summaryParams=()=>{
     const params=new URLSearchParams(new FormData(filterForm));
@@ -480,7 +542,7 @@ function initLiveAnalysis(){
   };
   if(generationForm.querySelector('input[name="group_name"]'))generationForm.querySelector('input[name="group_name"]').addEventListener('input',event=>{event.currentTarget.dataset.touched='true'});
   filterForm.addEventListener('submit',event=>{event.preventDefault();rangeLoaded=false;if(rangePanel)rangePanel.classList.add('hidden');loadSummary(true,false)});
-  filterForm.querySelectorAll('select,input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>{rangeLoaded=false;if(rangePanel)rangePanel.classList.add('hidden');loadSummary(true,false)}));
+  filterForm.querySelectorAll('select,input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>{syncFamilyGroups(input.name==='strategy_mode');rangeLoaded=false;if(rangePanel)rangePanel.classList.add('hidden');loadSummary(true,false)}));
   if(loadRangeButton)loadRangeButton.addEventListener('click',()=>loadSummary(true,true));
   generationForm.addEventListener('submit',async event=>{
     event.preventDefault();closeSource();syncGenerationFields();
@@ -513,12 +575,22 @@ function initLiveAnalysis(){
     try{await fetch('/api/group-jobs/'+activeJobId+'/cancel',{method:'POST',headers:{Accept:'application/json'}})}catch(error){appendProgress('Cancel request failed: '+error.message)}
   });
   window.addEventListener('pagehide',()=>{closeSource();if(summaryController)summaryController.abort()},{once:true});
+  syncFamilyGroups(true);
   loadSummary(false,false);
 }
 function initLiveMonitor(){
   const panel=document.getElementById('live-monitor');if(!panel)return;
+  const startUrl=panel.dataset.startUrl||'/api/live-monitors';
+  const activeUrl=panel.dataset.activeUrl||'/api/live-monitors/active';
+  const savedUrl=panel.dataset.savedUrl||'/api/live-monitor/saved';
+  const savedDetailUrl=panel.dataset.savedDetailUrl||'/api/live-monitor/saved/{id}';
+  const deleteUrl=panel.dataset.deleteUrl||'/api/live-monitor/saved/{id}';
+  const syncUrl=panel.dataset.syncUrl||'';
+  const savedMode=panel.dataset.savedMode||'contracts';
+  const restoreActive=panel.dataset.disableActiveRestore!=='true';
   const form=document.getElementById('live-monitor-form'),sessionsContainer=document.getElementById('live-monitor-sessions'),startStatus=document.getElementById('live-monitor-start-status');
   const savedRows=document.getElementById('live-saved-rows'),savedRefresh=document.getElementById('live-saved-refresh'),savedCategory=document.getElementById('live-saved-category'),savedDeleteCategory=document.getElementById('live-saved-delete-category');
+  const savedLoading=document.getElementById('live-saved-loading'),savedLoadingText=document.getElementById('live-saved-loading-text');
   const savedPrev=document.getElementById('live-saved-prev'),savedNext=document.getElementById('live-saved-next'),savedPageSummary=document.getElementById('live-saved-page-summary');
   const savedDetail=document.getElementById('live-saved-detail'),savedDetailClose=document.getElementById('live-saved-detail-close'),savedChartElement=document.getElementById('live-saved-chart');
   const savedDetailCategory=document.getElementById('live-saved-detail-category'),savedDetailTitle=document.getElementById('live-saved-detail-title'),savedDetailMeta=document.getElementById('live-saved-detail-meta');
@@ -536,6 +608,7 @@ function initLiveMonitor(){
   const fmtPrice=value=>Number.isFinite(value)?'$'+Number(value).toLocaleString(undefined,{maximumFractionDigits:3}):'-';
   const fmtPriceToBeat=value=>Number.isFinite(value)?'$'+Number(value).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:8}):'-';
   const fmtPct=value=>Number.isFinite(value)?Number(value).toFixed(2)+'%':'-';
+  const fmtMoney=value=>Number.isFinite(Number(value))?'$'+Number(value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):'-';
   const fmtSeconds=value=>Number.isFinite(value)?Math.round(value)+'s':'-';
   const fmtSecondsPrecise=value=>Number.isFinite(value)?Number(value).toFixed(1).replace(/\\.0$/,'')+'s':'-';
   const fmtAge=timestamp=>timestamp?new Date(timestamp*1000).toLocaleTimeString():'Waiting';
@@ -569,6 +642,45 @@ function initLiveMonitor(){
     button.disabled=busy;button.textContent=busy?'Starting...':'Start tracking';
   };
   const resetSavedChart=()=>{if(savedChart){savedChart.destroy();savedChart=null}};
+  const setSavedControlsBusy=busy=>{
+    if(busy)[savedRefresh,savedPrev,savedNext].forEach(button=>{if(button)button.disabled=true});
+    else if(savedRefresh)savedRefresh.disabled=false;
+    if(savedCategory)savedCategory.disabled=busy;
+    if(savedDeleteCategory)savedDeleteCategory.disabled=busy||selectedSavedCategory==='all';
+    savedRows?.closest('table')?.classList.toggle('is-loading',busy);
+  };
+  const setSavedLoading=(busy,message='Loading saved contracts...')=>{
+    if(savedLoading){
+      savedLoading.classList.toggle('hidden',!busy);
+      savedLoading.setAttribute('aria-busy',busy?'true':'false');
+    }
+    if(savedLoadingText)savedLoadingText.textContent=message;
+    setSavedControlsBusy(busy);
+  };
+  const renderSavedLoadingRows=(message='Loading saved contracts...')=>{
+    if(!savedRows)return;
+    savedRows.textContent='';
+    for(let index=0;index<3;index++){
+      const row=document.createElement('tr');
+      row.className='live-saved-placeholder';
+      row.innerHTML='<td><span></span></td><td><span></span></td><td><span></span></td><td><span></span></td><td><span></span></td><td><span></span></td><td><span></span></td><td><span></span></td><td></td>';
+      savedRows.appendChild(row);
+    }
+    savedPageSummary&&(savedPageSummary.textContent=message);
+  };
+  const setSavedDetailLoading=()=>{
+    if(!savedDetail)return;
+    savedDetail.classList.remove('hidden');
+    savedDetail.setAttribute('aria-busy','true');
+    savedDetailCategory&&(savedDetailCategory.textContent='Saved contract');
+    savedDetailTitle&&(savedDetailTitle.textContent='Loading saved contract...');
+    savedDetailMeta&&(savedDetailMeta.textContent='Fetching the full saved price history and preparing the chart.');
+    if(savedPartialWarning){savedPartialWarning.textContent='';savedPartialWarning.classList.add('hidden')}
+    if(savedGapList){savedGapList.textContent='';savedGapList.classList.add('hidden')}
+    [savedTarget,savedFinal,savedOutcome,savedHistoryCount,savedCoverage,savedAverageSpread,savedFinalDeviation,savedYesRange,savedDisconnectCount,savedDisconnectedSeconds,savedCryptoDisconnectCount,savedCryptoDisconnectedSeconds].forEach(element=>{if(element)element.textContent='-'});
+    if(paperTradeRows)paperTradeRows.innerHTML='<tr><td colspan="8" class="empty">Loading paper trades...</td></tr>';
+    resetSavedChart();
+  };
   const closeController=controller=>{if(controller?.source){controller.source.close();controller.source=null}};
   const destroyController=controller=>{
     closeController(controller);
@@ -609,6 +721,7 @@ function initLiveMonitor(){
       id,
       stopUrl:payload.stop_url,
       eventsUrl:payload.events_url,
+      runUrl:payload.run_url||'',
       source:null,
       chart:null,
       chartOpen:false,
@@ -644,6 +757,7 @@ function initLiveMonitor(){
     if(existing){
       existing.stopUrl=payload.stop_url;
       existing.eventsUrl=payload.events_url;
+      existing.runUrl=payload.run_url||existing.runUrl||'';
       return existing;
     }
     return createSessionCard(payload);
@@ -679,14 +793,90 @@ function initLiveMonitor(){
     if(!Array.isArray(payload.history)||!payload.history.length)return;
     const history=(payload.history||[]).filter(row=>Number.isFinite(row.t));
     const series=key=>history.map(row=>({x:Number(row.t)*1000,y:Number.isFinite(row[key])?Number(row[key]):null}));
-    current.data.datasets[0].data=series('crypto_price');
-    current.data.datasets[1].data=series('target_price');
-    current.data.datasets[2].data=series('yes_bid');
-    current.data.datasets[3].data=series('yes_ask');
+    const baseDatasets=[
+      {label:'Crypto',data:series('crypto_price'),borderColor:neon,backgroundColor:'#29f19c12',yAxisID:'crypto',pointRadius:0,tension:.2,parsing:false},
+      {label:'Target',data:series('target_price'),borderColor:'#8293aa',borderDash:[5,5],yAxisID:'crypto',pointRadius:0,tension:0,parsing:false},
+      {label:'YES bid',data:series('yes_bid'),borderColor:'#60a5fa',backgroundColor:'#60a5fa12',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false},
+      {label:'YES ask',data:series('yes_ask'),borderColor:'#fbbf24',backgroundColor:'#fbbf2412',yAxisID:'contract',pointRadius:0,tension:.2,parsing:false}
+    ];
+    current.data.datasets=savedMode==='paper'
+      ?baseDatasets.concat(paperTradeDatasets(payload.paper_trades||[]))
+      :baseDatasets;
     current.update('none');
+  };
+  const paperTradeRows=document.getElementById('paper-trade-rows');
+  const paperTradeDatasets=trades=>{
+    const point=(timestamp,value)=>({x:Date.parse(timestamp),y:Number(value)});
+    const upEntries=[],downEntries=[],winningExits=[],losingExits=[];
+    for(const trade of trades||[]){
+      const side=String(trade.side||'').toUpperCase();
+      const entry=finiteNumber(trade.entry_yes_axis_cents);
+      const exit=finiteNumber(trade.exit_yes_axis_cents);
+      if(entry!==null&&trade.opened_at){
+        const target=side==='DOWN'?downEntries:upEntries;
+        target.push(point(trade.opened_at,entry));
+      }
+      if(exit!==null&&trade.closed_at){
+        const target=Number(trade.pnl)>=0?winningExits:losingExits;
+        target.push(point(trade.closed_at,exit));
+      }
+    }
+    return [
+      {label:'Paper UP entry',type:'scatter',data:sampleEvenly(upEntries),backgroundColor:'#fbbf24',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointStyle:'triangle',pointRotation:0,pointRadius:10,pointHoverRadius:12,order:-20,parsing:false},
+      {label:'Paper DOWN entry',type:'scatter',data:sampleEvenly(downEntries),backgroundColor:'#a78bfa',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointStyle:'triangle',pointRotation:180,pointRadius:10,pointHoverRadius:12,order:-20,parsing:false},
+      {label:'Winning paper exit',type:'scatter',data:sampleEvenly(winningExits),backgroundColor:neon,borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointRadius:7,pointHoverRadius:9,order:-10,parsing:false},
+      {label:'Losing paper exit',type:'scatter',data:sampleEvenly(losingExits),backgroundColor:'#ff647c',borderColor:'#07111f',borderWidth:2,yAxisID:'contract',pointRadius:7,pointHoverRadius:9,order:-10,parsing:false}
+    ];
+  };
+  const drawPaperTradeChart=record=>{
+    if(!savedChartElement)return;
+    const history=(record.history||[]).filter(row=>finiteNumber(row.t)!==null);
+    savedChart=replaceChart(savedChartElement,{type:'line',data:{datasets:liveContractChartDatasets(history,paperTradeDatasets(record.trades||[]))},options:liveContractChartOptions(history)});
+  };
+  const deletePaperTrade=async(record,trade,button)=>{
+    if(!record?.id||!trade?.id)return;
+    if(!window.confirm('Delete this paper trade?'))return;
+    const original=button?.textContent;
+    if(button){button.disabled=true;button.textContent='Deleting...'}
+    try{
+      const url=savedDetailUrl.replace('{id}',encodeURIComponent(record.id))+'/trades/'+encodeURIComponent(trade.id);
+      const response=await fetch(url,{method:'DELETE',headers:{Accept:'application/json'}});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to delete paper trade'));
+      appendLog({level:'warning',source:'browser',message:'Deleted paper trade.'});
+      if(savedDetailMeta)savedDetailMeta.textContent='Paper trade deleted.';
+      if(savedPageSummary)savedPageSummary.textContent='Paper trade deleted.';
+      if(payload.deleted_contract){if(savedDetail){savedDetail.classList.add('hidden');resetSavedChart()}loadSaved(false)}
+      else{await openSaved(record.id);loadSaved(false)}
+    }catch(error){
+      appendLog({level:'error',source:'browser',message:error.message});
+      if(button){button.disabled=false;button.textContent=original||'Delete'}
+    }
+  };
+  const renderPaperTrades=record=>{
+    if(!paperTradeRows)return;
+    const trades=record.trades||[];
+    if(!trades.length){paperTradeRows.innerHTML='<tr><td colspan="8" class="empty">No paper trades on this contract.</td></tr>';return}
+    paperTradeRows.textContent='';
+    for(const trade of trades){
+      const row=document.createElement('tr');
+      row.innerHTML='<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td><button class="danger" type="button">Delete</button></td>';
+      row.children[0].textContent=trade.side||'-';
+      row.children[1].textContent=Number.isFinite(Number(trade.ask_price))?(Number(trade.ask_price)*100).toFixed(2)+'c':'-';
+      const exit=trade.exit_bid_price!=null?trade.exit_bid_price:trade.exit_price;
+      row.children[2].textContent=Number.isFinite(Number(exit))?(Number(exit)*100).toFixed(2)+'c':'-';
+      row.children[3].textContent=fmtSize(Number(trade.contracts_volume));
+      row.children[4].textContent=fmtMoney(trade.pnl);
+      row.children[4].className=Number(trade.pnl)>=0?'profit':'loss';
+      row.children[5].textContent=trade.opened_at?new Date(trade.opened_at).toLocaleString():'-';
+      row.children[6].textContent=trade.closed_at?new Date(trade.closed_at).toLocaleString():'-';
+      row.children[7].querySelector('button').addEventListener('click',event=>deletePaperTrade(record,trade,event.currentTarget));
+      paperTradeRows.appendChild(row);
+    }
   };
   const drawSavedChart=record=>{
     if(!savedChartElement)return;
+    if(savedMode==='paper'){drawPaperTradeChart(record);return}
     const history=(record.history||[]).filter(row=>finiteNumber(row.t)!==null);
     savedChart=replaceChart(savedChartElement,{type:'line',data:{datasets:liveContractChartDatasets(history)},options:liveContractChartOptions(history)});
   };
@@ -694,6 +884,7 @@ function initLiveMonitor(){
     if(!savedDetail)return;
     const summary=record.summary||{};
     savedDetail.classList.remove('hidden');
+    savedDetail.setAttribute('aria-busy','false');
     savedDetailCategory.textContent=(record.category?.label||categoryLabel(record.crypto_symbol))+' saved contract';
     savedDetailTitle.textContent=record.question||record.slug||'Saved contract';
     savedDetailMeta.textContent=(record.event_title||'-')+' - saved '+fmtSavedDate(record.saved_at)+' - duration '+fmtSeconds(summary.duration_seconds);
@@ -740,23 +931,33 @@ function initLiveMonitor(){
     savedHistoryCount.textContent=String((record.history||[]).length);
     savedCoverage.textContent=fmtPct(summary.coverage_pct);
     savedAverageSpread.textContent=fmtHistoryCents(summary.average_spread);
-    savedFinalDeviation.textContent=fmtPct(summary.final_deviation_pct);
-    savedYesRange.textContent=fmtHistoryCents(summary.min_yes_bid)+' / '+fmtHistoryCents(summary.max_yes_ask);
+    savedFinalDeviation.textContent=savedMode==='paper'?fmtMoney(record.net_profit):fmtPct(summary.final_deviation_pct);
+    savedYesRange.textContent=savedMode==='paper'?String(record.trade_count||0):fmtHistoryCents(summary.min_yes_bid)+' / '+fmtHistoryCents(summary.max_yes_ask);
     savedDisconnectCount.textContent=String(record.polymarket_disconnect_count||0);
     savedDisconnectedSeconds.textContent=fmtSeconds(record.polymarket_disconnected_seconds||0);
     savedCryptoDisconnectCount.textContent=String(record.crypto_disconnect_count||0);
     savedCryptoDisconnectedSeconds.textContent=fmtSeconds(record.crypto_disconnected_seconds||0);
+    renderPaperTrades(record);
     drawSavedChart(record);
   };
-  const openSaved=async recordId=>{
+  const openSaved=async(recordId,triggerButton=null)=>{
+    const previousText=triggerButton?.textContent;
+    if(triggerButton){triggerButton.disabled=true;triggerButton.textContent='Opening...'}
+    setSavedDetailLoading();
     try{
-      const response=await fetch('/api/live-monitor/saved/'+encodeURIComponent(recordId),{headers:{Accept:'application/json'}});
+      const url=savedDetailUrl.replace('{id}',encodeURIComponent(recordId));
+      const response=await fetch(url,{headers:{Accept:'application/json'}});
       const payload=await response.json();
       if(!response.ok)throw new Error(payload.detail||'Unable to open saved contract');
       renderSavedDetail(payload.record);
     }catch(error){
       console.error('[live-monitor] saved open failed',error);
       appendLog({level:'error',source:'browser',message:error.message});
+      if(savedDetail)savedDetail.setAttribute('aria-busy','false');
+      if(savedDetailTitle)savedDetailTitle.textContent='Saved contract failed to load';
+      if(savedDetailMeta)savedDetailMeta.textContent=error.message;
+    }finally{
+      if(triggerButton){triggerButton.disabled=false;triggerButton.textContent=previousText||'Open'}
     }
   };
   const deleteSavedCategory=async()=>{
@@ -779,6 +980,7 @@ function initLiveMonitor(){
   };
   const renderSavedCategories=(categories=[])=>{
     if(!savedCategory)return;
+    if(savedMode==='paper')return;
     const current=selectedSavedCategory;
     savedCategory.textContent='';
     const all=document.createElement('option');all.value='all';all.textContent='All contracts';savedCategory.appendChild(all);
@@ -832,6 +1034,8 @@ function initLiveMonitor(){
     const wsAgeText=Number.isFinite(wsAge)?' | ws age '+wsAge.toFixed(1)+'s':'';
     const restPolls=payload.health?.rest?.poll_count||0;
     controller.samplePath.textContent=(payload.saved_path||payload.samples_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
+    if(savedMode==='paper'&&controller.runUrl)controller.samplePath.textContent+=' | run group saved';
+    if(savedMode==='paper'&&payload.paper_trade_status?.message)controller.samplePath.textContent+=' | '+payload.paper_trade_status.message;
     if(payload.status?.last_error)controller.samplePath.textContent='Last error: '+payload.status.last_error;
     setDot(controller.quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
     setDot(controller.cryptoDot,!!payload.health?.crypto?.connected,!!payload.status?.last_error&&payload.status?.crypto==='reconnecting');
@@ -853,14 +1057,14 @@ function initLiveMonitor(){
     controller.source.addEventListener('tick',listener);
     controller.source.addEventListener('ping',()=>{controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false});
     controller.source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')},controller)});
-    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);loadSaved()});
+    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);setTimeout(()=>loadSaved(false),750)});
     controller.source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog(data.log,controller)});
-    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved()});
+    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved(false)});
     controller.source.onerror=error=>{
       const age=controller.lastPayloadAt?(Date.now()-controller.lastPayloadAt)/1000:Infinity;
       controller.quoteStatus.textContent='Stream reconnecting';
       console.error('[live-monitor] SSE error',error);
-      if(age>8&&!controller.streamWarningShown){
+      if(age>10&&!controller.streamWarningShown){
         controller.streamWarningShown=true;
         appendLog({level:'error',source:'browser',message:'SSE stream interrupted for '+age.toFixed(1)+'s; browser will retry.'},controller);
       }
@@ -868,8 +1072,9 @@ function initLiveMonitor(){
     return controller;
   };
   const restoreActiveSession=async()=>{
+    if(!restoreActive)return;
     try{
-      const response=await fetch('/api/live-monitors/active',{headers:{Accept:'application/json'}});
+      const response=await fetch(activeUrl,{headers:{Accept:'application/json'}});
       if(!response.ok)return;
       const payload=await response.json();
       if(!payload.active)return;
@@ -881,17 +1086,31 @@ function initLiveMonitor(){
       appendLog({level:'error',source:'browser',message:'Unable to restore active session: '+error.message});
     }
   };
-  const loadSaved=async()=>{
+  const loadSaved=async(sync=false)=>{
     if(!savedRows)return;
+    const shouldSync=savedMode!=='paper'&&sync&&syncUrl;
+    const loadingMessage=shouldSync
+      ?'Syncing saved contracts...'
+      :(savedMode==='paper'?'Loading recorded paper trades...':'Loading saved contracts...');
+    setSavedLoading(true,loadingMessage);
+    renderSavedLoadingRows(loadingMessage);
     try{
+      if(shouldSync){
+        const syncResponse=await fetch(syncUrl,{method:'POST',headers:{Accept:'application/json'}});
+        if(syncResponse.ok){
+          const syncPayload=await syncResponse.json();
+          if(syncPayload.created)appendLog({level:'info',source:'browser',message:'Synced '+syncPayload.created+' paper-traded contract(s).'});
+          if(syncPayload.skipped_first_contract)appendLog({level:'warning',source:'browser',message:'Skipped the first contract after connection for paper trading.'});
+        }
+      }
       const params=new URLSearchParams({page:String(savedPage),page_size:String(savedPageSize)});
       if(selectedSavedCategory!=='all')params.set('category',selectedSavedCategory);
-      const url='/api/live-monitor/saved?'+params.toString();
+      const url=savedUrl+'?'+params.toString();
       const response=await fetch(url,{headers:{Accept:'application/json'}});
       if(!response.ok)throw new Error('Unable to load saved contracts');
       const payload=await response.json(),records=payload.records||[];
       savedPage=Number(payload.page)||savedPage;
-      if(!records.length&&Number(payload.total)>0&&savedPage>1){savedPage-=1;loadSaved();return}
+      if(!records.length&&Number(payload.total)>0&&savedPage>1){savedPage-=1;return await loadSaved(sync)}
       renderSavedCategories(payload.categories||[]);
       renderSavedPagination(payload);
       if(!records.length){savedRows.innerHTML='<tr><td colspan="9" class="empty">No saved contracts yet.</td></tr>';return}
@@ -908,14 +1127,31 @@ function initLiveMonitor(){
         if(record.unsuitable_contract)tags.push('Unsuitable');
         if(record.target_price_anomaly)tags.push('Target anomaly');
         if(record.partial_contract)tags.push('Partial');
-        tr.children[5].textContent=(record.winning_outcome||'-')+(tags.length?' - '+tags.join(', '):'');
-        tr.children[6].textContent=record.history_count==null?'-':String(record.history_count);
+        tr.children[5].textContent=savedMode==='paper'
+          ?fmtMoney(record.net_profit)+' / '+fmtPct(Number(record.roi))
+          :(record.winning_outcome||'-')+(tags.length?' - '+tags.join(', '):'');
+        tr.children[5].className=savedMode==='paper'?(Number(record.net_profit)>=0?'profit':'loss'):'';
+        tr.children[6].textContent=savedMode==='paper'?String(record.trade_count||0):(record.history_count==null?'-':String(record.history_count));
         tr.children[7].textContent=fmtSavedDate(record.saved_at);
-        tr.children[8].querySelector('[data-action="open"]').addEventListener('click',()=>openSaved(record.id));
-        tr.children[8].querySelector('[data-action="delete"]').addEventListener('click',async()=>{
-          if(!window.confirm('Delete this saved contract?'))return;
-          const response=await fetch('/api/live-monitor/saved/'+encodeURIComponent(record.id),{method:'DELETE',headers:{Accept:'application/json'}});
-          if(response.ok)loadSaved();
+        tr.children[8].querySelector('[data-action="open"]').addEventListener('click',event=>openSaved(record.id,event.currentTarget));
+        const deleteButton=tr.children[8].querySelector('[data-action="delete"]');
+        deleteButton.addEventListener('click',async()=>{
+          if(!window.confirm(savedMode==='paper'?'Delete this paper-traded contract and its virtual trades?':'Delete this saved contract?'))return;
+          deleteButton.disabled=true;
+          deleteButton.textContent='Deleting...';
+          try{
+            const response=await fetch(deleteUrl.replace('{id}',encodeURIComponent(record.id)),{method:'DELETE',headers:{Accept:'application/json'}});
+            const payload=await response.json().catch(()=>({}));
+            if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to delete saved contract'));
+            appendLog({level:'warning',source:'browser',message:savedMode==='paper'?'Deleted paper-traded contract.':'Deleted saved contract.'});
+            if(savedPageSummary)savedPageSummary.textContent=savedMode==='paper'?'Paper-traded contract deleted.':'Saved contract deleted.';
+            if(savedDetail){savedDetail.classList.add('hidden');resetSavedChart()}
+            loadSaved(false);
+          }catch(error){
+            appendLog({level:'error',source:'browser',message:error.message});
+            deleteButton.disabled=false;
+            deleteButton.textContent='Delete';
+          }
         });
         savedRows.appendChild(tr);
       }
@@ -923,6 +1159,8 @@ function initLiveMonitor(){
       console.error('[live-monitor] saved load failed',error);
       renderSavedPagination({total:0});
       savedRows.innerHTML='<tr><td colspan="9" class="empty">Saved contracts failed: '+error.message+'</td></tr>';
+    }finally{
+      setSavedLoading(false);
     }
   };
   const stopSession=async controller=>{
@@ -936,7 +1174,7 @@ function initLiveMonitor(){
       setDot(controller.cryptoDot,false);
       appendLog({level:'warning',source:'browser',message:'Tracking stopped'},controller);
       controller.stopButton.classList.add('hidden');
-      loadSaved();
+      loadSaved(false);
     }catch(error){
       console.error('[live-monitor] stop failed',error);
       appendLog({level:'error',source:'browser',message:error.message},controller);
@@ -948,7 +1186,7 @@ function initLiveMonitor(){
     sessionControllers.forEach(controller=>{
       if(!controller.source||!controller.lastPayloadAt)return;
       const age=(Date.now()-controller.lastPayloadAt)/1000;
-      if(age>8&&!controller.staleWarningShown){
+      if(age>10&&!controller.staleWarningShown){
         controller.staleWarningShown=true;
         setDot(controller.quoteDot,false,true);
         appendLog({level:'error',source:'browser',message:'No SSE payload received for '+age.toFixed(1)+'s. Backend stream may be stuck.'},controller);
@@ -958,11 +1196,15 @@ function initLiveMonitor(){
   form.addEventListener('submit',async event=>{
     event.preventDefault();setBusy(true);setStartStatus('Starting live monitor...');
     try{
-      const response=await fetch('/api/live-monitors',{method:'POST',body:new FormData(form),headers:{Accept:'application/json'}});
+      const response=await fetch(startUrl,{method:'POST',body:new FormData(form),headers:{Accept:'application/json'}});
       const payload=await response.json();
       if(!response.ok)throw new Error(payload.detail||'Unable to start live monitor');
       connectSession(payload);
-      setStartStatus(sessionControllers.size+' active live monitor(s). Limit is 5.');
+      setStartStatus(
+        savedMode==='paper'&&payload.run_url
+          ?'Paper trading run saved. Run group: '+payload.run_url
+          :sessionControllers.size+' active live monitor(s). Limit is 5.'
+      );
     }catch(error){
       console.error('[live-monitor] start failed',error);
       setStartStatus(error.message,'error');
@@ -971,7 +1213,7 @@ function initLiveMonitor(){
       setBusy(false);
     }
   });
-  if(savedRefresh)savedRefresh.addEventListener('click',loadSaved);
+  if(savedRefresh)savedRefresh.addEventListener('click',()=>loadSaved(false));
   if(savedPrev)savedPrev.addEventListener('click',()=>{if(savedPage>1){savedPage-=1;loadSaved()}});
   if(savedNext)savedNext.addEventListener('click',()=>{savedPage+=1;loadSaved()});
   if(savedCategory)savedCategory.addEventListener('change',()=>{selectedSavedCategory=savedCategory.value||'all';savedPage=1;loadSaved()});
@@ -1081,5 +1323,113 @@ function initLocalDataTools(){
   downloadButton&&downloadButton.addEventListener('click',downloadRender);
   tokenForm&&tokenForm.addEventListener('submit',saveToken);
 }
+function initCopyTextButtons(){
+  document.querySelectorAll('[data-copy-text-target]').forEach(button=>{
+    button.addEventListener('click',async()=>{
+      const target=document.getElementById(button.dataset.copyTextTarget||'');
+      const text=target?target.value||target.textContent||'':'';
+      if(!text)return;
+      const original=button.textContent;
+      try{
+        await navigator.clipboard.writeText(text);
+        button.textContent='Copied';
+        setTimeout(()=>{button.textContent=original},1200);
+      }catch(error){
+        if(target.select){
+          target.select();
+          document.execCommand('copy');
+          button.textContent='Copied';
+          setTimeout(()=>{button.textContent=original},1200);
+        }
+      }
+    });
+  });
+}
+function initSmartFamilyReport(){
+  const panel=document.getElementById('smart-family-report');
+  if(!panel)return;
+  const refreshButton=document.getElementById('smart-family-report-refresh');
+  const status=document.getElementById('smart-family-report-status');
+  const rowsBody=document.getElementById('smart-family-report-rows');
+  const copySource=document.getElementById('smart-family-report-copy');
+  const formatSignedPercent=value=>{
+    const number=Number(value)||0;
+    return (number>=0?'+':'')+number.toFixed(2)+'%';
+  };
+  const formatPercent=value=>(Number(value)||0).toFixed(1)+'%';
+  const formatMoney=value=>{
+    const number=Number(value)||0;
+    return (number>=0?'+':'')+number.toFixed(2);
+  };
+  const valueClass=(tested,value)=>tested?(Number(value)>=0?'profit':'loss'):'';
+  const cell=(text,className='')=>{
+    const td=document.createElement('td');
+    td.textContent=text;
+    if(className)td.className=className;
+    return td;
+  };
+  const renderRows=rows=>{
+    if(!rowsBody)return;
+    rowsBody.textContent='';
+    if(!rows.length){
+      const tr=document.createElement('tr');
+      const td=cell('No smart live-monitor analysis has been generated yet.','empty');
+      td.colSpan=10;
+      tr.appendChild(td);
+      rowsBody.appendChild(tr);
+      return;
+    }
+    rows.forEach(row=>{
+      const tr=document.createElement('tr');
+      tr.appendChild(cell(String(row.rank||'')));
+      const family=cell('');
+      family.className='min-w-[230px]';
+      const title=document.createElement('p');
+      title.textContent=row.family_label||row.family||'Unknown family';
+      const meta=document.createElement('p');
+      meta.className='muted';
+      meta.textContent=(row.family||'unknown')+' - '+(row.analysis_count||0)+' analysis run(s)';
+      family.append(title,meta);
+      tr.appendChild(family);
+      tr.appendChild(cell(row.tested?formatSignedPercent(row.average_roi):'Not tested',valueClass(row.tested,row.average_roi)));
+      tr.appendChild(cell(row.tested?formatPercent(row.profitable_percent):'-'));
+      tr.appendChild(cell(row.tested?formatSignedPercent(row.best_roi):'-',valueClass(row.tested,row.best_roi)));
+      tr.appendChild(cell(row.tested?formatSignedPercent(row.worst_roi):'-',valueClass(row.tested,row.worst_roi)));
+      tr.appendChild(cell((row.strategy_count||0)+' / '+(row.final_strategy_count||0)));
+      tr.appendChild(cell(String(row.total_trades||0)));
+      tr.appendChild(cell(row.tested?formatMoney(row.total_net_profit):'-',valueClass(row.tested,row.total_net_profit)));
+      tr.appendChild(cell(row.tested?formatPercent(row.average_win_rate):'-'));
+      rowsBody.appendChild(tr);
+    });
+  };
+  const renderReport=payload=>{
+    panel.querySelectorAll('[data-smart-report-metric]').forEach(element=>{
+      const value=payload[element.dataset.smartReportMetric];
+      element.textContent=Number.isFinite(Number(value))?Number(value).toLocaleString():String(value??'-');
+    });
+    if(copySource)copySource.value=payload.copy_text||'';
+    renderRows(payload.rows||[]);
+    if(status)status.textContent='Refreshed '+new Date().toLocaleTimeString()+' from saved analyses.';
+  };
+  const refresh=async()=>{
+    if(!refreshButton)return;
+    const original=refreshButton.textContent;
+    refreshButton.disabled=true;
+    refreshButton.textContent='Refreshing...';
+    if(status)status.textContent='Refreshing saved smart-family statistics...';
+    try{
+      const response=await fetch(panel.dataset.reportUrl||'/api/account/smart-family-report',{headers:{Accept:'application/json'}});
+      const payload=await response.json();
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to refresh smart-family report'));
+      renderReport(payload);
+    }catch(error){
+      if(status)status.textContent='Refresh failed: '+error.message;
+    }finally{
+      refreshButton.disabled=false;
+      refreshButton.textContent=original;
+    }
+  };
+  refreshButton&&refreshButton.addEventListener('click',refresh);
+}
 window.addEventListener('pagehide',()=>{chartInstances.forEach(chart=>chart.destroy());chartInstances.clear()},{once:true});
-document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initSavedContractInlineCharts();initLiveRetestLoading();initLiveMonitor();initLocalDataTools()});
+document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initSavedContractInlineCharts();initLiveRetestLoading();initLiveRetestRefresh();initLiveMonitor();initLocalDataTools();initCopyTextButtons();initSmartFamilyReport()});

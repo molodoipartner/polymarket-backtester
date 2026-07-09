@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import math
 import queue
 import shutil
@@ -35,11 +36,19 @@ from backend.fixed_time import (
 )
 from backend.live_monitor import LIVE_STREAM_HISTORY_LIMIT, LiveMonitorManager
 from backend.storage import FileStore
+from backend.storage.file_store import utc_iso
 from backend.strategy_generator import LiveMonitorStrategyGenerator, StrategyGroupGenerator
+from backend.strategy_generator.live_monitor_generator import (
+    ALL_LIVE_FAMILY_LABELS,
+    SMART_LIVE_FAMILY_LABELS,
+)
 from config.settings import ROOT_DIR, settings
 
 router = APIRouter()
 templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
+logger = logging.getLogger(__name__)
+_PAPER_VISUAL_PREVIEW_LOCK = threading.Lock()
+_PAPER_VISUAL_PREVIEWS: dict[str, dict] = {}
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
 QUALITY_REPORT_CACHE_TTL_SECONDS = 900
 QUALITY_CONTRACT_LIMITS = {
@@ -177,12 +186,12 @@ def _quality_timeline_range(timeline: list[dict]) -> dict:
     }
 
 
-def _live_monitor_session_payload(session) -> dict:
+def _live_monitor_session_payload(session, history_limit: int | None = LIVE_STREAM_HISTORY_LIMIT) -> dict:
     return {
         "session_id": session.id,
         "events_url": f"/api/live-monitors/{session.id}/events",
         "stop_url": f"/api/live-monitors/{session.id}/stop",
-        "snapshot": session.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
+        "snapshot": session.snapshot(history_limit=history_limit),
     }
 
 
@@ -295,6 +304,19 @@ def _ensure_contract_summary(group: dict, strategy: dict | None = None) -> None:
         metrics.setdefault("contracts_total", group.get("contracts_total", metrics["event_count"]))
         metrics.setdefault("contracts_missing", group.get("contracts_missing", 0))
         metrics.setdefault("contracts_available", group.get("contracts_available", metrics["event_count"]))
+
+
+def _live_retest_summary_from_group(group: dict) -> dict | None:
+    summary = dict(group.get("saved_contract_summary") or {})
+    if not summary:
+        return None
+    contracts = summary.get("contracts")
+    if not isinstance(contracts, list) or not contracts:
+        return None
+    required = ("range_start_ts", "range_end_ts", "selected_start_ts", "selected_end_ts")
+    if any(summary.get(key) is None for key in required):
+        return None
+    return summary
 
 
 def _sample_series(rows: list[dict], limit: int = 1200) -> list[dict]:
@@ -415,6 +437,223 @@ def _family_profit_summary(strategies: list[dict]) -> list[dict]:
     return rows
 
 
+def _smart_family_rows_from_strategies(
+    strategies: list[dict],
+    groups: list[dict] | None = None,
+) -> list[dict]:
+    buckets: dict[str, dict] = {
+        family: {
+            "family": family,
+            "family_label": label,
+            "strategy_count": 0,
+            "final_strategy_count": 0,
+            "generated_count": 0,
+            "profitable_count": 0,
+            "total_roi": 0.0,
+            "best_roi": None,
+            "worst_roi": None,
+            "phase_tested_count": 0,
+            "phase_profitable_count": 0,
+            "phase_total_roi": 0.0,
+            "phase_best_roi": None,
+            "phase_worst_roi": None,
+            "latest_phase": 0,
+            "total_net_profit": 0.0,
+            "total_trades": 0,
+            "total_contracts_used": 0,
+            "total_win_rate": 0.0,
+            "total_stability": 0.0,
+            "total_sharpe": 0.0,
+            "groups": set(),
+        }
+        for family, label in SMART_LIVE_FAMILY_LABELS.items()
+    }
+    for group in groups or []:
+        group_id = group.get("id")
+        rankings = group.get("phase_validation", {}).get("family_rankings") or []
+        for ranking in rankings:
+            family = str(ranking.get("family") or "")
+            if family not in SMART_LIVE_FAMILY_LABELS:
+                continue
+            bucket = buckets[family]
+            bucket["generated_count"] += int(
+                ranking.get("generated_count", ranking.get("strategy_count", 0)) or 0
+            )
+            if group_id:
+                bucket["groups"].add(group_id)
+            latest_phase = None
+            for phase in ranking.get("phases") or []:
+                if int(phase.get("tested_count", 0) or 0) > 0:
+                    latest_phase = phase
+            if not latest_phase:
+                continue
+            tested_count = int(latest_phase.get("tested_count", 0) or 0)
+            average_roi = float(latest_phase.get("average_roi", 0) or 0)
+            bucket["phase_tested_count"] += tested_count
+            bucket["phase_profitable_count"] += int(latest_phase.get("profitable_count", 0) or 0)
+            bucket["phase_total_roi"] += average_roi * tested_count
+            bucket["latest_phase"] = max(bucket["latest_phase"], int(latest_phase.get("phase", 0) or 0))
+            for source_key, target_key, reducer in (
+                ("best_roi", "phase_best_roi", max),
+                ("worst_roi", "phase_worst_roi", min),
+            ):
+                value = _number_or_none(latest_phase.get(source_key))
+                if value is None:
+                    continue
+                bucket[target_key] = (
+                    value if bucket[target_key] is None else reducer(bucket[target_key], value)
+                )
+    for strategy in strategies:
+        family = str(strategy.get("family") or "")
+        if family not in SMART_LIVE_FAMILY_LABELS:
+            continue
+        metrics = strategy.get("metrics", {})
+        bucket = buckets[family]
+        roi = float(metrics.get("roi", 0) or 0)
+        bucket["strategy_count"] += 1
+        bucket["final_strategy_count"] += 1
+        if bucket["generated_count"] <= 0:
+            bucket["generated_count"] += 1
+        bucket["profitable_count"] += int(roi > 0)
+        bucket["total_roi"] += roi
+        bucket["best_roi"] = roi if bucket["best_roi"] is None else max(bucket["best_roi"], roi)
+        bucket["worst_roi"] = roi if bucket["worst_roi"] is None else min(bucket["worst_roi"], roi)
+        bucket["total_net_profit"] += float(metrics.get("net_profit", 0) or 0)
+        bucket["total_trades"] += int(metrics.get("trade_count", 0) or 0)
+        bucket["total_contracts_used"] += int(metrics.get("contracts_used", 0) or 0)
+        bucket["total_win_rate"] += float(metrics.get("win_rate", 0) or 0)
+        bucket["total_stability"] += float(metrics.get("stability_score", 0) or 0)
+        bucket["total_sharpe"] += float(metrics.get("sharpe_ratio", 0) or 0)
+        if strategy.get("group_id"):
+            bucket["groups"].add(strategy["group_id"])
+
+    rows = []
+    for bucket in buckets.values():
+        phase_tested_count = int(bucket["phase_tested_count"])
+        final_count = int(bucket["final_strategy_count"])
+        tested_count = phase_tested_count or final_count
+        count = max(1, tested_count)
+        uses_phase_metrics = phase_tested_count > 0
+        total_roi = bucket["phase_total_roi"] if uses_phase_metrics else bucket["total_roi"]
+        profitable_count = (
+            bucket["phase_profitable_count"] if uses_phase_metrics else bucket["profitable_count"]
+        )
+        best_roi = bucket["phase_best_roi"] if uses_phase_metrics else bucket["best_roi"]
+        worst_roi = bucket["phase_worst_roi"] if uses_phase_metrics else bucket["worst_roi"]
+        rows.append({
+            **bucket,
+            "analysis_count": len(bucket["groups"]),
+            "tested": tested_count > 0,
+            "strategy_count": tested_count,
+            "average_roi": round(total_roi / count, 6) if tested_count else 0.0,
+            "best_roi": round(float(best_roi or 0), 6),
+            "worst_roi": round(float(worst_roi or 0), 6),
+            "profitable_percent": round(profitable_count / count * 100, 4) if tested_count else 0.0,
+            "total_net_profit": round(bucket["total_net_profit"], 4),
+            "average_net_profit": round(bucket["total_net_profit"] / max(1, final_count), 6) if final_count else 0.0,
+            "average_win_rate": round(bucket["total_win_rate"] / max(1, final_count), 4) if final_count else 0.0,
+            "average_stability": round(bucket["total_stability"] / max(1, final_count), 4) if final_count else 0.0,
+            "average_sharpe": round(bucket["total_sharpe"] / max(1, final_count), 6) if final_count else 0.0,
+            "groups": sorted(bucket["groups"]),
+        })
+    rows.sort(
+        key=lambda item: (
+            item["tested"],
+            item["average_roi"],
+            item["profitable_percent"],
+            item["best_roi"],
+            item["total_net_profit"],
+            item["generated_count"],
+            item["final_strategy_count"],
+        ),
+        reverse=True,
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows
+
+
+def _smart_family_report(store: FileStore, user_id: str) -> dict:
+    smart_groups = [
+        group for group in store.list_user_records(user_id, "groups")
+        if group.get("source") == "live_monitor_saved_contracts"
+        and group.get("strategy_mode") == "smart"
+    ]
+    group_ids = {group["id"] for group in smart_groups if group.get("id")}
+    strategies = [
+        strategy for strategy in store.list_user_records(user_id, "strategies")
+        if strategy.get("group_id") in group_ids
+        and strategy.get("family") in SMART_LIVE_FAMILY_LABELS
+    ]
+    rows = _smart_family_rows_from_strategies(strategies, smart_groups)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_count": len(smart_groups),
+        "strategy_count": len(strategies),
+        "family_count": len(rows),
+        "rows": rows,
+        "copy_text": _smart_family_report_text(rows, len(smart_groups), len(strategies)),
+    }
+
+
+def _smart_family_report_text(rows: list[dict], analysis_count: int, strategy_count: int) -> str:
+    lines = [
+        "Smart live-monitor family report",
+        f"Analyses: {analysis_count}",
+        f"Strategies: {strategy_count}",
+        "",
+    ]
+    if not rows:
+        lines.append("No smart family statistics have been collected yet.")
+        return "\n".join(lines)
+    for row in rows:
+        if not row.get("tested"):
+            lines.append(
+                f"{row['rank']}. {row['family_label']} ({row['family']}): not tested yet."
+            )
+            continue
+        lines.append(
+            (
+                f"{row['rank']}. {row['family_label']} ({row['family']}): "
+                f"avg ROI {row['average_roi']:+.2f}%, best {row['best_roi']:+.2f}%, "
+                f"worst {row['worst_roi']:+.2f}%, profitable "
+                f"{row['profitable_percent']:.1f}%, tested {row['strategy_count']}, "
+                f"generated {row['generated_count']}, final {row['final_strategy_count']}, "
+                f"analyses {row['analysis_count']}, trades {row['total_trades']}, "
+                f"net profit {row['total_net_profit']:+.2f}, avg win rate "
+                f"{row['average_win_rate']:.1f}%, avg stability {row['average_stability']:.1f}."
+            )
+        )
+    lines.extend([
+        "",
+        "Please analyze which smart strategy families look strongest overall, which look weak, "
+        "and what I should test next.",
+    ])
+    return "\n".join(lines)
+
+
+def _record_smart_family_report_snapshot(store: FileStore, user_id: str, group: dict) -> None:
+    if group.get("source") != "live_monitor_saved_contracts" or group.get("strategy_mode") != "smart":
+        return
+    strategies = store.list_user_records_filtered_limited(
+        user_id,
+        "strategies",
+        {"group_id": group["id"]},
+        int(group.get("strategy_count", 0) or 0),
+    )
+    rows = _smart_family_rows_from_strategies(strategies, [group])
+    store.append_user_record(user_id, "family_reports", {
+        "group_id": group["id"],
+        "group_name": group.get("name"),
+        "strategy_mode": group.get("strategy_mode"),
+        "source": group.get("source"),
+        "analysis_created_at": group.get("created_at"),
+        "analysis_count": 1,
+        "strategy_count": len(strategies),
+        "rows": rows,
+    })
+
+
 def _normalize_live_bid_exit_outcomes(live_monitor, user_id: str, transactions: list[dict]) -> None:
     for transaction in transactions:
         if str(transaction.get("resolved_outcome") or "").upper() != "BID_EXIT":
@@ -434,6 +673,28 @@ def _number_or_none(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _live_strategy_family_options(strategy_mode: str) -> list[dict]:
+    mode = LiveMonitorStrategyGenerator._validate_strategy_mode(strategy_mode)
+    return [
+        {"id": family, "label": ALL_LIVE_FAMILY_LABELS[family]}
+        for family in LiveMonitorStrategyGenerator.available_families(mode)
+    ]
+
+
+def _selected_live_strategy_families(
+    strategy_mode: str,
+    strategy_families: list[str] | None,
+    *,
+    filter_enabled: bool = False,
+) -> tuple[str, ...] | None:
+    if not filter_enabled and not strategy_families:
+        return None
+    return LiveMonitorStrategyGenerator._validate_strategy_families(
+        strategy_mode,
+        strategy_families or [],
+    )
 
 
 def _reconstructed_strategy_transactions(
@@ -581,19 +842,44 @@ def account_page(request: Request):
     user = _user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
+    store = _store(request)
     account = {
         "id": user.get("id"),
         "email": user.get("email", ""),
         "username": user.get("username", ""),
         "display_name": user.get("display_name", ""),
         "role": "admin" if _is_admin(request) else "user",
-        "data_root": str(_store(request).root),
+        "data_root": str(store.root),
     }
+    smart_family_report = (
+        _smart_family_report(store, user["id"])
+        if not _is_admin(request)
+        else {"rows": [], "copy_text": "", "analysis_count": 0, "strategy_count": 0}
+    )
+    paper_trading_groups = [
+        group for group in sorted(
+            store.list_user_records(user["id"], "groups"),
+            key=lambda item: item.get("created_at", ""),
+            reverse=True,
+        )
+        if group.get("source") == "paper_trading_live"
+    ]
     return templates.TemplateResponse(
         request,
         "account.html",
-        _context(request, account=account),
+        _context(
+            request,
+            account=account,
+            smart_family_report=smart_family_report,
+            paper_trading_groups=paper_trading_groups,
+        ),
     )
+
+
+@router.get("/api/account/smart-family-report")
+def account_smart_family_report(request: Request):
+    user = _require_user(request)
+    return _smart_family_report(_store(request), user["id"])
 
 
 @router.post("/account/clear-project-cache")
@@ -1115,6 +1401,7 @@ def live_monitor_analysis_page(
     asset_symbol: str = Query("BTC"),
     timeframe: str = Query("5m"),
     strategy_mode: str = Query("lightweight"),
+    strategy_families: list[str] = Query(default=[]),
     include_partial_contracts: bool = Query(False),
     start_ts: float | None = Query(None),
     end_ts: float | None = Query(None),
@@ -1125,6 +1412,18 @@ def live_monitor_analysis_page(
     _require_user(request)
     selected_asset = asset_symbol.upper() if asset_symbol.upper() in ASSETS else "BTC"
     selected_timeframe = timeframe if timeframe in TIMEFRAMES else "5m"
+    selected_strategy_mode = (
+        strategy_mode if strategy_mode in {"lightweight", "smart"} else "lightweight"
+    )
+    try:
+        selected_families = _selected_live_strategy_families(
+            selected_strategy_mode,
+            strategy_families,
+            filter_enabled=bool(strategy_families),
+        )
+    except ValueError:
+        selected_families = None
+    family_options = _live_strategy_family_options(selected_strategy_mode)
     return templates.TemplateResponse(
         request,
         "live_monitor_analysis.html",
@@ -1134,8 +1433,14 @@ def live_monitor_analysis_page(
             timeframes={"5m": TIMEFRAMES["5m"]},
             selected_asset=selected_asset,
             selected_timeframe=selected_timeframe,
-            selected_strategy_mode=(
-                strategy_mode if strategy_mode in {"lightweight", "smart"} else "lightweight"
+            selected_strategy_mode=selected_strategy_mode,
+            strategy_family_options=family_options,
+            strategy_family_options_by_mode={
+                "lightweight": _live_strategy_family_options("lightweight"),
+                "smart": _live_strategy_family_options("smart"),
+            },
+            selected_strategy_families=set(
+                selected_families or [option["id"] for option in family_options]
             ),
             include_partial_contracts=include_partial_contracts,
             selected_start_ts=start_ts,
@@ -1187,6 +1492,8 @@ def create_live_monitor_analysis_group(
     strategy_count: Annotated[int, Form()],
     starting_balance: Annotated[float, Form()],
     strategy_mode: Annotated[str, Form()] = "lightweight",
+    strategy_families: Annotated[list[str] | None, Form()] = None,
+    strategy_family_filter_enabled: Annotated[bool, Form()] = False,
     include_partial_contracts: Annotated[bool, Form()] = False,
     start_ts: Annotated[str, Form()] = "",
     end_ts: Annotated[str, Form()] = "",
@@ -1202,8 +1509,13 @@ def create_live_monitor_analysis_group(
         max(0, _form_int(phase_2_contracts, "phase_2_contracts")),
         max(0, _form_int(phase_3_contracts, "phase_3_contracts")),
     )
-    generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
     try:
+        selected_families = _selected_live_strategy_families(
+            strategy_mode,
+            strategy_families,
+            filter_enabled=strategy_family_filter_enabled,
+        )
+        generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
         group = generator.generate(
             user["id"],
             group_name,
@@ -1216,7 +1528,9 @@ def create_live_monitor_analysis_group(
             parsed_end_ts,
             strategy_mode,
             phase_contract_counts=phase_counts,
+            strategy_families=selected_families,
         )
+        _record_smart_family_report_snapshot(_store(request), user["id"], group)
         request.session["message"] = (
             f"Created {group['strategy_count']} live-monitor strategies from "
             f"{group['event_count']} saved contract(s)."
@@ -1230,6 +1544,9 @@ def create_live_monitor_analysis_group(
         "include_partial_contracts": "true" if include_partial_contracts else "false",
         "strategy_mode": strategy_mode,
     }
+    for family in strategy_families or []:
+        params.setdefault("strategy_families", [])
+        params["strategy_families"].append(family)
     if parsed_start_ts is not None:
         params["start_ts"] = str(parsed_start_ts)
     if parsed_end_ts is not None:
@@ -1241,7 +1558,7 @@ def create_live_monitor_analysis_group(
     ):
         if value:
             params[key] = str(value)
-    params = urlencode(params)
+    params = urlencode(params, doseq=True)
     return RedirectResponse(f"/live-monitor/analysis?{params}", status_code=303)
 
 
@@ -1254,6 +1571,8 @@ async def start_live_monitor_analysis_job(
     strategy_count: Annotated[int, Form()],
     starting_balance: Annotated[float, Form()],
     strategy_mode: Annotated[str, Form()] = "lightweight",
+    strategy_families: Annotated[list[str] | None, Form()] = None,
+    strategy_family_filter_enabled: Annotated[bool, Form()] = False,
     include_partial_contracts: Annotated[bool, Form()] = False,
     start_ts: Annotated[str, Form()] = "",
     end_ts: Annotated[str, Form()] = "",
@@ -1269,6 +1588,14 @@ async def start_live_monitor_analysis_job(
         max(0, _form_int(phase_2_contracts, "phase_2_contracts")),
         max(0, _form_int(phase_3_contracts, "phase_3_contracts")),
     )
+    try:
+        selected_families = _selected_live_strategy_families(
+            strategy_mode,
+            strategy_families,
+            filter_enabled=strategy_family_filter_enabled,
+        )
+    except ValueError as error:
+        raise HTTPException(422, _error_message(error)) from error
     job = request.app.state.job_store.create(user["id"])
     task = asyncio.create_task(
         _run_live_monitor_analysis_job(
@@ -1285,6 +1612,7 @@ async def start_live_monitor_analysis_job(
             parsed_end_ts,
             strategy_mode,
             phase_counts,
+            selected_families,
         )
     )
     _track_job_task(request.app, job["id"], task)
@@ -1429,6 +1757,1425 @@ def delete_saved_live_monitor(request: Request, record_id: str):
     if not deleted:
         raise HTTPException(404, "Saved live monitor record not found")
     return {"deleted": True}
+
+
+def _paper_trading_strategy_scope(
+    request: Request, group_id: str, strategy_id: str
+) -> tuple[dict, FileStore, dict, dict]:
+    user = _require_user(request)
+    store = _store(request)
+    group = store.get_user_record(user["id"], "groups", group_id)
+    strategy = store.get_user_record(user["id"], "strategies", strategy_id)
+    if not group or not strategy or strategy.get("group_id") != group_id:
+        raise HTTPException(404, "Strategy not found in this group")
+    if group.get("source") != "live_monitor_saved_contracts":
+        raise HTTPException(422, "Paper trading is available for live-monitor strategies")
+    return user, store, group, strategy
+
+
+def _paper_trade_list_record(record: dict) -> dict:
+    return {
+        key: record.get(key)
+        for key in (
+            "id",
+            "group_id",
+            "strategy_id",
+            "source_group_id",
+            "source_strategy_id",
+            "strategy_name",
+            "family",
+            "saved_record_id",
+            "question",
+            "event_title",
+            "crypto_symbol",
+            "target_price",
+            "final_crypto_price",
+            "winning_outcome",
+            "window_start_ts",
+            "window_end_ts",
+            "paper_mode",
+            "trade_count",
+            "net_profit",
+            "roi",
+            "initial_capital",
+            "final_capital",
+            "saved_at",
+            "created_at",
+        )
+    } | {"history_count": record.get("history_count", 0)}
+
+
+def _paper_run_metrics(transactions: list[dict], initial_capital: float) -> tuple[dict, list[dict]]:
+    ordered = sorted(transactions, key=lambda item: str(item.get("closed_at") or item.get("created_at") or ""))
+    balance = initial_capital
+    equity_curve = [{"t": utc_iso(), "value": round(initial_capital, 4)}]
+    profits = []
+    for transaction in ordered:
+        pnl = float(transaction.get("pnl", 0) or 0)
+        balance += pnl
+        profits.append(pnl)
+        equity_curve.append({
+            "t": transaction.get("closed_at") or transaction.get("created_at") or utc_iso(),
+            "value": round(balance, 4),
+        })
+    gross_profit = sum(value for value in profits if value > 0)
+    gross_loss = abs(sum(value for value in profits if value < 0))
+    returns = [
+        float(item.get("pnl", 0) or 0) / max(
+            float(item.get("margin_locked", 0) or 0) + float(item.get("entry_fee", 0) or 0),
+            1e-9,
+        )
+        for item in ordered
+    ]
+    max_drawdown = FileBacktester._max_drawdown([point["value"] for point in equity_curve])
+    sharpe = LiveMonitorStrategyGenerator._sharpe(returns) if returns else 0.0
+    stability = FileBacktester.stability_metrics(
+        [point["value"] for point in equity_curve],
+        initial_capital,
+        balance,
+        sharpe,
+        max_drawdown,
+    )
+    metrics = {
+        "initial_capital": round(initial_capital, 4),
+        "final_capital": round(balance, 4),
+        "net_profit": round(balance - initial_capital, 4),
+        "roi": round((balance / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+        "sharpe_ratio": round(sharpe, 6),
+        "win_rate": round(sum(value > 0 for value in profits) / len(profits) * 100, 4) if profits else 0.0,
+        "max_drawdown": round(max_drawdown, 6),
+        **stability,
+        "profit_factor": round(gross_profit / gross_loss, 6) if gross_loss else (999.0 if gross_profit else 0.0),
+        "average_trade": round(sum(profits) / len(profits), 6) if profits else 0.0,
+        "trade_count": len(ordered),
+        "event_count": len({item.get("saved_record_id") or item.get("event_id") for item in ordered}),
+        "contracts_used": len({item.get("saved_record_id") or item.get("event_id") for item in ordered}),
+        "contracts_total": len({item.get("saved_record_id") or item.get("event_id") for item in ordered}),
+        "contracts_available": len({item.get("saved_record_id") or item.get("event_id") for item in ordered}),
+        "contracts_missing": 0,
+        "up_trade_count": sum(str(item.get("side")).upper() == "UP" for item in ordered),
+        "down_trade_count": sum(str(item.get("side")).upper() == "DOWN" for item in ordered),
+        "winning_trade_count": sum(value > 0 for value in profits),
+        "losing_trade_count": sum(value < 0 for value in profits),
+        "flat_trade_count": sum(value == 0 for value in profits),
+        "skipped_contract_count": 0,
+        "average_allocation_pct": round(
+            sum(float(item.get("allocation_pct_used", 0) or 0) for item in ordered) / max(1, len(ordered)) * 100,
+            6,
+        ) if ordered else 0.0,
+        "max_allocation_pct_used": round(
+            max((float(item.get("allocation_pct_used", 0) or 0) for item in ordered), default=0.0) * 100,
+            6,
+        ),
+    }
+    return metrics, equity_curve
+
+
+def _rebalance_paper_transactions(
+    store: FileStore,
+    user_id: str,
+    group_id: str,
+    strategy_id: str,
+    initial_capital: float,
+) -> list[dict]:
+    transactions = store.list_user_records_filtered(
+        user_id,
+        "transactions",
+        {"group_id": group_id, "strategy_id": strategy_id},
+    )
+    transactions.sort(key=lambda item: str(item.get("closed_at") or item.get("opened_at") or item.get("created_at") or ""))
+    balance = round(initial_capital, 8)
+    rebalanced = []
+    for transaction in transactions:
+        pnl = round(float(transaction.get("pnl", 0) or 0), 8)
+        balance_before = balance
+        balance_after = round(balance_before + pnl, 8)
+        updates = {
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "available_cash_after_close": balance_after,
+        }
+        if any(transaction.get(key) != value for key, value in updates.items()):
+            store.update_user_record(user_id, "transactions", transaction["id"], updates)
+            transaction = {**transaction, **updates}
+        rebalanced.append(transaction)
+        balance = balance_after
+    return rebalanced
+
+
+def _refresh_paper_run_summary(store: FileStore, user_id: str, group: dict, strategy: dict) -> None:
+    initial_capital = float(group.get("starting_balance") or strategy.get("metrics", {}).get("initial_capital") or 100)
+    transactions = _rebalance_paper_transactions(
+        store, user_id, group["id"], strategy["id"], initial_capital
+    )
+    metrics, equity_curve = _paper_run_metrics(transactions, initial_capital)
+    contract_count = len({item.get("saved_record_id") or item.get("event_id") for item in transactions})
+    store.update_user_record(
+        user_id,
+        "strategies",
+        strategy["id"],
+        {"metrics": metrics, "equity_curve": equity_curve},
+    )
+    store.update_user_record(
+        user_id,
+        "groups",
+        group["id"],
+        {
+            "event_count": contract_count,
+            "contracts_total": contract_count,
+            "contracts_available": contract_count,
+            "contracts_missing": 0,
+            "strategy_count": 1,
+            "summary": {
+                "best_roi": metrics["roi"],
+                "average_roi": metrics["roi"],
+                "profitable_strategies": int(metrics["roi"] > 0),
+            },
+            "coverage": {
+                (group.get("assets") or ["LIVE"])[0]: {
+                    "event_count": contract_count,
+                    "expected_event_count": contract_count,
+                    "missing_event_count": 0,
+                    "coverage_percent": 100.0,
+                    "missing_ranges": [],
+                }
+            },
+        },
+    )
+
+
+def _paper_run_for_source(
+    store: FileStore,
+    user_id: str,
+    source_group_id: str,
+    source_strategy_id: str,
+    run_group_id: str | None = None,
+) -> list[tuple[dict, dict]]:
+    groups = [
+        group for group in store.list_user_records(user_id, "groups")
+        if group.get("source") == "paper_trading_live"
+        and group.get("paper_trading", {}).get("source_group_id") == source_group_id
+        and group.get("paper_trading", {}).get("source_strategy_id") == source_strategy_id
+        and (run_group_id is None or group.get("id") == run_group_id)
+    ]
+    result = []
+    for group in groups:
+        strategies = store.list_user_records_filtered_limited(
+            user_id, "strategies", {"group_id": group["id"]}, 1
+        )
+        if strategies:
+            result.append((group, strategies[0]))
+    return result
+
+
+def _paper_visible_runs_for_source(
+    request: Request,
+    store: FileStore,
+    user_id: str,
+    source_group_id: str,
+    source_strategy_id: str,
+) -> list[tuple[dict, dict]]:
+    runs = _paper_run_for_source(store, user_id, source_group_id, source_strategy_id)
+    active = []
+    for group, strategy in runs:
+        session_id = str(group.get("paper_trading", {}).get("session_id") or "")
+        session = request.app.state.live_monitor.get(session_id)
+        if session and session.user_id == user_id and not session.is_finished:
+            active.append((group, strategy))
+    if active:
+        return active
+    if not runs:
+        return []
+    return [
+        max(
+            runs,
+            key=lambda pair: str(
+                pair[0].get("paper_trading", {}).get("started_at")
+                or pair[0].get("created_at")
+                or ""
+            ),
+        )
+    ]
+
+
+def _create_paper_run_group(
+    store: FileStore,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    session_id: str,
+    initial_event: object | None = None,
+    starting_balance: float | None = None,
+) -> tuple[dict, dict]:
+    now = utc_iso()
+    group_id = uuid.uuid4().hex
+    strategy_id = uuid.uuid4().hex
+    asset = str((source_group.get("assets") or ["LIVE"])[0])
+    timeframe = str(source_group.get("timeframe") or "live")
+    starting_balance = float(
+        starting_balance
+        if starting_balance is not None
+        else (
+            source_group.get("starting_balance")
+            or source_strategy.get("metrics", {}).get("initial_capital")
+            or 100
+        )
+    )
+    metrics, equity_curve = _paper_run_metrics([], starting_balance)
+    group = {
+        "id": group_id,
+        "name": f"Paper trading: {source_strategy.get('name', 'Strategy')} {now[:19]}",
+        "theme": "paper_trading_live",
+        "source": "paper_trading_live",
+        "strategy_mode": "paper",
+        "assets": [asset],
+        "asset_labels": source_group.get("asset_labels") or [asset],
+        "timeframe": timeframe,
+        "timeframe_label": source_group.get("timeframe_label") or timeframe,
+        "period": {
+            "start_date": now[:10],
+            "end_date": now[:10],
+            "start_time": now,
+            "end_time_exclusive": now,
+        },
+        "starting_balance": round(starting_balance, 4),
+        "strategy_count": 1,
+        "event_count": 0,
+        "contracts_total": 0,
+        "contracts_missing": 0,
+        "contracts_available": 0,
+        "coverage": {
+            asset: {
+                "event_count": 0,
+                "expected_event_count": 0,
+                "missing_event_count": 0,
+                "coverage_percent": 100.0,
+                "missing_ranges": [],
+            }
+        },
+        "summary": {"best_roi": 0.0, "average_roi": 0.0, "profitable_strategies": 0},
+        "paper_trading": {
+            "source_group_id": source_group["id"],
+            "source_strategy_id": source_strategy["id"],
+            "strategy_id": strategy_id,
+            "source_strategy_name": source_strategy.get("name"),
+            "session_id": session_id,
+            "initial_event_slug": getattr(initial_event, "slug", None),
+            "initial_window_start_ts": getattr(initial_event, "window_start_ts", None),
+            "deleted_saved_record_ids": [],
+            "started_at": now,
+            "status": "active",
+        },
+        "created_at": now,
+    }
+    strategy = {
+        "id": strategy_id,
+        "group_id": group_id,
+        "name": f"{source_strategy.get('name', 'Strategy')} paper run",
+        "theme": "paper_trading_live",
+        "family": source_strategy.get("family"),
+        "family_label": source_strategy.get("family_label"),
+        "description": source_strategy.get("description", ""),
+        "parameters": dict(source_strategy.get("parameters") or {}),
+        "favorite": False,
+        "metrics": metrics,
+        "equity_curve": equity_curve,
+        "paper_trading": {
+            "source_group_id": source_group["id"],
+            "source_strategy_id": source_strategy["id"],
+            "session_id": session_id,
+        },
+        "created_at": now,
+    }
+    store.save_group_bundle(user_id, group, [strategy], [])
+    return group, strategy
+
+
+def _paper_trade_contract_payload(request: Request, user_id: str, record: dict) -> dict:
+    saved_record_id = str(record.get("saved_record_id") or "").strip()
+    if saved_record_id:
+        contract = request.app.state.live_monitor.get_saved(user_id, saved_record_id) or {}
+    else:
+        contract = dict(record.get("contract_record") or {})
+    contract["history"] = _sample_series(contract.get("history") or [], limit=1600)
+    trades = []
+    stored_trades = request.app.state.store.list_user_records_filtered(
+        user_id, "transactions", {"paper_trade_id": record["id"]}
+    )
+    for trade in stored_trades:
+        trades.append(_paper_trade_marker_payload(trade))
+    return {
+        "record": {
+            **_paper_trade_list_record(record),
+            "history": contract.get("history") or [],
+            "summary": contract.get("summary") or {},
+            "partial_contract": contract.get("partial_contract", False),
+            "unsuitable_contract": contract.get("unsuitable_contract", False),
+            "partial_reason": contract.get("partial_reason"),
+            "unsuitable_reason": contract.get("unsuitable_reason"),
+            "connection_gap_periods": contract.get("connection_gap_periods") or [],
+            "polymarket_disconnect_count": contract.get("polymarket_disconnect_count", 0),
+            "polymarket_disconnected_seconds": contract.get("polymarket_disconnected_seconds", 0),
+            "crypto_disconnect_count": contract.get("crypto_disconnect_count", 0),
+            "crypto_disconnected_seconds": contract.get("crypto_disconnected_seconds", 0),
+            "trades": trades,
+        }
+    }
+
+
+def _paper_trade_marker_payload(trade: dict) -> dict:
+    side = str(trade.get("side") or "").upper()
+    entry_price = _number_or_none(trade.get("ask_price", trade.get("entry_price")))
+    exit_price = _number_or_none(trade.get("exit_bid_price", trade.get("exit_price")))
+    entry_price_cents = round(entry_price * 100, 4) if entry_price is not None else None
+    exit_price_cents = round(exit_price * 100, 4) if exit_price is not None else None
+    return {
+        **trade,
+        "side": side,
+        "entry_price_cents": entry_price_cents,
+        "entry_yes_axis_cents": (
+            round(100 - entry_price_cents, 4)
+            if side == "DOWN" and entry_price_cents is not None
+            else entry_price_cents
+        ),
+        "exit_price_cents": exit_price_cents,
+        "exit_yes_axis_cents": (
+            round(100 - exit_price_cents, 4)
+            if side == "DOWN" and exit_price_cents is not None
+            else exit_price_cents
+        ),
+    }
+
+
+def _paper_event_key(session_id: str, event_payload: dict) -> str:
+    window_start = _number_or_none(event_payload.get("window_start_ts"))
+    return ":".join(
+        str(part)
+        for part in (
+            session_id,
+            event_payload.get("slug") or event_payload.get("title") or "contract",
+            round(window_start, 3) if window_start is not None else "",
+        )
+    )
+
+
+def _paper_trade_id(paper_id: str, trade: dict) -> str:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        ":".join(
+            str(part)
+            for part in (
+                "paper-live-trade",
+                paper_id,
+                trade.get("opened_at") or "",
+                trade.get("side") or "",
+                trade.get("scale_entry_index") or 1,
+            )
+        ),
+    ).hex
+
+
+def _paper_strategy_spec(source_strategy: dict, run_strategy: dict | None = None) -> dict:
+    spec = dict((source_strategy or {}).get("parameters") or {})
+    if run_strategy:
+        spec.update(dict(run_strategy.get("parameters") or {}))
+    for key in (
+        "family",
+        "family_label",
+        "entry_second",
+        "quote_edge_cents",
+        "deviation_threshold_pct",
+        "allocation_pct",
+        "max_allocation_pct",
+        "fee_bps",
+        "exit_condition",
+        "price_source",
+        "min_seconds_left",
+        "max_seconds_left",
+        "confirmation_ticks",
+        "lookback_seconds",
+        "min_spread_cents",
+        "max_spread_cents",
+        "momentum_threshold_pct",
+        "target_distance_pct",
+        "direction",
+        "side",
+    ):
+        if key not in spec and (source_strategy or {}).get(key) is not None:
+            spec[key] = source_strategy[key]
+        if run_strategy and key not in spec and run_strategy.get(key) is not None:
+            spec[key] = run_strategy[key]
+    return spec
+
+
+def _paper_target_known_at_window_start(record: dict, history: list[dict] | None = None) -> bool:
+    window_start = _number_or_none(record.get("window_start_ts"))
+    if window_start is None:
+        return False
+    target_ts = (
+        _number_or_none(record.get("target_price_effective_ts"))
+        or _number_or_none(record.get("target_price_ts"))
+    )
+    if target_ts is None:
+        for row in history or record.get("history") or []:
+            if not isinstance(row, dict):
+                continue
+            row_target_ts = _number_or_none(row.get("target_price_ts"))
+            row_target = _number_or_none(row.get("target_price"))
+            if row_target_ts is not None and row_target is not None:
+                target_ts = row_target_ts
+                break
+    return target_ts is not None and abs(target_ts - window_start) <= 1e-6
+
+
+def _paper_record_from_snapshot(
+    run_group: dict,
+    run_strategy: dict,
+    source_group: dict,
+    source_strategy: dict,
+    session_id: str,
+    event_payload: dict,
+    history: list[dict],
+    trades: list[dict],
+) -> dict:
+    event_key = _paper_event_key(session_id, event_payload)
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{event_key}",
+    ).hex
+    now = utc_iso()
+    net_profit = round(sum(float(trade.get("pnl", 0) or 0) for trade in trades), 8)
+    initial_capital = float(
+        run_strategy.get("metrics", {}).get("final_capital")
+        or run_group.get("starting_balance")
+        or 100
+    )
+    final_capital = round(initial_capital + net_profit, 8)
+    return {
+        "id": paper_id,
+        "group_id": run_group["id"],
+        "strategy_id": run_strategy["id"],
+        "source_group_id": source_group["id"],
+        "source_strategy_id": source_strategy["id"],
+        "session_id": session_id,
+        "strategy_name": source_strategy.get("name") or run_strategy.get("name"),
+        "family": source_strategy.get("family") or run_strategy.get("family"),
+        "saved_record_id": None,
+        "live_event_key": event_key,
+        "question": event_payload.get("title"),
+        "event_title": event_payload.get("event_title") or event_payload.get("title"),
+        "crypto_symbol": (source_group.get("assets") or [""])[0],
+        "target_price": (history[0].get("target_price") if history else None),
+        "final_crypto_price": (history[-1].get("crypto_price") if history else None),
+        "winning_outcome": None,
+        "window_start_ts": event_payload.get("window_start_ts"),
+        "window_end_ts": event_payload.get("window_end_ts"),
+        "saved_at": now,
+        "created_at": now,
+        "paper_mode": True,
+        "trade_count": len(trades),
+        "net_profit": net_profit,
+        "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+        "initial_capital": initial_capital,
+        "final_capital": final_capital,
+        "history_count": len(history),
+    }
+
+
+def _persist_paper_live_trades(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session_id: str,
+    event_payload: dict,
+    history: list[dict],
+    trades: list[dict],
+) -> None:
+    if not trades:
+        return
+    store = _store(request)
+    event_key = _paper_event_key(session_id, event_payload)
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{event_key}",
+    ).hex
+    normalized = []
+    for trade in trades:
+        item = dict(trade)
+        item["id"] = str(item.get("id") or _paper_trade_id(paper_id, item))
+        item["paper_trade_id"] = paper_id
+        item["paper_mode"] = True
+        item["live_event_key"] = event_key
+        item["saved_record_id"] = None
+        normalized.append(item)
+    existing = store.get_user_record(user_id, "paper_trades", paper_id)
+    if not existing:
+        store.append_user_record(
+            user_id,
+            "paper_trades",
+            _paper_record_from_snapshot(
+                run_group,
+                run_strategy,
+                source_group,
+                source_strategy,
+                session_id,
+                event_payload,
+                history,
+                normalized,
+            ),
+        )
+    changed = False
+    for item in normalized:
+        transaction = store.get_user_record(user_id, "transactions", item["id"])
+        changes = {
+            key: value
+            for key, value in {
+                **item,
+                "group_id": run_group["id"],
+                "strategy_id": run_strategy["id"],
+                "paper_trade_id": paper_id,
+                "paper_mode": True,
+            }.items()
+            if key not in {"id", "group_id", "strategy_id", "created_at"}
+        }
+        if transaction:
+            if any(transaction.get(key) != value for key, value in changes.items()):
+                store.update_user_record(user_id, "transactions", item["id"], changes)
+                changed = True
+        else:
+            store.append_user_record(
+                user_id,
+                "transactions",
+                {
+                    "id": item["id"],
+                    "group_id": run_group["id"],
+                    "strategy_id": run_strategy["id"],
+                    "paper_trade_id": paper_id,
+                    "paper_mode": True,
+                    **item,
+                },
+            )
+            changed = True
+    if changed or not existing:
+        transactions = store.list_user_records_filtered(
+            user_id, "transactions", {"paper_trade_id": paper_id}
+        )
+        initial_capital = float((existing or {}).get("initial_capital") or run_group.get("starting_balance") or 100)
+        net_profit = round(sum(float(trade.get("pnl", 0) or 0) for trade in transactions), 8)
+        final_capital = round(initial_capital + net_profit, 8)
+        store.update_user_record(
+            user_id,
+            "paper_trades",
+            paper_id,
+            {
+                "trade_count": len(transactions),
+                "net_profit": net_profit,
+                "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+                "final_capital": final_capital,
+                "final_crypto_price": (history[-1].get("crypto_price") if history else None),
+                "history_count": len(history),
+            },
+        )
+        refreshed_group = store.get_user_record(user_id, "groups", run_group["id"]) or run_group
+        refreshed_strategy = store.get_user_record(user_id, "strategies", run_strategy["id"]) or run_strategy
+        _refresh_paper_run_summary(store, user_id, refreshed_group, refreshed_strategy)
+
+
+def _finalize_paper_live_contract(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    saved_preview: dict | None,
+) -> None:
+    if not saved_preview:
+        return
+    session_id = str(run_group.get("paper_trading", {}).get("session_id") or "").strip()
+    saved_record_id = str(saved_preview.get("id") or "").strip()
+    if not session_id or not saved_record_id:
+        return
+    saved_window_start = _number_or_none(saved_preview.get("window_start_ts"))
+    initial_window_start = _number_or_none(
+        (run_group.get("paper_trading") or {}).get("initial_window_start_ts")
+    )
+    if (
+        saved_window_start is not None
+        and initial_window_start is not None
+        and abs(saved_window_start - initial_window_start) <= 1e-6
+    ):
+        return
+    event_payload = {
+        "slug": saved_preview.get("slug"),
+        "title": saved_preview.get("question") or saved_preview.get("event_title"),
+        "window_start_ts": saved_preview.get("window_start_ts"),
+        "window_end_ts": saved_preview.get("window_end_ts"),
+    }
+    event_key = _paper_event_key(session_id, event_payload)
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{event_key}",
+    ).hex
+    store = _store(request)
+    existing = store.get_user_record(user_id, "paper_trades", paper_id)
+    saved = request.app.state.live_monitor.get_saved(user_id, saved_record_id)
+    if not saved:
+        return
+    if not _paper_target_known_at_window_start(saved):
+        return
+    asset = str((source_group.get("assets") or [""])[0]).upper()
+    timeframe = str(source_group.get("timeframe") or "")
+    generator = LiveMonitorStrategyGenerator(store, request.app.state.live_monitor)
+    event = generator._record_to_event(saved, asset, timeframe)
+    if not event:
+        return
+    result = generator._run(
+        [event],
+        _paper_strategy_spec(source_strategy, run_strategy),
+        float((existing or {}).get("initial_capital") or run_group.get("starting_balance") or 100),
+    )
+    generated = []
+    for trade in result.get("transactions") or []:
+        item = _paper_trade_marker_payload(trade)
+        item["id"] = _paper_trade_id(paper_id, item)
+        item["paper_trade_id"] = paper_id
+        item["paper_mode"] = True
+        item["live_event_key"] = event_key
+        item["saved_record_id"] = saved_record_id
+        item["preview"] = False
+        item["status"] = "closed"
+        generated.append(item)
+    if not generated:
+        return
+    if existing:
+        existing_transactions = store.list_user_records_filtered(
+            user_id, "transactions", {"paper_trade_id": paper_id}
+        )
+        existing_ids = {str(trade.get("id")) for trade in existing_transactions}
+        finalized = [trade for trade in generated if str(trade.get("id")) in existing_ids]
+    else:
+        finalized = generated
+    if not finalized:
+        return
+    net_profit = round(sum(float(trade.get("pnl", 0) or 0) for trade in finalized), 8)
+    initial_capital = float((existing or {}).get("initial_capital") or run_group.get("starting_balance") or 100)
+    final_capital = round(initial_capital + net_profit, 8)
+    changes = {
+        "saved_record_id": saved_record_id,
+        "winning_outcome": saved.get("winning_outcome"),
+        "final_crypto_price": saved.get("final_crypto_price"),
+        "history_count": len(saved.get("history") or []),
+        "trade_count": len(finalized),
+        "net_profit": net_profit,
+        "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+        "final_capital": final_capital,
+    }
+    if existing:
+        store.update_user_record(user_id, "paper_trades", paper_id, changes)
+    else:
+        record = _paper_record_from_snapshot(
+            run_group,
+            run_strategy,
+            source_group,
+            source_strategy,
+            session_id,
+            event_payload,
+            saved.get("history") or [],
+            finalized,
+        )
+        record.update(changes)
+        store.append_user_record(user_id, "paper_trades", record)
+    for item in finalized:
+        transaction = store.get_user_record(user_id, "transactions", item["id"])
+        changes = {
+            key: value
+            for key, value in {
+                **item,
+                "paper_trade_id": paper_id,
+                "paper_mode": True,
+            }.items()
+            if key not in {"id", "group_id", "strategy_id", "created_at"}
+        }
+        if transaction:
+            store.update_user_record(user_id, "transactions", item["id"], changes)
+        else:
+            store.append_user_record(
+                user_id,
+                "transactions",
+                {
+                    "id": item["id"],
+                    "group_id": run_group["id"],
+                    "strategy_id": run_strategy["id"],
+                    "paper_trade_id": paper_id,
+                    "paper_mode": True,
+                    **item,
+                },
+            )
+    refreshed_group = store.get_user_record(user_id, "groups", run_group["id"]) or run_group
+    refreshed_strategy = store.get_user_record(user_id, "strategies", run_strategy["id"]) or run_strategy
+    _refresh_paper_run_summary(store, user_id, refreshed_group, refreshed_strategy)
+
+
+def _paper_first_session_contract_id(
+    request: Request,
+    user_id: str,
+    session_id: str,
+    asset: str,
+    timeframe: str,
+) -> str | None:
+    generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
+    previews = [
+        record for record in request.app.state.live_monitor.list_saved_previews(
+            user_id, category=asset.lower()
+        )
+        if str(record.get("session_id") or "") == session_id
+        and generator._record_timeframe(record) == timeframe
+    ]
+    previews.sort(
+        key=lambda item: (
+            _number_or_none(item.get("window_start_ts")) or math.inf,
+            str(item.get("saved_at") or ""),
+        )
+    )
+    return str(previews[0].get("id") or "") if previews else None
+
+
+def _paper_live_trade_preview(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    snapshot: dict,
+    *,
+    persist: bool = False,
+) -> dict:
+    store = _store(request)
+    run_group = store.get_user_record(user_id, "groups", run_group["id"]) or run_group
+    run_strategy = store.get_user_record(user_id, "strategies", run_strategy["id"]) or run_strategy
+    asset = str((source_group.get("assets") or [""])[0]).upper()
+    timeframe = str(source_group.get("timeframe") or "")
+    session_id = str(run_group.get("paper_trading", {}).get("session_id") or "").strip()
+    paper_meta = run_group.get("paper_trading") or {}
+    event_payload = snapshot.get("event") or {}
+    window_start = _number_or_none(event_payload.get("window_start_ts"))
+    window_end = _number_or_none(event_payload.get("window_end_ts"))
+    history = [
+        row for row in snapshot.get("history") or []
+        if isinstance(row, dict) and _number_or_none(row.get("t")) is not None
+    ]
+    history.sort(key=lambda row: float(row["t"]))
+    initial_window_start = _number_or_none(paper_meta.get("initial_window_start_ts"))
+    if (
+        initial_window_start is not None
+        and window_start is not None
+        and abs(initial_window_start - window_start) <= 1e-6
+    ):
+        return {
+            "paper_trades": [],
+            "paper_trade_status": {
+                "status": "skipping_first_contract",
+                "message": "Paper trading waits for the next contract after initial connection.",
+            },
+        }
+    if initial_window_start is None:
+        completed_first_id = _paper_first_session_contract_id(
+            request, user_id, session_id, asset, timeframe
+        )
+        if not completed_first_id:
+            return {
+                "paper_trades": [],
+                "paper_trade_status": {
+                    "status": "skipping_first_contract",
+                    "message": "Paper trading waits for the next contract after initial connection.",
+                },
+            }
+    if not asset or not timeframe or window_start is None or window_end is None or not history:
+        return {"paper_trades": [], "paper_trade_status": {"status": "waiting"}}
+    if not _paper_target_known_at_window_start(event_payload, history):
+        return {
+            "paper_trades": [],
+            "paper_trade_status": {
+                "status": "waiting_for_target",
+                "message": "Skipping this contract because target price was not known at window start.",
+            },
+        }
+    generator = LiveMonitorStrategyGenerator(store, request.app.state.live_monitor)
+    current_cash = float(
+        run_strategy.get("metrics", {}).get("final_capital")
+        or run_group.get("starting_balance")
+        or source_strategy.get("metrics", {}).get("final_capital")
+        or 100
+    )
+    event = {
+        "id": str(event_payload.get("slug") or event_payload.get("title") or session_id),
+        "market_id": str(event_payload.get("slug") or session_id),
+        "question": str(event_payload.get("title") or "Live paper contract"),
+        "asset": asset,
+        "timeframe": timeframe,
+        "start_ts": window_start,
+        "end_ts": window_end,
+        "start_time": datetime.fromtimestamp(window_start, timezone.utc).isoformat(),
+        "expiration_time": datetime.fromtimestamp(window_end, timezone.utc).isoformat(),
+        "history": history,
+        "resolved_outcome": "flat",
+        "partial_contract": True,
+        "saved_record_id": None,
+        "slug": event_payload.get("slug"),
+    }
+    try:
+        result = generator._run(
+            [event],
+            _paper_strategy_spec(source_strategy, run_strategy),
+            current_cash,
+        )
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
+        return {
+            "paper_trades": [],
+            "paper_trade_status": {"status": "error", "message": _error_message(error)},
+        }
+    last_history_ts = _number_or_none(history[-1].get("t")) if history else None
+    trades = []
+    for trade in result.get("transactions") or []:
+        opened_ts = _timestamp_from_iso(trade.get("opened_at"))
+        closed_ts = _timestamp_from_iso(trade.get("closed_at"))
+        if last_history_ts is not None and opened_ts is not None and opened_ts > last_history_ts + 1e-6:
+            continue
+        marker = _paper_trade_marker_payload(trade)
+        is_live_exit = (
+            str(trade.get("exit_type") or "") != "settlement"
+            and closed_ts is not None
+            and (last_history_ts is None or closed_ts <= last_history_ts + 1e-6)
+        )
+        if not is_live_exit:
+            marker["closed_at"] = None
+            marker["exit_price"] = None
+            marker["exit_price_cents"] = None
+            marker["exit_yes_axis_cents"] = None
+            marker["exit_type"] = "open"
+            marker["settlement_value"] = 0
+            marker["pnl"] = 0
+            marker["analysis_history_count"] = marker.get("entry_history_count")
+            marker["available_cash_after_close"] = marker.get("available_cash_after_entry")
+            marker["balance_after"] = marker.get("balance_before")
+        marker["preview"] = True
+        marker["status"] = "closed" if is_live_exit else "open"
+        trades.append(marker)
+    if persist:
+        _persist_paper_live_trades(
+            request,
+            user_id,
+            source_group,
+            source_strategy,
+            run_group,
+            run_strategy,
+            session_id,
+            event_payload,
+            history,
+            trades,
+        )
+    return {
+        "paper_trades": trades,
+        "paper_trade_status": {
+            "status": "active" if trades else "watching",
+            "message": (
+                f"{len(trades)} live paper marker(s)"
+                if trades
+                else "Waiting for this strategy's entry conditions."
+            ),
+        },
+    }
+
+
+def _timestamp_from_iso(value) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _paper_session_payload(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session,
+) -> dict:
+    payload = _live_monitor_session_payload(session, history_limit=None)
+    payload["events_url"] = (
+        f"/api/paper-trading/{source_group['id']}/strategies/"
+        f"{source_strategy['id']}/sessions/{session.id}/events"
+    )
+    payload["paper_mode"] = True
+    payload["source_group_id"] = source_group["id"]
+    payload["source_strategy_id"] = source_strategy["id"]
+    payload["group_id"] = run_group["id"]
+    payload["strategy_id"] = run_strategy["id"]
+    payload["run_group_id"] = run_group["id"]
+    payload["run_strategy_id"] = run_strategy["id"]
+    payload["run_url"] = f"/groups/{run_group['id']}/strategies/{run_strategy['id']}"
+    payload["snapshot"].update(
+        _paper_existing_trade_preview(request, user_id, run_group, payload["snapshot"])
+    )
+    return payload
+
+
+def _paper_existing_trade_preview(
+    request: Request,
+    user_id: str,
+    run_group: dict,
+    snapshot: dict,
+) -> dict:
+    session_id = str(run_group.get("paper_trading", {}).get("session_id") or "").strip()
+    event_payload = snapshot.get("event") or {}
+    if not session_id or not event_payload:
+        return {"paper_trades": [], "paper_trade_status": {"status": "watching"}}
+    strategy_id = str((run_group.get("paper_trading") or {}).get("strategy_id") or "")
+    if not strategy_id:
+        strategies = _store(request).list_user_records_filtered(
+            user_id, "strategies", {"group_id": run_group["id"]}
+        )
+        strategy_id = str(strategies[0].get("id") or "") if strategies else ""
+    if not strategy_id:
+        return {"paper_trades": [], "paper_trade_status": {"status": "watching"}}
+    event_key = _paper_event_key(session_id, event_payload)
+    if strategy_id:
+        paper_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"paper-live:{strategy_id}:{event_key}",
+        ).hex
+    trades = [
+        _paper_trade_marker_payload(trade)
+        for trade in _store(request).list_user_records_filtered(
+            user_id, "transactions", {"paper_trade_id": paper_id}
+        )
+    ]
+    return {
+        "paper_trades": trades,
+        "paper_trade_status": {
+            "status": "active" if trades else "watching",
+            "message": (
+                f"{len(trades)} recorded paper marker(s)"
+                if trades
+                else "Waiting for this strategy's entry conditions."
+            ),
+        },
+    }
+
+
+def _paper_visual_preview_key(session_id: str, run_strategy: dict, snapshot: dict) -> str:
+    return ":".join([
+        session_id,
+        str(run_strategy.get("id") or ""),
+        _paper_event_key(session_id, snapshot.get("event") or {}),
+    ])
+
+
+def _paper_cached_visual_preview(cache_key: str) -> dict | None:
+    with _PAPER_VISUAL_PREVIEW_LOCK:
+        entry = _PAPER_VISUAL_PREVIEWS.get(cache_key)
+        payload = dict(entry.get("payload") or {}) if entry else None
+    return payload or None
+
+
+def _paper_preview_running(cache_key: str, now: float, min_interval: float = 0.75) -> bool:
+    with _PAPER_VISUAL_PREVIEW_LOCK:
+        entry = _PAPER_VISUAL_PREVIEWS.setdefault(cache_key, {})
+        if entry.get("running"):
+            return True
+        if now - float(entry.get("started_at") or 0) < min_interval:
+            return True
+        entry["running"] = True
+        entry["started_at"] = now
+        return False
+
+
+def _store_paper_visual_preview(cache_key: str, payload: dict | None, error: Exception | None = None) -> None:
+    with _PAPER_VISUAL_PREVIEW_LOCK:
+        entry = _PAPER_VISUAL_PREVIEWS.setdefault(cache_key, {})
+        entry["running"] = False
+        entry["updated_at"] = time.time()
+        if payload is not None:
+            entry["payload"] = payload
+        if error is not None:
+            entry["payload"] = {
+                "paper_trades": [],
+                "paper_trade_status": {"status": "error", "message": _error_message(error)},
+            }
+
+
+def _paper_deleted_saved_record_ids(group: dict) -> set[str]:
+    values = (group.get("paper_trading") or {}).get("deleted_saved_record_ids") or []
+    return {str(value) for value in values if str(value or "").strip()}
+
+
+def _mark_paper_saved_record_deleted(
+    store: FileStore,
+    user_id: str,
+    group: dict,
+    saved_record_id: str | None,
+) -> None:
+    record_id = str(saved_record_id or "").strip()
+    if not record_id:
+        return
+    paper_meta = dict(group.get("paper_trading") or {})
+    deleted = sorted(_paper_deleted_saved_record_ids(group) | {record_id})
+    paper_meta["deleted_saved_record_ids"] = deleted
+    store.update_user_record(user_id, "groups", group["id"], {"paper_trading": paper_meta})
+    group["paper_trading"] = paper_meta
+
+
+@router.get("/groups/{group_id}/strategies/{strategy_id}/paper-trading", response_class=HTMLResponse)
+def paper_trading_page(request: Request, group_id: str, strategy_id: str):
+    _user, _store_obj, group, strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    return templates.TemplateResponse(
+        request,
+        "paper_trading.html",
+        _context(request, group=group, strategy=strategy),
+    )
+
+
+@router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/monitors")
+async def start_paper_trading_monitor(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    event_url: Annotated[str, Form()],
+    starting_balance: Annotated[float, Form()] = 100.0,
+):
+    user, _store_obj, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    try:
+        if not math.isfinite(starting_balance) or starting_balance <= 0:
+            raise ValueError("Starting balance must be greater than zero")
+        session = await request.app.state.live_monitor.start(user["id"], event_url)
+    except (httpx.HTTPError, ValueError, OSError) as error:
+        raise HTTPException(422, _error_message(error)) from error
+    run_group, run_strategy = _create_paper_run_group(
+        _store(request),
+        user["id"],
+        _group,
+        _strategy,
+        session.id,
+        session.event,
+        starting_balance,
+    )
+    payload = _paper_session_payload(
+        request, user["id"], _group, _strategy, run_group, run_strategy, session
+    )
+    return JSONResponse(payload, status_code=202)
+
+
+@router.get("/api/paper-trading/{group_id}/strategies/{strategy_id}/active")
+def active_paper_trading_monitor(request: Request, group_id: str, strategy_id: str):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    payloads = []
+    for run_group, run_strategy in _paper_run_for_source(
+        store, user["id"], group_id, strategy_id
+    ):
+        session_id = str(run_group.get("paper_trading", {}).get("session_id") or "")
+        session = request.app.state.live_monitor.get(session_id)
+        if not session or session.user_id != user["id"] or session.is_finished:
+            continue
+        payload = _paper_session_payload(
+            request, user["id"], _group, _strategy, run_group, run_strategy, session
+        )
+        payloads.append(payload)
+    if not payloads:
+        return {"active": False, "sessions": []}
+    return {"active": True, "sessions": payloads, **payloads[0]}
+
+
+@router.get("/api/paper-trading/{group_id}/strategies/{strategy_id}/sessions/{session_id}/events")
+async def paper_trading_monitor_events(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    session_id: str,
+):
+    user, store, source_group, source_strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    session = request.app.state.live_monitor.get(session_id)
+    if not session or session.user_id != user["id"]:
+        raise HTTPException(404, "Paper trading live session not found")
+    runs = _paper_run_for_source(store, user["id"], group_id, strategy_id)
+    run_pair = next(
+        (
+            (run_group, run_strategy)
+            for run_group, run_strategy in runs
+            if str(run_group.get("paper_trading", {}).get("session_id") or "") == session_id
+        ),
+        None,
+    )
+    if run_pair is None:
+        raise HTTPException(404, "Paper trading run not found for this session")
+    run_group, run_strategy = run_pair
+    queue = session.add_subscriber()
+
+    async def stream():
+        try:
+            yield "retry: 1000\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=2)
+                except asyncio.TimeoutError:
+                    yield (
+                        "event: ping\n"
+                        f"data: {json.dumps({'server_time': time.time()})}\n\n"
+                    )
+                    continue
+                event_name = message["event"]
+                if event_name == "saved":
+                    saved_record_preview = (message.get("data") or {}).get("record")
+
+                    async def finalize_saved_contract(saved_preview=saved_record_preview) -> None:
+                        try:
+                            await asyncio.to_thread(
+                                _finalize_paper_live_contract,
+                                request,
+                                user["id"],
+                                source_group,
+                                source_strategy,
+                                run_group,
+                                run_strategy,
+                                saved_preview,
+                            )
+                        except Exception:
+                            logger.exception("Paper trading contract finalization failed")
+
+                    asyncio.create_task(finalize_saved_contract())
+                snapshot = session.snapshot(history_limit=None)
+                cache_key = _paper_visual_preview_key(session_id, run_strategy, snapshot)
+                paper_payload = (
+                    _paper_cached_visual_preview(cache_key)
+                    or _paper_existing_trade_preview(request, user["id"], run_group, snapshot)
+                )
+                if not _paper_preview_running(cache_key, time.time()):
+                    preview_snapshot = dict(snapshot)
+                    preview_snapshot["history"] = list(snapshot.get("history") or [])
+
+                    async def refresh_visual_preview(
+                        key=cache_key,
+                        current_snapshot=preview_snapshot,
+                    ) -> None:
+                        try:
+                            payload = await asyncio.to_thread(
+                                _paper_live_trade_preview,
+                                request,
+                                user["id"],
+                                source_group,
+                                source_strategy,
+                                run_group,
+                                run_strategy,
+                                current_snapshot,
+                                persist=False,
+                            )
+                            _store_paper_visual_preview(key, payload)
+                        except Exception as error:
+                            logger.exception("Paper trading visual preview failed")
+                            _store_paper_visual_preview(key, None, error)
+
+                    asyncio.create_task(refresh_visual_preview())
+                snapshot.update(paper_payload)
+                yield (
+                    f"event: {event_name}\n"
+                    f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                )
+        finally:
+            session.remove_subscriber(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/sync")
+def sync_paper_trading_contracts(request: Request, group_id: str, strategy_id: str):
+    _user, _store_obj, _source_group, _source_strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    return {
+        "created": 0,
+        "skipped": 0,
+        "no_trade": 0,
+        "skipped_first_contract": 0,
+        "total": 0,
+        "run_count": 0,
+        "disabled": True,
+        "message": "Paper trades are recorded live by the listener; sync does not generate trades.",
+    }
+
+
+@router.get("/api/paper-trading/{group_id}/strategies/{strategy_id}/contracts")
+def paper_trading_contracts(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    visible_runs = _paper_visible_runs_for_source(
+        request, store, user["id"], group_id, strategy_id
+    )
+    run_group_ids = {group["id"] for group, _strategy in visible_runs}
+    all_rows = [] if not run_group_ids else [
+        row for row in store.list_user_records(user["id"], "paper_trades")
+        if row.get("source_group_id") == group_id
+        and row.get("source_strategy_id") == strategy_id
+        and row.get("group_id") in run_group_ids
+    ]
+    all_rows.sort(key=lambda item: str(item.get("saved_at") or item.get("created_at") or ""), reverse=True)
+    total = len(all_rows)
+    total_pages = max(1, math.ceil(total / page_size))
+    current_page = min(page, total_pages)
+    start = (current_page - 1) * page_size
+    rows = all_rows[start:start + page_size]
+    return {
+        "records": [_paper_trade_list_record(row) for row in rows],
+        "page": current_page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "has_previous": current_page > 1,
+        "has_next": current_page < total_pages,
+        "categories": [],
+    }
+
+
+@router.get("/api/paper-trading/{group_id}/strategies/{strategy_id}/contracts/{paper_id}")
+def paper_trading_contract_detail(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    paper_id: str,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    record = store.get_user_record(user["id"], "paper_trades", paper_id)
+    if (
+        not record
+        or record.get("source_group_id") != group_id
+        or record.get("source_strategy_id") != strategy_id
+    ):
+        raise HTTPException(404, "Paper-traded contract not found")
+    return _paper_trade_contract_payload(request, user["id"], record)
+
+
+@router.delete("/api/paper-trading/{group_id}/strategies/{strategy_id}/contracts/{paper_id}")
+def delete_paper_trading_contract(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    paper_id: str,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    record = store.get_user_record(user["id"], "paper_trades", paper_id)
+    if (
+        not record
+        or record.get("source_group_id") != group_id
+        or record.get("source_strategy_id") != strategy_id
+    ):
+        raise HTTPException(404, "Paper-traded contract not found")
+    deleted = store.delete_user_record(user["id"], "paper_trades", paper_id)
+    removed_transactions = store.delete_user_records_filtered(
+        user["id"], "transactions", {"paper_trade_id": paper_id}
+    )
+    run_group = store.get_user_record(user["id"], "groups", record["group_id"])
+    if run_group:
+        _mark_paper_saved_record_deleted(
+            store, user["id"], run_group, record.get("saved_record_id")
+        )
+    return {"deleted": deleted, "removed_transactions": removed_transactions}
+
+
+@router.delete("/api/paper-trading/{group_id}/strategies/{strategy_id}/contracts/{paper_id}/trades/{trade_id}")
+def delete_paper_trading_trade(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    paper_id: str,
+    trade_id: str,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    record = store.get_user_record(user["id"], "paper_trades", paper_id)
+    if (
+        not record
+        or record.get("source_group_id") != group_id
+        or record.get("source_strategy_id") != strategy_id
+    ):
+        raise HTTPException(404, "Paper-traded contract not found")
+    trade = store.get_user_record(user["id"], "transactions", trade_id)
+    if (
+        not trade
+        or trade.get("paper_trade_id") != paper_id
+        or trade.get("group_id") != record.get("group_id")
+        or trade.get("strategy_id") != record.get("strategy_id")
+    ):
+        raise HTTPException(404, "Paper trade not found")
+    removed_transactions = 1 if store.delete_user_record(user["id"], "transactions", trade_id) else 0
+    remaining_trades = (
+        []
+        if int(record.get("trade_count", 0) or 0) <= 1
+        else store.list_user_records_filtered(
+            user["id"], "transactions", {"paper_trade_id": paper_id}
+        )
+    )
+    if remaining_trades:
+        initial_capital = float(record.get("initial_capital") or 100)
+        net_profit = round(sum(float(item.get("pnl", 0) or 0) for item in remaining_trades), 8)
+        final_capital = round(initial_capital + net_profit, 8)
+        store.update_user_record(
+            user["id"],
+            "paper_trades",
+            paper_id,
+            {
+                "trade_count": len(remaining_trades),
+                "net_profit": net_profit,
+                "final_capital": final_capital,
+                "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+            },
+        )
+        deleted_contract = False
+    else:
+        store.delete_user_record(user["id"], "paper_trades", paper_id)
+        run_group_for_delete = store.get_user_record(user["id"], "groups", record["group_id"])
+        if run_group_for_delete:
+            _mark_paper_saved_record_deleted(
+                store, user["id"], run_group_for_delete, record.get("saved_record_id")
+            )
+        deleted_contract = True
+    return {
+        "deleted": True,
+        "deleted_contract": deleted_contract,
+        "removed_transactions": removed_transactions,
+    }
 
 
 @router.post("/groups")
@@ -1676,6 +3423,7 @@ async def _run_live_monitor_analysis_job(
     end_ts: float | None,
     strategy_mode: str,
     phase_contract_counts: tuple[int, int, int] | None = None,
+    strategy_families: tuple[str, ...] | None = None,
 ) -> None:
     def ensure_not_cancelled() -> None:
         current = app.state.job_store.get(job_id)
@@ -1728,6 +3476,13 @@ async def _run_live_monitor_analysis_job(
             report,
             ensure_not_cancelled,
             phase_contract_counts,
+            strategy_families,
+        )
+        await asyncio.to_thread(
+            _record_smart_family_report_snapshot,
+            app.state.store,
+            user_id,
+            group,
         )
         report({
             "stage": "complete",
@@ -1997,21 +3752,11 @@ def strategy_detail(
         ).days + 1
     except (KeyError, TypeError, ValueError):
         period_days = None
-    live_retest_summary = None
-    if group.get("source") == "live_monitor_saved_contracts":
-        try:
-            live_retest_summary = LiveMonitorStrategyGenerator(
-                store, request.app.state.live_monitor
-            ).saved_contract_summary(
-                user["id"],
-                group["assets"][0],
-                group["timeframe"],
-                bool(group.get("include_partial_contracts", False)),
-                parse_utc_datetime(group["period"]["start_time"]).timestamp(),
-                parse_utc_datetime(group["period"]["end_time_exclusive"]).timestamp(),
-            )
-        except (KeyError, TypeError, ValueError):
-            live_retest_summary = None
+    live_retest_summary = (
+        _live_retest_summary_from_group(group)
+        if group.get("source") == "live_monitor_saved_contracts"
+        else None
+    )
     return templates.TemplateResponse(
         request,
         "file_strategy_detail.html",
@@ -2028,6 +3773,36 @@ def strategy_detail(
             live_retest_summary=live_retest_summary,
         ),
     )
+
+
+@router.get("/api/groups/{group_id}/strategies/{strategy_id}/live-retest/summary")
+def live_retest_summary(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+):
+    user = _require_user(request)
+    store = _store(request)
+    group = store.get_user_record(user["id"], "groups", group_id)
+    strategy = store.get_user_record(user["id"], "strategies", strategy_id)
+    if not group or not strategy or strategy.get("group_id") != group_id:
+        raise HTTPException(404, "Strategy not found")
+    if group.get("source") != "live_monitor_saved_contracts":
+        raise HTTPException(404, "Live retest is available only for live-monitor groups")
+    try:
+        summary = LiveMonitorStrategyGenerator(
+            store,
+            request.app.state.live_monitor,
+        ).saved_contract_summary(
+            user["id"],
+            group["assets"][0],
+            group["timeframe"],
+            bool(group.get("include_partial_contracts", False)),
+            include_contracts=True,
+        )
+    except (IndexError, KeyError, ValueError) as error:
+        raise HTTPException(422, _error_message(error)) from error
+    return {"summary": summary}
 
 
 @router.get("/api/groups/{group_id}/strategies/{strategy_id}/trades/{transaction_id}/contract-chart")
@@ -2053,13 +3828,33 @@ def strategy_trade_contract_chart(
         or strategy.get("group_id") != group_id
         or transaction.get("group_id") != group_id
         or transaction.get("strategy_id") != strategy_id
-        or group.get("source") != "live_monitor_saved_contracts"
+        or group.get("source") not in {"live_monitor_saved_contracts", "paper_trading_live"}
     ):
         raise HTTPException(404, "Trade contract chart not found")
-    saved_record_id = str(transaction.get("saved_record_id") or "").strip()
-    if not saved_record_id:
-        raise HTTPException(404, "This trade is not linked to a saved live contract")
-    record = request.app.state.live_monitor.get_saved(user["id"], saved_record_id)
+    if group.get("source") == "paper_trading_live":
+        paper_trade_id = str(transaction.get("paper_trade_id") or "").strip()
+        paper_record = (
+            store.get_user_record(user["id"], "paper_trades", paper_trade_id)
+            if paper_trade_id
+            else None
+        )
+        saved_record_id = str(
+            transaction.get("saved_record_id")
+            or (paper_record or {}).get("saved_record_id")
+            or ""
+        ).strip()
+        record = (
+            request.app.state.live_monitor.get_saved(user["id"], saved_record_id)
+            if saved_record_id
+            else None
+        )
+        if not record and paper_record:
+            record = dict(paper_record.get("contract_record") or {})
+    else:
+        saved_record_id = str(transaction.get("saved_record_id") or "").strip()
+        if not saved_record_id:
+            raise HTTPException(404, "This trade is not linked to a saved live contract")
+        record = request.app.state.live_monitor.get_saved(user["id"], saved_record_id)
     if not record:
         raise HTTPException(404, "Saved live contract not found")
     resolved_outcome = transaction.get("resolved_outcome")
