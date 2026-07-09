@@ -1084,6 +1084,9 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert paper_page.status_code == 200
         assert "Start trading" in paper_page.text
         assert "Starting balance" in paper_page.text
+        assert "<th>Entry $</th>" in paper_page.text
+        assert "<th>Balance</th>" in paper_page.text
+        assert 'id="paper-trades-delete-all"' in paper_page.text
         assert "Contracts with paper trades" in paper_page.text
         assert f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync" not in paper_page.text
         run_group, run_strategy = routes_module._create_paper_run_group(
@@ -1204,6 +1207,7 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         paper_payload = paper_detail.json()["record"]
         assert paper_payload["trades"]
         assert paper_payload["history"]
+        assert paper_payload["trades"][0]["balance_after"] == 795
         run_transactions = store.list_user_records_filtered(
             user["id"],
             "transactions",
@@ -1222,11 +1226,12 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert account.status_code == 200
         assert "Paper trading run groups" in account.text
         assert run_group["name"] in account.text
-        deleted_paper = client.delete(
-            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/contracts/{paper_record['id']}"
+        deleted_all_trades = client.delete(
+            f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/trades"
         )
-        assert deleted_paper.status_code == 200
-        assert deleted_paper.json()["removed_transactions"] >= 1
+        assert deleted_all_trades.status_code == 200
+        assert deleted_all_trades.json()["removed_transactions"] >= 1
+        assert deleted_all_trades.json()["removed_contracts"] >= 1
         synced_after_delete = client.post(
             f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync"
         )
@@ -1236,6 +1241,11 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert not store.list_user_records_filtered(
             user["id"],
             "transactions",
+            {"group_id": run_group["id"], "strategy_id": run_strategy["id"]},
+        )
+        assert not store.list_user_records_filtered(
+            user["id"],
+            "paper_trades",
             {"group_id": run_group["id"], "strategy_id": run_strategy["id"]},
         )
 

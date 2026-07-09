@@ -35,6 +35,7 @@
   data-saved-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts"
   data-saved-detail-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts/{id}"
   data-delete-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/contracts/{id}"
+  data-delete-all-trades-url="/api/paper-trading/{{ group.id }}/strategies/{{ strategy.id }}/trades"
   data-saved-mode="paper"
 >
   <form id="live-monitor-form" class="live-monitor-form">
@@ -64,6 +65,7 @@
     </div>
     <div class="live-saved-toolbar">
       <select id="live-saved-category" class="hidden"><option value="all">All contracts</option></select>
+      <button class="danger" id="paper-trades-delete-all" type="button">Delete all trades</button>
       <button class="secondary" id="live-saved-refresh" type="button">Refresh</button>
     </div>
   </div>
@@ -102,8 +104,8 @@
     </div>
     <div class="mt-4 overflow-x-auto">
       <table>
-        <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Volume</th><th>PnL</th><th>Opened</th><th>Closed</th><th></th></tr></thead>
-        <tbody id="paper-trade-rows"><tr><td colspan="8" class="empty">No paper trades loaded.</td></tr></tbody>
+        <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Volume</th><th>Entry $</th><th>PnL</th><th>Balance</th><th>Opened</th><th>Closed</th><th></th></tr></thead>
+        <tbody id="paper-trade-rows"><tr><td colspan="10" class="empty">No paper trades loaded.</td></tr></tbody>
       </table>
     </div>
   </div>

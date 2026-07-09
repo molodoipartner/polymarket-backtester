@@ -2123,6 +2123,33 @@ def _paper_trade_contract_payload(request: Request, user_id: str, record: dict) 
     }
 
 
+def _update_paper_trade_totals(
+    store: FileStore,
+    user_id: str,
+    paper_id: str,
+) -> None:
+    record = store.get_user_record(user_id, "paper_trades", paper_id)
+    if not record:
+        return
+    trades = store.list_user_records_filtered(
+        user_id, "transactions", {"paper_trade_id": paper_id}
+    )
+    initial_capital = float(record.get("initial_capital") or 100)
+    net_profit = round(sum(float(item.get("pnl", 0) or 0) for item in trades), 8)
+    final_capital = round(initial_capital + net_profit, 8)
+    store.update_user_record(
+        user_id,
+        "paper_trades",
+        paper_id,
+        {
+            "trade_count": len(trades),
+            "net_profit": net_profit,
+            "final_capital": final_capital,
+            "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
+        },
+    )
+
+
 def _paper_trade_marker_payload(trade: dict) -> dict:
     side = str(trade.get("side") or "").upper()
     entry_price = _number_or_none(trade.get("ask_price", trade.get("entry_price")))
@@ -2237,6 +2264,7 @@ def _paper_record_from_snapshot(
     event_payload: dict,
     history: list[dict],
     trades: list[dict],
+    initial_capital: float | None = None,
 ) -> dict:
     event_key = _paper_event_key(session_id, event_payload)
     paper_id = uuid.uuid5(
@@ -2246,9 +2274,13 @@ def _paper_record_from_snapshot(
     now = utc_iso()
     net_profit = round(sum(float(trade.get("pnl", 0) or 0) for trade in trades), 8)
     initial_capital = float(
-        run_strategy.get("metrics", {}).get("final_capital")
-        or run_group.get("starting_balance")
-        or 100
+        initial_capital
+        if initial_capital is not None
+        else (
+            run_strategy.get("metrics", {}).get("final_capital")
+            or run_group.get("starting_balance")
+            or 100
+        )
     )
     final_capital = round(initial_capital + net_profit, 8)
     return {
@@ -2282,6 +2314,46 @@ def _paper_record_from_snapshot(
     }
 
 
+def _paper_run_current_cash(
+    store: FileStore,
+    user_id: str,
+    run_group: dict,
+    run_strategy: dict,
+    current_window_start: float | None = None,
+) -> float:
+    rows = store.list_user_records_filtered(
+        user_id,
+        "paper_trades",
+        {"group_id": run_group["id"], "strategy_id": run_strategy["id"]},
+    )
+    candidates: list[tuple[float, str, float]] = []
+    for row in rows:
+        row_start = _number_or_none(row.get("window_start_ts"))
+        if (
+            current_window_start is not None
+            and row_start is not None
+            and row_start >= current_window_start - 1e-6
+        ):
+            continue
+        final_capital = _number_or_none(row.get("final_capital"))
+        if final_capital is None:
+            continue
+        row_end = _number_or_none(row.get("window_end_ts"))
+        ordering_ts = row_end if row_end is not None else (row_start if row_start is not None else -1.0)
+        candidates.append(
+            (ordering_ts, str(row.get("saved_at") or row.get("created_at") or ""), float(final_capital))
+        )
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[-1][2]
+    return float(
+        run_strategy.get("metrics", {}).get("final_capital")
+        or run_group.get("starting_balance")
+        or run_strategy.get("metrics", {}).get("initial_capital")
+        or 100
+    )
+
+
 def _persist_paper_live_trades(
     request: Request,
     user_id: str,
@@ -2313,6 +2385,13 @@ def _persist_paper_live_trades(
         normalized.append(item)
     existing = store.get_user_record(user_id, "paper_trades", paper_id)
     if not existing:
+        initial_capital = _paper_run_current_cash(
+            store,
+            user_id,
+            run_group,
+            run_strategy,
+            _number_or_none(event_payload.get("window_start_ts")),
+        )
         store.append_user_record(
             user_id,
             "paper_trades",
@@ -2325,6 +2404,7 @@ def _persist_paper_live_trades(
                 event_payload,
                 history,
                 normalized,
+                initial_capital=initial_capital,
             ),
         )
     changed = False
@@ -2436,7 +2516,16 @@ def _finalize_paper_live_contract(
     result = generator._run(
         [event],
         _paper_strategy_spec(source_strategy, run_strategy),
-        float((existing or {}).get("initial_capital") or run_group.get("starting_balance") or 100),
+        float(
+            (existing or {}).get("initial_capital")
+            or _paper_run_current_cash(
+                store,
+                user_id,
+                run_group,
+                run_strategy,
+                _number_or_none(saved_preview.get("window_start_ts")),
+            )
+        ),
     )
     generated = []
     for trade in result.get("transactions") or []:
@@ -2462,7 +2551,16 @@ def _finalize_paper_live_contract(
     if not finalized:
         return
     net_profit = round(sum(float(trade.get("pnl", 0) or 0) for trade in finalized), 8)
-    initial_capital = float((existing or {}).get("initial_capital") or run_group.get("starting_balance") or 100)
+    initial_capital = float(
+        (existing or {}).get("initial_capital")
+        or _paper_run_current_cash(
+            store,
+            user_id,
+            run_group,
+            run_strategy,
+            _number_or_none(saved_preview.get("window_start_ts")),
+        )
+    )
     final_capital = round(initial_capital + net_profit, 8)
     changes = {
         "saved_record_id": saved_record_id,
@@ -2486,6 +2584,7 @@ def _finalize_paper_live_contract(
             event_payload,
             saved.get("history") or [],
             finalized,
+            initial_capital=initial_capital,
         )
         record.update(changes)
         store.append_user_record(user_id, "paper_trades", record)
@@ -2606,11 +2705,12 @@ def _paper_live_trade_preview(
             },
         }
     generator = LiveMonitorStrategyGenerator(store, request.app.state.live_monitor)
-    current_cash = float(
-        run_strategy.get("metrics", {}).get("final_capital")
-        or run_group.get("starting_balance")
-        or source_strategy.get("metrics", {}).get("final_capital")
-        or 100
+    current_cash = _paper_run_current_cash(
+        store,
+        user_id,
+        run_group,
+        run_strategy,
+        window_start,
     )
     event = {
         "id": str(event_payload.get("slug") or event_payload.get("title") or session_id),
@@ -3140,41 +3240,72 @@ def delete_paper_trading_trade(
     ):
         raise HTTPException(404, "Paper trade not found")
     removed_transactions = 1 if store.delete_user_record(user["id"], "transactions", trade_id) else 0
-    remaining_trades = (
-        []
-        if int(record.get("trade_count", 0) or 0) <= 1
-        else store.list_user_records_filtered(
-            user["id"], "transactions", {"paper_trade_id": paper_id}
-        )
-    )
-    if remaining_trades:
-        initial_capital = float(record.get("initial_capital") or 100)
-        net_profit = round(sum(float(item.get("pnl", 0) or 0) for item in remaining_trades), 8)
-        final_capital = round(initial_capital + net_profit, 8)
-        store.update_user_record(
-            user["id"],
-            "paper_trades",
-            paper_id,
-            {
-                "trade_count": len(remaining_trades),
-                "net_profit": net_profit,
-                "final_capital": final_capital,
-                "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
-            },
-        )
-        deleted_contract = False
-    else:
-        store.delete_user_record(user["id"], "paper_trades", paper_id)
-        run_group_for_delete = store.get_user_record(user["id"], "groups", record["group_id"])
-        if run_group_for_delete:
-            _mark_paper_saved_record_deleted(
-                store, user["id"], run_group_for_delete, record.get("saved_record_id")
-            )
-        deleted_contract = True
+    if removed_transactions:
+        _update_paper_trade_totals(store, user["id"], paper_id)
     return {
-        "deleted": True,
-        "deleted_contract": deleted_contract,
+        "deleted": bool(removed_transactions),
         "removed_transactions": removed_transactions,
+    }
+
+
+@router.delete("/api/paper-trading/{group_id}/strategies/{strategy_id}/contracts/{paper_id}/trades")
+def delete_all_paper_trading_trades(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+    paper_id: str,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    record = store.get_user_record(user["id"], "paper_trades", paper_id)
+    if (
+        not record
+        or record.get("source_group_id") != group_id
+        or record.get("source_strategy_id") != strategy_id
+    ):
+        raise HTTPException(404, "Paper-traded contract not found")
+    removed_transactions = store.delete_user_records_filtered(
+        user["id"], "transactions", {"paper_trade_id": paper_id}
+    )
+    if removed_transactions:
+        _update_paper_trade_totals(store, user["id"], paper_id)
+    return {
+        "deleted": removed_transactions > 0,
+        "removed_transactions": removed_transactions,
+    }
+
+
+@router.delete("/api/paper-trading/{group_id}/strategies/{strategy_id}/trades")
+def delete_all_paper_trading_runs_trades(
+    request: Request,
+    group_id: str,
+    strategy_id: str,
+):
+    user, store, _group, _strategy = _paper_trading_strategy_scope(
+        request, group_id, strategy_id
+    )
+    visible_runs = _paper_visible_runs_for_source(
+        request, store, user["id"], group_id, strategy_id
+    )
+    run_group_ids = {group["id"] for group, _run_strategy in visible_runs}
+    records = [] if not run_group_ids else [
+        row for row in store.list_user_records(user["id"], "paper_trades")
+        if row.get("source_group_id") == group_id
+        and row.get("source_strategy_id") == strategy_id
+        and row.get("group_id") in run_group_ids
+    ]
+    removed_transactions = 0
+    removed_contracts = 0
+    for record in records:
+        removed_transactions += store.delete_user_records_filtered(
+            user["id"], "transactions", {"paper_trade_id": record["id"]}
+        )
+        removed_contracts += int(store.delete_user_record(user["id"], "paper_trades", record["id"]))
+    return {
+        "deleted": bool(removed_transactions or removed_contracts),
+        "removed_transactions": removed_transactions,
+        "removed_contracts": removed_contracts,
     }
 
 

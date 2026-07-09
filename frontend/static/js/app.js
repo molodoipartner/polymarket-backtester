@@ -585,6 +585,7 @@ function initLiveMonitor(){
   const savedUrl=panel.dataset.savedUrl||'/api/live-monitor/saved';
   const savedDetailUrl=panel.dataset.savedDetailUrl||'/api/live-monitor/saved/{id}';
   const deleteUrl=panel.dataset.deleteUrl||'/api/live-monitor/saved/{id}';
+  const deleteAllTradesUrl=panel.dataset.deleteAllTradesUrl||'';
   const syncUrl=panel.dataset.syncUrl||'';
   const savedMode=panel.dataset.savedMode||'contracts';
   const restoreActive=panel.dataset.disableActiveRestore!=='true';
@@ -592,14 +593,14 @@ function initLiveMonitor(){
   const savedRows=document.getElementById('live-saved-rows'),savedRefresh=document.getElementById('live-saved-refresh'),savedCategory=document.getElementById('live-saved-category'),savedDeleteCategory=document.getElementById('live-saved-delete-category');
   const savedLoading=document.getElementById('live-saved-loading'),savedLoadingText=document.getElementById('live-saved-loading-text');
   const savedPrev=document.getElementById('live-saved-prev'),savedNext=document.getElementById('live-saved-next'),savedPageSummary=document.getElementById('live-saved-page-summary');
-  const savedDetail=document.getElementById('live-saved-detail'),savedDetailClose=document.getElementById('live-saved-detail-close'),savedChartElement=document.getElementById('live-saved-chart');
+  const savedDetail=document.getElementById('live-saved-detail'),savedDetailClose=document.getElementById('live-saved-detail-close'),paperTradesDeleteAll=document.getElementById('paper-trades-delete-all'),savedChartElement=document.getElementById('live-saved-chart');
   const savedDetailCategory=document.getElementById('live-saved-detail-category'),savedDetailTitle=document.getElementById('live-saved-detail-title'),savedDetailMeta=document.getElementById('live-saved-detail-meta');
   const savedPartialWarning=document.getElementById('live-saved-partial-warning'),savedGapList=document.getElementById('live-saved-gap-list');
   const savedTarget=document.getElementById('live-saved-target'),savedFinal=document.getElementById('live-saved-final'),savedOutcome=document.getElementById('live-saved-outcome'),savedHistoryCount=document.getElementById('live-saved-history-count');
   const savedCoverage=document.getElementById('live-saved-coverage'),savedAverageSpread=document.getElementById('live-saved-average-spread'),savedFinalDeviation=document.getElementById('live-saved-final-deviation'),savedYesRange=document.getElementById('live-saved-yes-range');
   const savedDisconnectCount=document.getElementById('live-saved-disconnect-count'),savedDisconnectedSeconds=document.getElementById('live-saved-disconnected-seconds');
   const savedCryptoDisconnectCount=document.getElementById('live-saved-crypto-disconnect-count'),savedCryptoDisconnectedSeconds=document.getElementById('live-saved-crypto-disconnected-seconds');
-  let savedChart=null,selectedSavedCategory='all',savedPage=1;
+  let savedChart=null,currentSavedRecord=null,selectedSavedCategory='all',savedPage=1;
   const savedPageSize=20;
   const sessionControllers=new Map();
   const fmtCents=(value,empty='-')=>Number.isFinite(value)?(value*100).toFixed(2)+'c':empty;
@@ -846,31 +847,52 @@ function initLiveMonitor(){
       appendLog({level:'warning',source:'browser',message:'Deleted paper trade.'});
       if(savedDetailMeta)savedDetailMeta.textContent='Paper trade deleted.';
       if(savedPageSummary)savedPageSummary.textContent='Paper trade deleted.';
-      if(payload.deleted_contract){if(savedDetail){savedDetail.classList.add('hidden');resetSavedChart()}loadSaved(false)}
-      else{await openSaved(record.id);loadSaved(false)}
+      await openSaved(record.id);
     }catch(error){
       appendLog({level:'error',source:'browser',message:error.message});
       if(button){button.disabled=false;button.textContent=original||'Delete'}
     }
   };
+  const deleteAllPaperTrades=async button=>{
+    if(!deleteAllTradesUrl)return;
+    if(!window.confirm('Delete all paper trades for this strategy?'))return;
+    const original=button?.textContent;
+    if(button){button.disabled=true;button.textContent='Deleting...'}
+    try{
+      const response=await fetch(deleteAllTradesUrl,{method:'DELETE',headers:{Accept:'application/json'}});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to delete paper trades'));
+      appendLog({level:'warning',source:'browser',message:'Deleted '+String(payload.removed_transactions||0)+' paper trade(s).'});
+      if(savedDetailMeta)savedDetailMeta.textContent='Paper trades deleted.';
+      if(savedPageSummary)savedPageSummary.textContent='Paper trades deleted.';
+      if(savedDetail){savedDetail.classList.add('hidden');resetSavedChart()}
+      await loadSaved(false);
+    }catch(error){
+      appendLog({level:'error',source:'browser',message:error.message});
+      if(button){button.disabled=false;button.textContent=original||'Delete all trades'}
+    }
+  };
   const renderPaperTrades=record=>{
     if(!paperTradeRows)return;
     const trades=record.trades||[];
-    if(!trades.length){paperTradeRows.innerHTML='<tr><td colspan="8" class="empty">No paper trades on this contract.</td></tr>';return}
+    if(!trades.length){paperTradeRows.innerHTML='<tr><td colspan="10" class="empty">No paper trades on this contract.</td></tr>';return}
     paperTradeRows.textContent='';
     for(const trade of trades){
       const row=document.createElement('tr');
-      row.innerHTML='<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td><button class="danger" type="button">Delete</button></td>';
+      row.innerHTML='<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td><button class="danger" type="button">Delete</button></td>';
       row.children[0].textContent=trade.side||'-';
       row.children[1].textContent=Number.isFinite(Number(trade.ask_price))?(Number(trade.ask_price)*100).toFixed(2)+'c':'-';
       const exit=trade.exit_bid_price!=null?trade.exit_bid_price:trade.exit_price;
       row.children[2].textContent=Number.isFinite(Number(exit))?(Number(exit)*100).toFixed(2)+'c':'-';
       row.children[3].textContent=fmtSize(Number(trade.contracts_volume));
-      row.children[4].textContent=fmtMoney(trade.pnl);
-      row.children[4].className=Number(trade.pnl)>=0?'profit':'loss';
-      row.children[5].textContent=trade.opened_at?new Date(trade.opened_at).toLocaleString():'-';
-      row.children[6].textContent=trade.closed_at?new Date(trade.closed_at).toLocaleString():'-';
-      row.children[7].querySelector('button').addEventListener('click',event=>deletePaperTrade(record,trade,event.currentTarget));
+      row.children[4].textContent=fmtMoney(Number(trade.margin_locked)+Number(trade.entry_fee||0));
+      row.children[5].textContent=fmtMoney(trade.pnl);
+      row.children[5].className=Number(trade.pnl)>=0?'profit':'loss';
+      const balanceAfter=finiteNumber(trade.balance_after??trade.available_cash_after_close??trade.balance_before);
+      row.children[6].textContent=balanceAfter!=null?fmtMoney(balanceAfter):'-';
+      row.children[7].textContent=trade.opened_at?new Date(trade.opened_at).toLocaleString():'-';
+      row.children[8].textContent=trade.closed_at?new Date(trade.closed_at).toLocaleString():'-';
+      row.children[9].querySelector('button').addEventListener('click',event=>deletePaperTrade(record,trade,event.currentTarget));
       paperTradeRows.appendChild(row);
     }
   };
@@ -882,7 +904,11 @@ function initLiveMonitor(){
   };
   const renderSavedDetail=record=>{
     if(!savedDetail)return;
+    currentSavedRecord=record;
     const summary=record.summary||{};
+    const paperTrades=Array.isArray(record.trades)?record.trades:[];
+    const paperTradeCount=paperTrades.length;
+    const paperNetProfit=paperTrades.reduce((sum,trade)=>sum+(finiteNumber(trade.pnl)??0),0);
     savedDetail.classList.remove('hidden');
     savedDetail.setAttribute('aria-busy','false');
     savedDetailCategory.textContent=(record.category?.label||categoryLabel(record.crypto_symbol))+' saved contract';
@@ -931,8 +957,8 @@ function initLiveMonitor(){
     savedHistoryCount.textContent=String((record.history||[]).length);
     savedCoverage.textContent=fmtPct(summary.coverage_pct);
     savedAverageSpread.textContent=fmtHistoryCents(summary.average_spread);
-    savedFinalDeviation.textContent=savedMode==='paper'?fmtMoney(record.net_profit):fmtPct(summary.final_deviation_pct);
-    savedYesRange.textContent=savedMode==='paper'?String(record.trade_count||0):fmtHistoryCents(summary.min_yes_bid)+' / '+fmtHistoryCents(summary.max_yes_ask);
+    savedFinalDeviation.textContent=savedMode==='paper'?fmtMoney(paperNetProfit):fmtPct(summary.final_deviation_pct);
+    savedYesRange.textContent=savedMode==='paper'?String(paperTradeCount):fmtHistoryCents(summary.min_yes_bid)+' / '+fmtHistoryCents(summary.max_yes_ask);
     savedDisconnectCount.textContent=String(record.polymarket_disconnect_count||0);
     savedDisconnectedSeconds.textContent=fmtSeconds(record.polymarket_disconnected_seconds||0);
     savedCryptoDisconnectCount.textContent=String(record.crypto_disconnect_count||0);
@@ -1218,6 +1244,7 @@ function initLiveMonitor(){
   if(savedNext)savedNext.addEventListener('click',()=>{savedPage+=1;loadSaved()});
   if(savedCategory)savedCategory.addEventListener('change',()=>{selectedSavedCategory=savedCategory.value||'all';savedPage=1;loadSaved()});
   if(savedDeleteCategory)savedDeleteCategory.addEventListener('click',deleteSavedCategory);
+  if(paperTradesDeleteAll)paperTradesDeleteAll.addEventListener('click',()=>deleteAllPaperTrades(paperTradesDeleteAll));
   if(savedDetailClose)savedDetailClose.addEventListener('click',()=>{savedDetail.classList.add('hidden');resetSavedChart()});
   loadSaved();
   restoreActiveSession();
