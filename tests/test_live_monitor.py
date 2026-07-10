@@ -1457,6 +1457,53 @@ def test_long_polymarket_transport_reconnect_is_recorded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_polymarket_stale_watchdog_reconnects_silent_quote_feed(monkeypatch):
+    updates = []
+
+    async def on_update(kind, detail):
+        updates.append((kind, detail))
+
+    class WebSocket:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+    client._connected_at = 100.0
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: 110.0)
+    ws = WebSocket()
+
+    with pytest.raises(live_monitor.TransientWebSocketDisconnect):
+        await client._stale_watchdog(ws)
+
+    assert ws.closed is True
+    assert state.quote_status == "reconnecting"
+    assert state.last_error == "Polymarket CLOB quote feed stale for 10.0s"
+    assert ("status", {"source": "polymarket"}) in updates
+
+
+@pytest.mark.asyncio
+async def test_polymarket_quote_receipt_refreshes_stale_watchdog_clock(monkeypatch):
+    async def on_update(_kind, _detail):
+        return None
+
+    clock = {"monotonic": 100.0}
+    monkeypatch.setattr(live_monitor.time, "monotonic", lambda: clock["monotonic"])
+    state = LiveMonitorState(quotes={"token-1": LiveQuote(bid=0.41, ask=0.44)})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+    client._connected_at = 90.0
+    client._last_quote_at = 90.0
+
+    await client._store_quote("token-1", 0.41, 0.44, 2000.0)
+
+    assert client.health()["last_quote_age"] == 0.0
+    assert state.quotes["token-1"].price_change_count == 0
+
+
+@pytest.mark.asyncio
 async def test_polymarket_listener_ignores_control_and_invalid_text_frames():
     async def on_update(_kind, _detail):
         return None

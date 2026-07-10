@@ -1088,7 +1088,7 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert "<th>Balance</th>" in paper_page.text
         assert 'id="paper-trades-delete-all"' in paper_page.text
         assert "Contracts with paper trades" in paper_page.text
-        assert f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync" not in paper_page.text
+        assert f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync" in paper_page.text
         run_group, run_strategy = routes_module._create_paper_run_group(
             store,
             user["id"],
@@ -1187,9 +1187,11 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
             f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync"
         )
         assert synced.status_code == 200
-        assert synced.json()["disabled"] is True
+        assert synced.json()["disabled"] is False
         assert synced.json()["created"] == 0
-        assert synced.json()["run_count"] == 0
+        assert synced.json()["run_count"] == 1
+        assert synced.json()["skipped"] >= 1
+        assert synced.json()["skipped_first_contract"] == 1
         paper_list = client.get(
             f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/contracts"
         )
@@ -1236,7 +1238,7 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
             f"/api/paper-trading/{group['id']}/strategies/{strategies[0]['id']}/sync"
         )
         assert synced_after_delete.status_code == 200
-        assert synced_after_delete.json()["disabled"] is True
+        assert synced_after_delete.json()["disabled"] is False
         assert synced_after_delete.json()["created"] == 0
         assert not store.list_user_records_filtered(
             user["id"],
@@ -1272,6 +1274,123 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         )
         assert len(result_trades) == 1
         assert result_trades[0]["saved_record_id"] == "full-up"
+
+
+def test_paper_trading_sync_matches_live_monitor_backtest(tmp_path: Path, monkeypatch):
+    store, user = populated_store(tmp_path)
+    write_live_monitor_record(
+        store,
+        user,
+        "paper-sync-first",
+        0,
+        outcome="Up",
+        session_id="paper-sync-session",
+    )
+    write_live_monitor_record(
+        store,
+        user,
+        "paper-sync-up",
+        1,
+        outcome="Up",
+        session_id="paper-sync-session",
+    )
+    created_at = datetime.now(timezone.utc).isoformat()
+    source_group = {
+        "id": "source-paper-sync",
+        "user_id": user["id"],
+        "name": "Source paper sync",
+        "assets": ["BTC"],
+        "timeframe": "5m",
+        "source": "live_monitor_saved_contracts",
+        "starting_balance": 1000,
+        "strategy_count": 1,
+        "event_count": 1,
+        "created_at": created_at,
+    }
+    source_strategy = {
+        "id": "source-paper-sync-strategy",
+        "group_id": source_group["id"],
+        "name": "Quote momentum sync",
+        "family": "quote_momentum",
+        "parameters": {
+            "family": "quote_momentum",
+            "entry_second": 10,
+            "quote_edge_cents": 2,
+            "deviation_threshold_pct": 0.03,
+            "allocation_pct": 0.1,
+            "max_allocation_pct": 0.1,
+            "fee_bps": 0,
+            "exit_condition": "settlement",
+            "price_source": "saved_live_monitor_ask",
+        },
+        "metrics": {"final_capital": 1000},
+        "created_at": created_at,
+    }
+    store.save_group_bundle(user["id"], source_group, [source_strategy], [])
+    run_group, run_strategy = routes_module._create_paper_run_group(
+        store,
+        user["id"],
+        source_group,
+        source_strategy,
+        "paper-sync-session",
+        starting_balance=1000,
+    )
+
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    with TestClient(app_module.create_app()) as client:
+        login = client.post(
+            "/login",
+            data={"email": user["email"], "password": "secure-pass"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+        synced = client.post(
+            f"/api/paper-trading/{source_group['id']}/strategies/{source_strategy['id']}/sync"
+        )
+        assert synced.status_code == 200, synced.text
+        assert synced.json()["disabled"] is False
+        assert synced.json()["created"] == 1
+        assert synced.json()["skipped_first_contract"] == 1
+
+    saved = live_monitor_module.LiveMonitorManager(
+        store.root / "live_monitor"
+    ).get_saved(
+        user["id"], "paper-sync-up"
+    )
+    generator = LiveMonitorStrategyGenerator(store, None)
+    expected_event = generator._record_to_event(saved, "BTC", "5m")
+    expected_result = generator._run(
+        [expected_event],
+        routes_module._paper_strategy_spec(source_strategy, run_strategy),
+        1000,
+    )
+    expected_trade = expected_result["transactions"][0]
+    paper_records = store.list_user_records_filtered(
+        user["id"],
+        "paper_trades",
+        {
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "saved_record_id": "paper-sync-up",
+        },
+    )
+    assert len(paper_records) == 1
+    paper_trades = store.list_user_records_filtered(
+        user["id"], "transactions", {"paper_trade_id": paper_records[0]["id"]}
+    )
+    assert len(paper_trades) == 1
+    paper_trade = paper_trades[0]
+    assert paper_trade["side"] == expected_trade["side"]
+    assert paper_trade["opened_at"] == expected_trade["opened_at"]
+    assert paper_trade["closed_at"] == expected_trade["closed_at"]
+    assert paper_trade["ask_price"] == expected_trade["ask_price"]
+    assert paper_trade["entry_price"] == expected_trade["entry_price"]
+    assert paper_trade["exit_price"] == expected_trade["exit_price"]
+    assert paper_trade["exit_type"] == expected_trade["exit_type"]
+    assert paper_trade["pnl"] == expected_trade["pnl"]
+    assert paper_records[0]["final_capital"] == pytest.approx(
+        expected_result["final_capital"], abs=0.0001
+    )
 
 
 def test_live_monitor_analysis_filters_target_price_anomaly_contracts(tmp_path: Path, monkeypatch):

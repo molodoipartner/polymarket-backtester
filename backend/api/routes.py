@@ -3110,18 +3110,95 @@ async def paper_trading_monitor_events(
 
 @router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/sync")
 def sync_paper_trading_contracts(request: Request, group_id: str, strategy_id: str):
-    _user, _store_obj, _source_group, _source_strategy = _paper_trading_strategy_scope(
+    user, store, source_group, source_strategy = _paper_trading_strategy_scope(
         request, group_id, strategy_id
     )
+    visible_runs = _paper_visible_runs_for_source(
+        request, store, user["id"], group_id, strategy_id
+    )
+    generator = LiveMonitorStrategyGenerator(store, request.app.state.live_monitor)
+    created = 0
+    skipped = 0
+    no_trade = 0
+    skipped_first_contract = 0
+    total = 0
+    for run_group, run_strategy in visible_runs:
+        session_id = str(run_group.get("paper_trading", {}).get("session_id") or "").strip()
+        if not session_id:
+            continue
+        asset = str((source_group.get("assets") or [""])[0]).upper()
+        timeframe = str(source_group.get("timeframe") or "")
+        first_saved_record_id = _paper_first_session_contract_id(
+            request, user["id"], session_id, asset, timeframe
+        )
+        deleted_saved_record_ids = _paper_deleted_saved_record_ids(run_group)
+        previews = [
+            record for record in request.app.state.live_monitor.list_saved_previews(
+                user["id"], category=asset.lower()
+            )
+            if str(record.get("session_id") or "") == session_id
+            and generator._record_timeframe(record) == timeframe
+        ]
+        previews.sort(
+            key=lambda item: (
+                _number_or_none(item.get("window_start_ts")) or math.inf,
+                str(item.get("saved_at") or ""),
+            )
+        )
+        for preview in previews:
+            saved_record_id = str(preview.get("id") or "").strip()
+            if not saved_record_id:
+                continue
+            total += 1
+            if saved_record_id == first_saved_record_id:
+                skipped_first_contract += 1
+                continue
+            if saved_record_id in deleted_saved_record_ids:
+                skipped += 1
+                continue
+            existing = store.list_user_records_filtered(
+                user["id"],
+                "paper_trades",
+                {
+                    "group_id": run_group["id"],
+                    "strategy_id": run_strategy["id"],
+                    "saved_record_id": saved_record_id,
+                },
+            )
+            if existing:
+                skipped += 1
+                continue
+            _finalize_paper_live_contract(
+                request,
+                user["id"],
+                source_group,
+                source_strategy,
+                run_group,
+                run_strategy,
+                preview,
+            )
+            finalized = store.list_user_records_filtered(
+                user["id"],
+                "paper_trades",
+                {
+                    "group_id": run_group["id"],
+                    "strategy_id": run_strategy["id"],
+                    "saved_record_id": saved_record_id,
+                },
+            )
+            if finalized:
+                created += 1
+            else:
+                no_trade += 1
     return {
-        "created": 0,
-        "skipped": 0,
-        "no_trade": 0,
-        "skipped_first_contract": 0,
-        "total": 0,
-        "run_count": 0,
-        "disabled": True,
-        "message": "Paper trades are recorded live by the listener; sync does not generate trades.",
+        "created": created,
+        "skipped": skipped,
+        "no_trade": no_trade,
+        "skipped_first_contract": skipped_first_contract,
+        "total": total,
+        "run_count": len(visible_runs),
+        "disabled": False,
+        "message": "Paper trades synchronized from saved live-monitor contracts.",
     }
 
 
@@ -3298,6 +3375,11 @@ def delete_all_paper_trading_runs_trades(
     removed_transactions = 0
     removed_contracts = 0
     for record in records:
+        run_group = store.get_user_record(user["id"], "groups", record.get("group_id"))
+        if run_group:
+            _mark_paper_saved_record_deleted(
+                store, user["id"], run_group, record.get("saved_record_id")
+            )
         removed_transactions += store.delete_user_records_filtered(
             user["id"], "transactions", {"paper_trade_id": record["id"]}
         )

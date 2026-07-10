@@ -35,6 +35,7 @@ RECONNECT_STABLE_RESET_SECONDS = 60
 RECONNECT_MAX_DELAY_SECONDS = 10
 REST_QUOTE_POLL_SECONDS = 1.0
 WS_STALE_POLL_AFTER_SECONDS = 8.0
+POLYMARKET_RECONNECT_STALE_AFTER_SECONDS = 10.0
 REST_QUOTE_FAILURE_COOLDOWN_SECONDS = 15.0
 CRYPTO_STALE_AFTER_SECONDS = 3.0
 CRYPTO_RESUBSCRIBE_STALE_AFTER_SECONDS = 10.0
@@ -193,6 +194,7 @@ def _is_recordable_disconnect(duration: float, reason: str | None = None) -> boo
         and (
             reason.startswith("Crypto WebSocket ping timeout")
             or reason.startswith("Crypto price feed stale")
+            or reason.startswith("Polymarket CLOB quote feed stale")
         )
     )
 
@@ -293,6 +295,7 @@ class PolymarketLiveOrderBook:
         }
         self._tick_sizes = {token_id: "0.01" for token_id in self.token_ids}
         self._last_message_at: float | None = None
+        self._last_quote_at: float | None = None
         self._connected_at: float | None = None
         self._ever_connected = False
         self._disconnected_since: float | None = None
@@ -333,6 +336,7 @@ class PolymarketLiveOrderBook:
             self._ws = ws
             self._pending_snapshot_tokens = set(self.token_ids)
             self._last_message_at = time.monotonic()
+            self._last_quote_at = None
             self._connected_at = time.monotonic()
             self._mark_connected()
             self.state.quote_status = "connected"
@@ -352,11 +356,12 @@ class PolymarketLiveOrderBook:
                 },
             )
             listener = asyncio.create_task(self._listen(ws))
+            watchdog = asyncio.create_task(self._stale_watchdog(ws))
             heartbeat = asyncio.create_task(self._heartbeat(ws))
             disconnect_reason = "Polymarket WebSocket stream ended"
             try:
                 done, _pending = await asyncio.wait(
-                    (listener, heartbeat),
+                    (listener, watchdog, heartbeat),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
@@ -379,9 +384,9 @@ class PolymarketLiveOrderBook:
                             "message": "Polymarket WebSocket listener stopped; reconnecting if tracking is still active.",
                         },
                     )
-                for task in (listener, heartbeat):
+                for task in (listener, watchdog, heartbeat):
                     task.cancel()
-                await asyncio.gather(listener, heartbeat, return_exceptions=True)
+                await asyncio.gather(listener, watchdog, heartbeat, return_exceptions=True)
                 self._ws = None
 
     async def _listen(self, ws) -> None:
@@ -404,6 +409,30 @@ class PolymarketLiveOrderBook:
         while True:
             await ws.send("PING")
             await asyncio.sleep(10)
+
+    async def _stale_watchdog(self, ws) -> None:
+        while True:
+            reference = self._last_quote_at or self._connected_at
+            if reference is not None:
+                age = time.monotonic() - reference
+                if age >= POLYMARKET_RECONNECT_STALE_AFTER_SECONDS:
+                    reason = f"Polymarket CLOB quote feed stale for {age:.1f}s"
+                    self.state.quote_status = "reconnecting"
+                    self.state.last_error = reason
+                    await self.on_update(
+                        "log",
+                        {
+                            "level": "warning",
+                            "source": "polymarket",
+                            "message": f"{reason}; reconnecting.",
+                        },
+                    )
+                    await self.on_update("status", {"source": "polymarket"})
+                    await ws.close()
+                    raise TransientWebSocketDisconnect(reason)
+            await asyncio.sleep(
+                min(1.0, POLYMARKET_RECONNECT_STALE_AFTER_SECONDS / 3)
+            )
 
     async def _apply_message(self, message: dict) -> None:
         event_type = message.get("event_type")
@@ -534,6 +563,8 @@ class PolymarketLiveOrderBook:
             ask_size,
         )
         previous = self.state.quotes[token_id]
+        if bid is not None or ask is not None:
+            self._last_quote_at = time.monotonic()
         if bid is not None and ask is not None and bid > ask:
             await self.on_update(
                 "log",
@@ -690,6 +721,11 @@ class PolymarketLiveOrderBook:
             "last_message_age": (
                 time.monotonic() - self._last_message_at
                 if self._last_message_at is not None
+                else None
+            ),
+            "last_quote_age": (
+                time.monotonic() - self._last_quote_at
+                if self._last_quote_at is not None
                 else None
             ),
             "pending_snapshots": len(self._pending_snapshot_tokens),
@@ -1254,11 +1290,14 @@ class LiveMonitorSession:
                     continue
                 health = self.polymarket.health()
                 last_message_age = health.get("last_message_age")
+                last_quote_age = health.get("last_quote_age")
                 should_poll = (
                     not health.get("connected")
                     or health.get("pending_snapshots", 0) > 0
                     or last_message_age is None
                     or last_message_age >= WS_STALE_POLL_AFTER_SECONDS
+                    or last_quote_age is None
+                    or last_quote_age >= WS_STALE_POLL_AFTER_SECONDS
                 )
                 if should_poll:
                     await self._poll_rest_quotes()

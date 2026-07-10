@@ -1083,9 +1083,9 @@ function initLiveMonitor(){
     controller.source.addEventListener('tick',listener);
     controller.source.addEventListener('ping',()=>{controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false});
     controller.source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')},controller)});
-    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);setTimeout(()=>loadSaved(false),750)});
+    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);setTimeout(()=>loadSaved(Boolean(syncUrl)),750)});
     controller.source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog(data.log,controller)});
-    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved(false)});
+    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved(Boolean(syncUrl))});
     controller.source.onerror=error=>{
       const age=controller.lastPayloadAt?(Date.now()-controller.lastPayloadAt)/1000:Infinity;
       controller.quoteStatus.textContent='Stream reconnecting';
@@ -1114,7 +1114,7 @@ function initLiveMonitor(){
   };
   const loadSaved=async(sync=false)=>{
     if(!savedRows)return;
-    const shouldSync=savedMode!=='paper'&&sync&&syncUrl;
+    const shouldSync=sync&&syncUrl;
     const loadingMessage=shouldSync
       ?'Syncing saved contracts...'
       :(savedMode==='paper'?'Loading recorded paper trades...':'Loading saved contracts...');
@@ -1239,14 +1239,14 @@ function initLiveMonitor(){
       setBusy(false);
     }
   });
-  if(savedRefresh)savedRefresh.addEventListener('click',()=>loadSaved(false));
+  if(savedRefresh)savedRefresh.addEventListener('click',()=>loadSaved(Boolean(syncUrl)));
   if(savedPrev)savedPrev.addEventListener('click',()=>{if(savedPage>1){savedPage-=1;loadSaved()}});
   if(savedNext)savedNext.addEventListener('click',()=>{savedPage+=1;loadSaved()});
   if(savedCategory)savedCategory.addEventListener('change',()=>{selectedSavedCategory=savedCategory.value||'all';savedPage=1;loadSaved()});
   if(savedDeleteCategory)savedDeleteCategory.addEventListener('click',deleteSavedCategory);
   if(paperTradesDeleteAll)paperTradesDeleteAll.addEventListener('click',()=>deleteAllPaperTrades(paperTradesDeleteAll));
   if(savedDetailClose)savedDetailClose.addEventListener('click',()=>{savedDetail.classList.add('hidden');resetSavedChart()});
-  loadSaved();
+  loadSaved(Boolean(syncUrl));
   restoreActiveSession();
 }
 function initLocalDataTools(){
