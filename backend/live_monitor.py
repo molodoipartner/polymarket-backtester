@@ -23,6 +23,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from backend.data.polymarket_client import parse_list
 from backend.storage.file_store import utc_iso
+from backend.trading.clob_proxy import clob_async_client
 from config.settings import settings
 
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -1318,7 +1319,7 @@ class LiveMonitorSession:
             return
         orderbook = self.polymarket
         try:
-            async with httpx.AsyncClient(timeout=5, follow_redirects=True, trust_env=True) as client:
+            async with clob_async_client(timeout=5, follow_redirects=True, trust_env=True) as client:
                 for token_id in token_ids:
                     snapshot = await _fetch_clob_book_snapshot(client, token_id)
                     if self.polymarket is not orderbook or token_id not in self.state.quotes:

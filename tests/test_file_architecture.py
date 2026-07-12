@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 import backend.api.app as app_module
 import backend.api.routes as routes_module
 import backend.live_monitor as live_monitor_module
+import backend.trading.clob_proxy as clob_proxy_module
 from backend.auth import hash_password, verify_password
 from backend.backtester import FileBacktester
 from backend.fixed_time import TIMEFRAME_SECONDS, parse_period, parse_utc_datetime
@@ -1954,6 +1955,21 @@ def test_polymarket_executor_uses_prepared_order_without_resigning(monkeypatch):
     assert fake_client.create_calls == 1
     assert fake_client.post_calls == 1
     assert response["_timing"]["signed_token_quantity"] == pytest.approx(1.25)
+
+
+def test_clob_proxy_selects_supported_http_proxy(monkeypatch):
+    monkeypatch.setenv(
+        "POLYMARKET_CLOB_PROXY_URLS",
+        "socks4://81.12.157.98:5678,http://5.2.238.216:8787",
+    )
+    clob_proxy_module.clob_proxy_url.cache_clear()
+
+    assert clob_proxy_module.clob_proxy_url() == "http://5.2.238.216:8787"
+    kwargs = clob_proxy_module.clob_async_client_kwargs(timeout=5, follow_redirects=True, trust_env=True)
+    assert kwargs["proxy"] == "http://5.2.238.216:8787"
+    assert kwargs["trust_env"] is False
+
+    clob_proxy_module.clob_proxy_url.cache_clear()
 
 
 def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path: Path, monkeypatch):
