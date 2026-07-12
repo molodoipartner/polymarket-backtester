@@ -57,6 +57,17 @@ During Blueprint setup, set the prompted secret variables:
 - `PASSWORD`
 - `ADMIN_USERNAME`
 - `ADMIN_PASSWORD`
+- `PRIVATE_KEY`
+- `PROXY_ADDRESS`
+- `API_KEY`
+- `API_SECRET`
+- `API_PASSPHRASE`
+
+For live Polymarket trading, keep these Render variables enabled:
+
+- `POLYMARKET_LIVE_TRADING_ENABLED=true`
+- `POLYMARKET_LIVE_ORDER_AMOUNT=1`
+- `SIGNATURE_TYPE=1`
 
 `SESSION_SECRET` and `EXPORT_TOKEN` are generated automatically by Render.
 
