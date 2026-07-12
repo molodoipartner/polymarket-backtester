@@ -7,6 +7,7 @@ import tarfile
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import httpx
@@ -343,6 +344,7 @@ def test_live_monitor_smart_generator_samples_unique_dynamic_parameters():
         "smart_breakout_confirmation",
         "smart_pullback_continuation",
         "smart_settlement_drift",
+        "price_threshold_70_stop_40",
     }
     assert {item["generation_method"] for item in first} == {
         "system_random_parameter_sample"
@@ -350,6 +352,7 @@ def test_live_monitor_smart_generator_samples_unique_dynamic_parameters():
     assert {item["exit_condition"] for item in first} <= {
         "dynamic_bid_or_settlement",
         "conviction_hold_or_stop",
+        "stop_loss_40_or_settlement",
     }
     assert {item["entry_mode"] for item in first} <= {"single_entry", "scale_in"}
     assert any(item["entry_mode"] == "scale_in" for item in first)
@@ -1084,6 +1087,8 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert paper_page.status_code == 200
         assert "Start trading" in paper_page.text
         assert "Starting balance" in paper_page.text
+        assert 'name="real_trading"' in paper_page.text
+        assert "Real trading" in paper_page.text
         assert "<th>Entry $</th>" in paper_page.text
         assert "<th>Balance</th>" in paper_page.text
         assert 'id="paper-trades-delete-all"' in paper_page.text
@@ -1514,6 +1519,787 @@ def test_paper_trading_requires_target_price_at_window_start():
         fallback_history,
     )
     assert not routes_module._paper_target_known_at_window_start(late)
+
+
+def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("real-paper@example.com", "Real Paper", hash_password("secure-pass"))
+    source_group = {
+        "id": "source-real-paper",
+        "name": "Source Real Paper",
+        "assets": ["BTC"],
+        "asset_labels": ["Bitcoin"],
+        "timeframe": "5m",
+        "timeframe_label": "5m",
+        "starting_balance": 100,
+    }
+    source_strategy = {
+        "id": "source-real-paper-strategy",
+        "group_id": source_group["id"],
+        "name": "Quote momentum real paper",
+        "family": "quote_momentum",
+        "family_label": "Quote Momentum",
+        "description": "Test strategy",
+        "parameters": {
+            "family": "quote_momentum",
+            "entry_second": 10,
+            "quote_edge_cents": 1,
+            "allocation_pct": 0.1,
+            "fee_bps": 0,
+            "exit_condition": "settlement",
+            "price_source": "saved_live_monitor_bid_ask",
+        },
+        "metrics": {"initial_capital": 100},
+    }
+    store.save_group_bundle(user["id"], source_group, [source_strategy], [])
+    run_group, run_strategy = routes_module._create_paper_run_group(
+        store,
+        user["id"],
+        source_group,
+        source_strategy,
+        "real-paper-session",
+        SimpleNamespace(slug="previous", window_start_ts=1782639300),
+        100,
+        True,
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+            self.sells = []
+            self.balance_checks = []
+            self.balances = {}
+
+        def market_buy(self, order_request):
+            self.calls.append(order_request)
+            self.balances[order_request.token_id] = 1.8
+            return {
+                "success": True,
+                "orderID": "fake-order",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 12.34,
+                },
+            }
+
+        def market_sell(self, order_request):
+            self.sells.append(order_request)
+            current = self.balances.get(order_request.token_id, 0)
+            self.balances[order_request.token_id] = max(0, current - order_request.amount)
+            return {
+                "success": True,
+                "orderID": "fake-close-order",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 9.87,
+                },
+            }
+
+        def token_balance(self, token_id):
+            self.balance_checks.append(token_id)
+            return self.balances.get(token_id, 0)
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+                live_monitor=SimpleNamespace(),
+            )
+        )
+    )
+    monkeypatch.setattr(settings, "polymarket_live_order_amount", 1.0)
+    start_ts = 1782639600
+    snapshot = {
+        "event": {
+            "slug": "btc-updown-5m-1782639600",
+            "title": "Bitcoin Up or Down",
+            "window_start_ts": start_ts,
+            "window_end_ts": start_ts + 300,
+            "tokens": [
+                {"token_id": "up-token", "outcome": "Up", "condition_id": "condition"},
+                {"token_id": "down-token", "outcome": "Down", "condition_id": "condition"},
+            ],
+        },
+        "history": [
+            {
+                "t": start_ts + 10,
+                "crypto_price": 100.1,
+                "target_price": 100,
+                "target_price_ts": start_ts,
+                "yes_bid": 0.53,
+                "yes_ask": 0.55,
+                "yes_mid": 54,
+                "no_bid": 0.45,
+                "no_ask": 0.47,
+            }
+        ],
+    }
+
+    first = routes_module._paper_live_trade_preview(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        snapshot,
+    )
+    second = routes_module._paper_live_trade_preview(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        snapshot,
+    )
+
+    assert first["paper_trades"]
+    assert first["real_orders"][0]["status"] == "submitted"
+    assert first["real_orders"][0]["token_id"] == "up-token"
+    assert second["real_orders"][0]["status"] == "submitted"
+    assert len(executor.calls) == 1
+    assert executor.calls[0].token_id == "up-token"
+    assert executor.calls[0].amount == 1.0
+    assert executor.calls[0].order_type == "FAK"
+    assert executor.calls[0].price == 0.99
+    assert executor.balance_checks == ["up-token"]
+    real_orders = store.list_user_records(user["id"], "real_orders")
+    assert len(real_orders) == 1
+    assert real_orders[0]["response"]["orderID"] == "fake-order"
+    assert real_orders[0]["real_open_quantity"] == pytest.approx(1.8)
+    assert real_orders[0]["paper_signal_at"]
+    assert real_orders[0]["clob_send_at"]
+    assert real_orders[0]["clob_duration_ms"] == pytest.approx(12.34)
+    assert routes_module._paper_real_order_retryable({
+        "status": "failed",
+        "error": "order couldn't be fully filled. FOK orders are fully filled or killed.",
+    })
+    assert routes_module._paper_real_order_retryable({
+        "status": "failed",
+        "error": "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.",
+    })
+    assert routes_module._paper_real_order_retryable({
+        "status": "failed",
+        "error": "not enough balance / allowance: the balance is not enough -> balance: 1408448, order amount: 1420000",
+    })
+
+    closed_trade = {
+        **first["paper_trades"][0],
+        "status": "closed",
+        "closed_at": datetime.fromtimestamp(start_ts + 40, timezone.utc).isoformat(),
+        "exit_price": 0.58,
+        "exit_bid_price": 0.58,
+    }
+    closed_once = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "real-paper-session",
+        snapshot["event"],
+        snapshot,
+        [closed_trade],
+    )
+    closed_twice = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "real-paper-session",
+        snapshot["event"],
+        snapshot,
+        [closed_trade],
+    )
+
+    assert closed_once[0]["status"] == "submitted"
+    assert closed_once[0]["order_action"] == "close"
+    assert closed_once[0]["amount"] == pytest.approx(1.8)
+    assert closed_once[0]["close_quantity_source"] == "stored_open_balance"
+    assert closed_once[0]["paper_signal_at"]
+    assert closed_once[0]["clob_send_at"]
+    assert closed_once[0]["clob_duration_ms"] == pytest.approx(9.87)
+    assert closed_twice[0]["status"] == "submitted"
+    assert len(executor.sells) == 1
+    assert executor.sells[0].token_id == "up-token"
+    assert executor.sells[0].amount == pytest.approx(1.8)
+    assert executor.sells[0].order_type == "FAK"
+    assert executor.sells[0].price == 0.01
+    assert executor.balance_checks == ["up-token"]
+    real_orders = store.list_user_records(user["id"], "real_orders")
+    assert len(real_orders) == 2
+
+    down_trade = {
+        **first["paper_trades"][0],
+        "side": "DOWN",
+        "status": "open",
+        "opened_at": datetime.fromtimestamp(start_ts + 55, timezone.utc).isoformat(),
+        "closed_at": None,
+        "entry_price": 0.47,
+        "ask_price": 0.47,
+    }
+    down_open = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "real-paper-session",
+        snapshot["event"],
+        snapshot,
+        [down_trade],
+    )
+    assert down_open[0]["status"] == "submitted"
+    assert down_open[0]["side"] == "DOWN"
+    assert down_open[0]["token_id"] == "down-token"
+    assert down_open[0]["limit_price"] == 0.99
+    assert executor.calls[-1].token_id == "down-token"
+    assert executor.calls[-1].price == 0.99
+    assert executor.balance_checks[-1] == "down-token"
+
+    down_closed_trade = {
+        **down_trade,
+        "status": "closed",
+        "closed_at": datetime.fromtimestamp(start_ts + 80, timezone.utc).isoformat(),
+        "exit_price": 0.43,
+        "exit_bid_price": 0.43,
+    }
+    down_close = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "real-paper-session",
+        snapshot["event"],
+        snapshot,
+        [down_closed_trade],
+    )
+    assert down_close[0]["status"] == "submitted"
+    assert down_close[0]["side"] == "DOWN"
+    assert down_close[0]["token_id"] == "down-token"
+    assert down_close[0]["limit_price"] == 0.01
+    assert executor.sells[-1].token_id == "down-token"
+    assert executor.sells[-1].price == 0.01
+
+
+def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("real-paper-close-retry@example.com", "Real Paper", hash_password("secure-pass"))
+    run_group = {
+        "id": "run-real-paper",
+        "paper_trading": {
+            "real_trading_enabled": True,
+            "source_group_id": "source-real-paper",
+            "source_strategy_id": "source-real-paper-strategy",
+        },
+    }
+    run_strategy = {"id": "run-real-paper-strategy"}
+    session_id = "real-paper-session"
+    event_payload = {
+        "slug": "btc-updown-5m-1782639600",
+        "title": "Bitcoin Up or Down",
+        "tokens": [
+            {"token_id": "up-token", "outcome": "Up"},
+            {"token_id": "down-token", "outcome": "Down"},
+        ],
+    }
+    snapshot = {"event": event_payload}
+    trade = {
+        "side": "UP",
+        "status": "closed",
+        "opened_at": datetime.fromtimestamp(1782639610, timezone.utc).isoformat(),
+        "closed_at": datetime.fromtimestamp(1782639640, timezone.utc).isoformat(),
+        "scale_entry_index": 1,
+        "exit_price": 0.58,
+    }
+    paper_id = routes_module.uuid.uuid5(
+        routes_module.uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{routes_module._paper_event_key(session_id, event_payload)}",
+    ).hex
+    open_order_id = routes_module._paper_real_order_id(paper_id, trade)
+    close_order_id = routes_module._paper_real_close_order_id(paper_id, trade)
+    store.append_user_record(
+        user["id"],
+        "real_orders",
+        {
+            "id": open_order_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "status": "submitted",
+            "token_id": "up-token",
+            "real_open_quantity": 1.42,
+        },
+    )
+    store.append_user_record(
+        user["id"],
+        "real_orders",
+        {
+            "id": close_order_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "status": "failed",
+            "order_action": "close",
+            "error": "not enough balance / allowance: the balance is not enough -> balance: 1408448, order amount: 1420000",
+        },
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.sells = []
+            self.balance_checks = []
+
+        def market_sell(self, order_request):
+            self.sells.append(order_request)
+            return {
+                "success": True,
+                "orderID": "retry-close-order",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 8.5,
+                },
+            }
+
+        def token_balance(self, token_id):
+            self.balance_checks.append(token_id)
+            return 999
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+            )
+        )
+    )
+
+    closed = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        session_id,
+        event_payload,
+        snapshot,
+        [trade],
+    )
+
+    assert closed[0]["status"] == "submitted"
+    assert closed[0]["amount"] == pytest.approx(1.408448)
+    assert closed[0]["close_quantity_source"] == "previous_clob_error_balance"
+    assert executor.sells[0].amount == pytest.approx(1.408448)
+    assert executor.balance_checks == []
+
+
+def test_polymarket_executor_extracts_balance_from_balance_allowance_response():
+    executor_class = routes_module.PolymarketLiveOrderExecutor
+    assert executor_class._balance_value_from_response({"balance": "1350000"}) == "1350000"
+    assert executor_class._balance_value_from_response({"data": {"balance": "1350000"}}) == "1350000"
+    assert executor_class._balance_value_from_response({"allowance": "0"}) is None
+
+
+def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path: Path, monkeypatch):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("real-paper-zero-balance@example.com", "Real Paper", hash_password("secure-pass"))
+    source_group = {
+        "id": "source-real-paper-zero",
+        "name": "Source Real Paper",
+        "assets": ["BTC"],
+        "timeframe": "5m",
+        "starting_balance": 100,
+    }
+    source_strategy = {
+        "id": "source-real-paper-zero-strategy",
+        "group_id": source_group["id"],
+        "name": "Quote momentum real paper",
+        "family": "quote_momentum",
+        "parameters": {
+            "family": "quote_momentum",
+            "entry_second": 10,
+            "quote_edge_cents": 1,
+            "allocation_pct": 0.1,
+            "fee_bps": 0,
+            "exit_condition": "settlement",
+            "price_source": "saved_live_monitor_bid_ask",
+        },
+        "metrics": {"initial_capital": 100},
+    }
+    store.save_group_bundle(user["id"], source_group, [source_strategy], [])
+    run_group, run_strategy = routes_module._create_paper_run_group(
+        store,
+        user["id"],
+        source_group,
+        source_strategy,
+        "real-paper-zero-session",
+        SimpleNamespace(slug="previous", window_start_ts=1782639300),
+        100,
+        True,
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.buys = []
+            self.sells = []
+            self.balance_checks = []
+
+        def market_buy(self, order_request):
+            self.buys.append(order_request)
+            return {
+                "success": True,
+                "orderID": "zero-balance-open",
+                "status": "matched",
+                "makingAmount": "0.999999",
+                "takingAmount": "1.42857",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 7.5,
+                    "signed_token_quantity": 1.010101,
+                },
+            }
+
+        def market_sell(self, order_request):
+            self.sells.append(order_request)
+            return {
+                "success": True,
+                "orderID": "zero-balance-close",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 6.5,
+                },
+            }
+
+        def token_balance_info(self, token_id):
+            self.balance_checks.append(token_id)
+            return {
+                "balance": 0,
+                "raw_balance": "0",
+                "response": {"balance": "0"},
+                "source": "get_balance_allowance",
+            }
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+                live_monitor=SimpleNamespace(),
+            )
+        )
+    )
+    monkeypatch.setattr(settings, "polymarket_live_order_amount", 1.0)
+    start_ts = 1782639600
+    snapshot = {
+        "event": {
+            "slug": "btc-updown-5m-1782639600",
+            "title": "Bitcoin Up or Down",
+            "window_start_ts": start_ts,
+            "window_end_ts": start_ts + 300,
+            "tokens": [
+                {"token_id": "up-token", "outcome": "Up"},
+                {"token_id": "down-token", "outcome": "Down"},
+            ],
+        },
+        "history": [
+            {
+                "t": start_ts + 10,
+                "crypto_price": 99.9,
+                "target_price": 100,
+                "target_price_ts": start_ts,
+                "yes_bid": 0.45,
+                "yes_ask": 0.47,
+                "yes_mid": 46,
+                "no_bid": 0.53,
+                "no_ask": 0.55,
+            }
+        ],
+    }
+
+    opened = routes_module._paper_live_trade_preview(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        snapshot,
+    )
+    closed_trade = {
+        **opened["paper_trades"][0],
+        "status": "closed",
+        "closed_at": datetime.fromtimestamp(start_ts + 40, timezone.utc).isoformat(),
+        "exit_price": 0.5,
+        "exit_bid_price": 0.5,
+    }
+    closed = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "real-paper-zero-session",
+        snapshot["event"],
+        snapshot,
+        [closed_trade],
+    )
+
+    assert opened["real_orders"][0]["status"] == "submitted"
+    assert opened["real_orders"][0]["real_open_balance_after_open"] == 0
+    assert opened["real_orders"][0]["real_open_quantity"] == pytest.approx(1.42857)
+    assert opened["real_orders"][0]["real_open_quantity_source"] == "order_response_taking_amount"
+    assert opened["real_orders"][0]["real_open_avg_price"] == pytest.approx(0.7, abs=0.001)
+    assert closed[0]["status"] == "submitted"
+    assert closed[0]["amount"] == pytest.approx(1.42857)
+    assert executor.sells[0].amount == pytest.approx(1.42857)
+    assert executor.balance_checks == ["down-token"]
+
+
+def test_paper_real_trading_close_old_zero_quantity_open_does_not_sell_estimate(tmp_path: Path):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("real-paper-old-zero@example.com", "Real Paper", hash_password("secure-pass"))
+    run_group = {
+        "id": "run-real-paper",
+        "paper_trading": {
+            "real_trading_enabled": True,
+            "source_group_id": "source-real-paper",
+            "source_strategy_id": "source-real-paper-strategy",
+        },
+    }
+    run_strategy = {"id": "run-real-paper-strategy"}
+    session_id = "real-paper-session"
+    event_payload = {
+        "slug": "btc-updown-5m-1782639600",
+        "title": "Bitcoin Up or Down",
+        "tokens": [
+            {"token_id": "up-token", "outcome": "Up"},
+            {"token_id": "down-token", "outcome": "Down"},
+        ],
+    }
+    snapshot = {"event": event_payload}
+    trade = {
+        "side": "DOWN",
+        "status": "closed",
+        "opened_at": datetime.fromtimestamp(1782639610, timezone.utc).isoformat(),
+        "closed_at": datetime.fromtimestamp(1782639640, timezone.utc).isoformat(),
+        "scale_entry_index": 1,
+        "exit_price": 0.5,
+    }
+    paper_id = routes_module.uuid.uuid5(
+        routes_module.uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{routes_module._paper_event_key(session_id, event_payload)}",
+    ).hex
+    open_order_id = routes_module._paper_real_order_id(paper_id, trade)
+    store.append_user_record(
+        user["id"],
+        "real_orders",
+        {
+            "id": open_order_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "status": "submitted",
+            "side": "DOWN",
+            "token_id": "down-token",
+            "amount": 1.0,
+            "limit_price": 0.99,
+            "real_open_quantity": 0,
+            "response": {"success": True, "orderID": "old-open-without-signed-quantity"},
+        },
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.sells = []
+            self.balance_checks = []
+
+        def market_sell(self, order_request):
+            self.sells.append(order_request)
+            return {
+                "success": True,
+                "orderID": "old-zero-close",
+                "_timing": {
+                    "send_at": routes_module._paper_clock_ms(),
+                    "duration_ms": 6.5,
+                },
+            }
+
+        def token_balance(self, token_id):
+            self.balance_checks.append(token_id)
+            return 999
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+            )
+        )
+    )
+
+    closed = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        session_id,
+        event_payload,
+        snapshot,
+        [trade],
+    )
+
+    assert closed[0]["status"] == "failed"
+    assert closed[0]["amount"] is None
+    assert "Could not resolve quantity to close" in closed[0]["error"]
+    assert executor.sells == []
+    assert executor.balance_checks == []
+
+
+def test_manual_paper_trade_open_and_close_updates_same_transaction(tmp_path: Path, monkeypatch):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("manual-paper@example.com", "Manual Paper", hash_password("secure-pass"))
+    source_group = {
+        "id": "source-manual-paper",
+        "name": "Source Manual Paper",
+        "assets": ["BTC"],
+        "asset_labels": ["Bitcoin"],
+        "timeframe": "5m",
+        "timeframe_label": "5m",
+        "starting_balance": 100,
+    }
+    source_strategy = {
+        "id": "source-manual-paper-strategy",
+        "group_id": source_group["id"],
+        "name": "Manual paper strategy",
+        "family": "quote_momentum",
+        "family_label": "Quote Momentum",
+        "description": "Test strategy",
+        "parameters": {
+            "family": "quote_momentum",
+            "entry_second": 10,
+            "quote_edge_cents": 1,
+            "allocation_pct": 0.1,
+            "fee_bps": 0,
+            "exit_condition": "settlement",
+            "price_source": "saved_live_monitor_bid_ask",
+        },
+        "metrics": {"initial_capital": 100},
+    }
+    store.save_group_bundle(user["id"], source_group, [source_strategy], [])
+    run_group, run_strategy = routes_module._create_paper_run_group(
+        store,
+        user["id"],
+        source_group,
+        source_strategy,
+        "manual-paper-session",
+        SimpleNamespace(slug="previous", window_start_ts=1782639300),
+        100,
+        True,
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.buys = []
+            self.sells = []
+            self.balance_checks = []
+            self.balances = {}
+
+        def market_buy(self, order_request):
+            self.buys.append(order_request)
+            self.balances[order_request.token_id] = 1.4
+            return {"success": True, "orderID": "manual-buy"}
+
+        def market_sell(self, order_request):
+            self.sells.append(order_request)
+            current = self.balances.get(order_request.token_id, 0)
+            self.balances[order_request.token_id] = max(0, current - order_request.amount)
+            return {"success": True, "orderID": "manual-sell"}
+
+        def token_balance(self, token_id):
+            self.balance_checks.append(token_id)
+            return self.balances.get(token_id, 0)
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+                live_monitor=SimpleNamespace(),
+            )
+        )
+    )
+    monkeypatch.setattr(settings, "polymarket_live_order_amount", 1.0)
+    start_ts = 1782639600
+    snapshot = {
+        "event": {
+            "slug": "btc-updown-5m-1782639600",
+            "title": "Bitcoin Up or Down",
+            "window_start_ts": start_ts,
+            "window_end_ts": start_ts + 300,
+            "tokens": [
+                {"token_id": "up-token", "outcome": "Up", "condition_id": "condition"},
+                {"token_id": "down-token", "outcome": "Down", "condition_id": "condition"},
+            ],
+        },
+        "quotes": [
+            {"token_id": "up-token", "outcome": "Up", "bid": 0.48, "ask": 0.5},
+            {"token_id": "down-token", "outcome": "Down", "bid": 0.49, "ask": 0.52},
+        ],
+        "history": [
+            {
+                "t": start_ts + 20,
+                "crypto_price": 100.1,
+                "target_price": 100,
+                "target_price_ts": start_ts,
+                "yes_bid": 48,
+                "yes_ask": 50,
+                "yes_mid": 49,
+                "no_bid": 49,
+                "no_ask": 52,
+            }
+        ],
+    }
+
+    opened = routes_module._paper_manual_open_transaction(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        "manual-paper-session",
+        snapshot,
+        "UP",
+    )
+    closed = routes_module._paper_manual_close_transaction(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        snapshot,
+    )
+
+    assert opened["status"] == "open"
+    assert closed["id"] == opened["id"]
+    assert closed["status"] == "closed"
+    assert closed["exit_type"] == "manual_market"
+    assert closed["exit_price"] == 0.48
+    assert closed["closed_quantity"] == pytest.approx(1.4)
+    assert closed["actual_token_balance_before_close"] == pytest.approx(1.4)
+    assert closed["closed_quantity_source"] == "stored_open_balance"
+    assert closed["pnl"] == pytest.approx(-0.328)
+    assert len(executor.buys) == 1
+    assert len(executor.sells) == 1
+    assert executor.buys[0].order_type == "FAK"
+    assert executor.sells[0].order_type == "FAK"
+    assert executor.buys[0].price == 0.99
+    assert executor.sells[0].price == 0.01
+    assert executor.balance_checks == ["up-token"]
+    assert executor.sells[0].amount == pytest.approx(1.4)
+    paper_records = store.list_user_records(user["id"], "paper_trades")
+    assert len(paper_records) == 1
+    assert paper_records[0]["trade_count"] == 1
+    assert store.get_user_record(user["id"], "transactions", opened["id"])["closed_at"]
 
 
 def test_live_monitor_quality_scan_finds_target_and_history_issues(
@@ -2841,7 +3627,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
                 "timeframe": "5m",
                 "strategy_mode": "smart",
                 "include_partial_contracts": "true",
-                "strategy_count": "7",
+                "strategy_count": "8",
                 "starting_balance": "500",
             },
         )
@@ -2865,6 +3651,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_breakout_confirmation",
             "smart_pullback_continuation",
             "smart_settlement_drift",
+            "price_threshold_70_stop_40",
         }
         assert {
             "smart_value_edge",
@@ -2874,6 +3661,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_breakout_confirmation",
             "smart_pullback_continuation",
             "smart_settlement_drift",
+            "price_threshold_70_stop_40",
         } <= smart_families
         all_trades = store.list_user_records_filtered(
             user["id"], "transactions", {"group_id": group["id"]}

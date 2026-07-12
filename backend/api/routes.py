@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import queue
+import re
 import shutil
 import tarfile
 import threading
@@ -42,6 +43,7 @@ from backend.strategy_generator.live_monitor_generator import (
     ALL_LIVE_FAMILY_LABELS,
     SMART_LIVE_FAMILY_LABELS,
 )
+from backend.trading import PolymarketLiveOrderExecutor, PolymarketLiveOrderRequest
 from config.settings import ROOT_DIR, settings
 
 router = APIRouter()
@@ -49,6 +51,8 @@ templates = Jinja2Templates(directory=ROOT_DIR / "frontend" / "templates")
 logger = logging.getLogger(__name__)
 _PAPER_VISUAL_PREVIEW_LOCK = threading.Lock()
 _PAPER_VISUAL_PREVIEWS: dict[str, dict] = {}
+_PAPER_TOKEN_WARM_LOCK = threading.Lock()
+_PAPER_WARMED_TOKEN_IDS: set[str] = set()
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
 QUALITY_REPORT_CACHE_TTL_SECONDS = 900
 QUALITY_CONTRACT_LIMITS = {
@@ -2006,6 +2010,7 @@ def _create_paper_run_group(
     session_id: str,
     initial_event: object | None = None,
     starting_balance: float | None = None,
+    real_trading_enabled: bool = False,
 ) -> tuple[dict, dict]:
     now = utc_iso()
     group_id = uuid.uuid4().hex
@@ -2060,6 +2065,8 @@ def _create_paper_run_group(
             "strategy_id": strategy_id,
             "source_strategy_name": source_strategy.get("name"),
             "session_id": session_id,
+            "real_trading_enabled": bool(real_trading_enabled),
+            "real_order_amount": round(min(float(settings.polymarket_live_order_amount or 1.0), 1.0), 2),
             "initial_event_slug": getattr(initial_event, "slug", None),
             "initial_window_start_ts": getattr(initial_event, "window_start_ts", None),
             "deleted_saved_record_ids": [],
@@ -2084,6 +2091,8 @@ def _create_paper_run_group(
             "source_group_id": source_group["id"],
             "source_strategy_id": source_strategy["id"],
             "session_id": session_id,
+            "real_trading_enabled": bool(real_trading_enabled),
+            "real_order_amount": round(min(float(settings.polymarket_live_order_amount or 1.0), 1.0), 2),
         },
         "created_at": now,
     }
@@ -2779,15 +2788,38 @@ def _paper_live_trade_preview(
             history,
             trades,
         )
+    real_orders = _execute_paper_real_trading_signals(
+        request,
+        user_id,
+        run_group,
+        run_strategy,
+        session_id,
+        event_payload,
+        snapshot,
+        trades,
+    )
+    real_order_failures = [
+        order for order in real_orders if str(order.get("status") or "") == "failed"
+    ]
+    real_order_submitted = [
+        order for order in real_orders if str(order.get("status") or "") == "submitted"
+    ]
+    message = (
+        f"{len(trades)} live paper marker(s)"
+        if trades
+        else "Waiting for this strategy's entry conditions."
+    )
+    if real_order_submitted:
+        message += f" Real order submitted: ${_paper_real_order_amount():.2f}."
+    if real_order_failures:
+        message += f" Real order failed: {real_order_failures[-1].get('error')}"
     return {
         "paper_trades": trades,
+        "real_orders": real_orders,
         "paper_trade_status": {
             "status": "active" if trades else "watching",
-            "message": (
-                f"{len(trades)} live paper marker(s)"
-                if trades
-                else "Waiting for this strategy's entry conditions."
-            ),
+            "real_trading_enabled": bool((run_group.get("paper_trading") or {}).get("real_trading_enabled")),
+            "message": message,
         },
     }
 
@@ -2823,6 +2855,21 @@ def _paper_session_payload(
     payload["run_group_id"] = run_group["id"]
     payload["run_strategy_id"] = run_strategy["id"]
     payload["run_url"] = f"/groups/{run_group['id']}/strategies/{run_strategy['id']}"
+    payload["manual_open_url"] = (
+        f"/api/paper-trading/{source_group['id']}/strategies/"
+        f"{source_strategy['id']}/sessions/{session.id}/manual/open"
+    )
+    payload["manual_close_url"] = (
+        f"/api/paper-trading/{source_group['id']}/strategies/"
+        f"{source_strategy['id']}/sessions/{session.id}/manual/close"
+    )
+    payload["real_trading_enabled"] = bool(
+        (run_group.get("paper_trading") or {}).get("real_trading_enabled")
+    )
+    payload["real_order_amount"] = (run_group.get("paper_trading") or {}).get(
+        "real_order_amount",
+        _paper_real_order_amount(),
+    )
     payload["snapshot"].update(
         _paper_existing_trade_preview(request, user_id, run_group, payload["snapshot"])
     )
@@ -2870,6 +2917,856 @@ def _paper_existing_trade_preview(
             ),
         },
     }
+
+
+def _paper_real_order_id(paper_id: str, trade: dict) -> str:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        ":".join(
+            str(part)
+            for part in (
+                "paper-real-order",
+                paper_id,
+                trade.get("opened_at") or "",
+                trade.get("side") or "",
+                trade.get("scale_entry_index") or 1,
+            )
+        ),
+    ).hex
+
+
+def _paper_real_close_order_id(paper_id: str, trade: dict) -> str:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        ":".join(
+            str(part)
+            for part in (
+                "paper-real-close-order",
+                paper_id,
+                trade.get("opened_at") or "",
+                trade.get("closed_at") or "",
+                trade.get("side") or "",
+                trade.get("scale_entry_index") or 1,
+            )
+        ),
+    ).hex
+
+
+def _paper_token_id_for_side(snapshot: dict, side: str) -> str | None:
+    wanted = "up" if str(side or "").upper() == "UP" else "down"
+    tokens = (snapshot.get("event") or {}).get("tokens") or []
+    for token in tokens:
+        if str(token.get("outcome") or "").strip().lower() == wanted:
+            return str(token.get("token_id") or "").strip() or None
+    if len(tokens) >= 2:
+        index = 0 if wanted == "up" else 1
+        return str(tokens[index].get("token_id") or "").strip() or None
+    return None
+
+
+def _paper_real_order_amount() -> float:
+    amount = _number_or_none(settings.polymarket_live_order_amount)
+    if amount is None or amount <= 0:
+        amount = 1.0
+    return round(min(amount, 1.0), 2)
+
+
+def _paper_real_order_type() -> str:
+    return "FAK"
+
+
+def _paper_aggressive_limit_price(action: str) -> float:
+    return 0.99 if str(action or "").upper() == "BUY" else 0.01
+
+
+def _paper_clock_ms() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _paper_timing_from_response(response: dict | None) -> dict:
+    if not isinstance(response, dict):
+        return {}
+    timing = response.get("_timing")
+    return timing if isinstance(timing, dict) else {}
+
+
+def _paper_open_balance_info(executor, token_id: str) -> tuple[float | None, dict | None, str]:
+    balance_info = getattr(executor, "token_balance_info", None)
+    if callable(balance_info):
+        info = balance_info(token_id)
+        if isinstance(info, dict):
+            return _number_or_none(info.get("balance")), info, str(info.get("source") or "post_open_balance")
+    return executor.token_balance(token_id), None, "post_open_balance"
+
+
+def _paper_open_fill_quantity(response: dict | None) -> tuple[float | None, str | None]:
+    if not isinstance(response, dict):
+        return None, None
+    if str(response.get("success")).lower() == "false":
+        return None, None
+    status = str(response.get("status") or "").lower()
+    if status and status not in {"matched", "filled", "partially_filled", "partial"}:
+        return None, None
+    quantity = _number_or_none(response.get("takingAmount"))
+    if quantity is None or quantity <= 0:
+        return None, None
+    return math.floor(quantity * 1_000_000) / 1_000_000, "order_response_taking_amount"
+
+
+def _paper_signal_to_clob_ms(signal_at: str | None, clob_send_at: str | None) -> float | None:
+    if not signal_at or not clob_send_at:
+        return None
+    try:
+        start = datetime.fromisoformat(str(signal_at).replace("Z", "+00:00"))
+        sent = datetime.fromisoformat(str(clob_send_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return round((sent - start).total_seconds() * 1000, 3)
+
+
+def _paper_mutable_real_order_fields(record: dict) -> dict:
+    immutable = {"id", "group_id", "strategy_id", "created_at"}
+    return {key: value for key, value in record.items() if key not in immutable}
+
+
+def _paper_live_order_executor(request: Request) -> PolymarketLiveOrderExecutor:
+    executor = getattr(request.app.state, "polymarket_live_order_executor", None)
+    if executor is None:
+        executor = PolymarketLiveOrderExecutor()
+        request.app.state.polymarket_live_order_executor = executor
+    return executor
+
+
+def _warm_paper_live_order_executor(request: Request, user_id: str, session_id: str) -> None:
+    try:
+        executor = _paper_live_order_executor(request)
+        prepare = getattr(executor, "prepare", None)
+        if callable(prepare):
+            prepare()
+        else:
+            executor.validate_ready()
+        _store(request).log(user_id, "paper_real_order_executor_warmed", {"session_id": session_id})
+    except Exception as error:
+        logger.exception("Paper real trading executor warmup failed")
+        try:
+            _store(request).log(
+                user_id,
+                "paper_real_order_executor_warm_failed",
+                {"session_id": session_id, "error": _error_message(error)},
+            )
+        except Exception:
+            logger.exception("Paper real trading executor warmup failure logging failed")
+
+
+def _paper_snapshot_token_ids(snapshot: dict) -> list[str]:
+    tokens = (snapshot.get("event") or {}).get("tokens") or []
+    return [
+        str(token.get("token_id") or "").strip()
+        for token in tokens
+        if isinstance(token, dict) and str(token.get("token_id") or "").strip()
+    ]
+
+
+def _warm_paper_live_order_tokens(request: Request, token_ids: list[str]) -> None:
+    with _PAPER_TOKEN_WARM_LOCK:
+        pending = [token_id for token_id in token_ids if token_id not in _PAPER_WARMED_TOKEN_IDS]
+        _PAPER_WARMED_TOKEN_IDS.update(pending)
+    if not pending:
+        return
+    try:
+        executor = _paper_live_order_executor(request)
+        prepare_tokens = getattr(executor, "prepare_tokens", None)
+        if callable(prepare_tokens):
+            prepare_tokens(pending)
+    except Exception:
+        logger.exception("Paper real trading token warmup failed")
+
+
+def _paper_real_order_retryable(record: dict) -> bool:
+    if str(record.get("status") or "") != "failed":
+        return False
+    error = str(record.get("error") or "").lower()
+    return any(
+        text in error
+        for text in (
+            "real trading is disabled",
+            "private_key",
+            "proxy_address",
+            "polymarket_private_key",
+            "polymarket_funder",
+            "api_key",
+            "api_secret",
+            "api_passphrase",
+            "py-clob-client-v2 is not installed",
+            "couldn't be fully filled",
+            "fully filled or killed",
+            "no orders found to match",
+            "not enough balance / allowance",
+            "balance is not enough",
+        )
+    )
+
+
+def _paper_error_balance_quantity(record: dict | None) -> float | None:
+    error = str((record or {}).get("error") or "")
+    match = re.search(r"\bbalance:\s*(\d+)", error, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(0.0, int(match.group(1)) / 1_000_000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _paper_open_record_quantity(record: dict | None) -> tuple[float | None, str]:
+    stored_quantity = _number_or_none((record or {}).get("real_open_quantity"))
+    if stored_quantity is not None and stored_quantity > 0:
+        return math.floor(stored_quantity * 1_000_000) / 1_000_000, "stored_open_balance"
+    return None, "stored_open_balance"
+
+
+def _paper_quote_for_side(snapshot: dict, side: str) -> dict | None:
+    wanted = "up" if str(side or "").upper() == "UP" else "down"
+    for quote in snapshot.get("quotes") or []:
+        if str(quote.get("outcome") or "").strip().lower() == wanted:
+            return quote
+    return None
+
+
+def _paper_current_price(snapshot: dict, side: str, field: str) -> float | None:
+    quote = _paper_quote_for_side(snapshot, side)
+    if not quote:
+        return None
+    return _number_or_none(quote.get(field))
+
+
+def _paper_current_history(snapshot: dict) -> list[dict]:
+    history = [
+        row for row in snapshot.get("history") or []
+        if isinstance(row, dict) and _number_or_none(row.get("t")) is not None
+    ]
+    history.sort(key=lambda row: float(row["t"]))
+    return history
+
+
+def _paper_manual_scope(
+    request: Request,
+    user_id: str,
+    source_group_id: str,
+    source_strategy_id: str,
+    session_id: str,
+) -> tuple[dict, dict, dict, dict, object, dict]:
+    store = _store(request)
+    source_group = store.get_user_record(user_id, "groups", source_group_id)
+    source_strategy = store.get_user_record(user_id, "strategies", source_strategy_id)
+    if not source_group or not source_strategy or source_strategy.get("group_id") != source_group_id:
+        raise HTTPException(404, "Paper trading source strategy not found")
+    session = request.app.state.live_monitor.get(session_id)
+    if not session or session.user_id != user_id:
+        raise HTTPException(404, "Paper trading live session not found")
+    run_pair = next(
+        (
+            (run_group, run_strategy)
+            for run_group, run_strategy in _paper_run_for_source(
+                store, user_id, source_group_id, source_strategy_id
+            )
+            if str((run_group.get("paper_trading") or {}).get("session_id") or "") == session_id
+        ),
+        None,
+    )
+    if run_pair is None:
+        raise HTTPException(404, "Paper trading run not found for this session")
+    snapshot = session.snapshot(history_limit=None)
+    return source_group, source_strategy, run_pair[0], run_pair[1], session, snapshot
+
+
+def _ensure_manual_paper_record(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session_id: str,
+    event_payload: dict,
+    history: list[dict],
+) -> dict:
+    store = _store(request)
+    event_key = _paper_event_key(session_id, event_payload)
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{event_key}",
+    ).hex
+    existing = store.get_user_record(user_id, "paper_trades", paper_id)
+    if existing:
+        return existing
+    initial_capital = _paper_run_current_cash(
+        store,
+        user_id,
+        run_group,
+        run_strategy,
+        _number_or_none(event_payload.get("window_start_ts")),
+    )
+    record = _paper_record_from_snapshot(
+        run_group,
+        run_strategy,
+        source_group,
+        source_strategy,
+        session_id,
+        event_payload,
+        history,
+        [],
+        initial_capital=initial_capital,
+    )
+    record["manual_trade"] = True
+    record["contract_record"] = {
+        "id": record["id"],
+        "history": history,
+        "question": event_payload.get("title"),
+        "event_title": event_payload.get("event_title") or event_payload.get("title"),
+        "slug": event_payload.get("slug"),
+        "window_start_ts": event_payload.get("window_start_ts"),
+        "window_end_ts": event_payload.get("window_end_ts"),
+    }
+    return store.append_user_record(user_id, "paper_trades", record)
+
+
+def _paper_manual_open_transaction(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session_id: str,
+    snapshot: dict,
+    side: str = "UP",
+) -> dict:
+    event_payload = snapshot.get("event") or {}
+    history = _paper_current_history(snapshot)
+    if not event_payload or not history:
+        raise HTTPException(422, "Live session snapshot is not ready yet")
+    token_id = _paper_token_id_for_side(snapshot, side)
+    if not token_id:
+        raise HTTPException(422, f"Could not resolve {side} Polymarket token")
+    ask_price = _paper_current_price(snapshot, side, "ask")
+    if ask_price is None or ask_price <= 0:
+        raise HTTPException(422, f"No live {side} ask is available")
+    amount = _paper_real_order_amount()
+    executor = _paper_live_order_executor(request)
+    response = executor.market_buy(
+        PolymarketLiveOrderRequest(
+            token_id=token_id,
+            amount=amount,
+            order_type=_paper_real_order_type(),
+            price=_paper_aggressive_limit_price("BUY"),
+        )
+    )
+    real_open_balance = None
+    real_open_quantity = None
+    real_open_balance_info = None
+    real_open_quantity_source = "post_open_balance"
+    try:
+        real_open_balance, real_open_balance_info, real_open_quantity_source = _paper_open_balance_info(
+            executor,
+            token_id,
+        )
+        real_open_quantity = math.floor(real_open_balance * 1_000_000) / 1_000_000
+    except Exception:
+        logger.exception("Paper manual real trading balance lookup failed after open")
+    paper_record = _ensure_manual_paper_record(
+        request,
+        user_id,
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        session_id,
+        event_payload,
+        history,
+    )
+    now = utc_iso()
+    trade_id = uuid.uuid5(uuid.NAMESPACE_URL, f"paper-manual-open:{paper_record['id']}:{now}:{side}").hex
+    balance_before = _paper_run_current_cash(
+        _store(request),
+        user_id,
+        run_group,
+        run_strategy,
+        _number_or_none(event_payload.get("window_start_ts")),
+    )
+    trade = _store(request).append_user_record(
+        user_id,
+        "transactions",
+        {
+            "id": trade_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "paper_trade_id": paper_record["id"],
+            "paper_mode": True,
+            "manual_trade": True,
+            "status": "open",
+            "real_order_status": "submitted",
+            "real_open_response": response,
+            "real_open_balance_after_open": (
+                round(real_open_balance, 8) if real_open_balance is not None else None
+            ),
+            "real_open_quantity": real_open_quantity,
+            "real_open_quantity_source": real_open_quantity_source,
+            "real_open_balance_response": real_open_balance_info,
+            "token_id": token_id,
+            "event_id": str(event_payload.get("slug") or paper_record["id"]),
+            "market_id": str(event_payload.get("slug") or session_id),
+            "market_question": event_payload.get("title") or "Manual live paper trade",
+            "asset": (source_group.get("assets") or ["LIVE"])[0],
+            "timeframe": source_group.get("timeframe") or "live",
+            "side": side,
+            "resolved_outcome": "OPEN",
+            "opened_at": now,
+            "closed_at": None,
+            "expiration_time": (
+                datetime.fromtimestamp(float(event_payload["window_end_ts"]), timezone.utc).isoformat()
+                if _number_or_none(event_payload.get("window_end_ts")) is not None
+                else None
+            ),
+            "entry_price": round(ask_price, 8),
+            "ask_price": round(ask_price, 8),
+            "allocation_pct_used": round(amount / max(balance_before, amount, 1e-9), 8),
+            "contracts_volume": real_open_quantity,
+            "quantity": real_open_quantity,
+            "margin_locked": amount,
+            "entry_fee": 0,
+            "fee_bps": 0,
+            "available_cash_before_entry": round(balance_before, 4),
+            "available_cash_after_entry": round(balance_before - amount, 4),
+            "available_cash_after_close": round(balance_before, 4),
+            "balance_before": round(balance_before, 4),
+            "balance_after": round(balance_before, 4),
+            "exit_price": None,
+            "exit_type": "open",
+            "settlement_value": 0,
+            "pnl": 0,
+            "quote_source": "manual_live_market",
+            "saved_record_id": None,
+            "partial_contract": True,
+        },
+    )
+    _update_paper_trade_totals(_store(request), user_id, paper_record["id"])
+    refreshed_group = _store(request).get_user_record(user_id, "groups", run_group["id"]) or run_group
+    refreshed_strategy = _store(request).get_user_record(user_id, "strategies", run_strategy["id"]) or run_strategy
+    _refresh_paper_run_summary(_store(request), user_id, refreshed_group, refreshed_strategy)
+    return trade
+
+
+def _paper_manual_close_transaction(
+    request: Request,
+    user_id: str,
+    run_group: dict,
+    run_strategy: dict,
+    snapshot: dict,
+) -> dict:
+    trade = _store(request).find_user_record_reverse(
+        user_id,
+        "transactions",
+        {
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "manual_trade": True,
+            "status": "open",
+        },
+    )
+    if not trade:
+        raise HTTPException(422, "No open manual paper trade found")
+    side = str(trade.get("side") or "UP").upper()
+    token_id = str(trade.get("token_id") or "").strip()
+    if not token_id:
+        raise HTTPException(422, "Open manual trade is missing token_id")
+    current_token_id = _paper_token_id_for_side(snapshot, side)
+    if current_token_id and current_token_id != token_id:
+        raise HTTPException(
+            422,
+            "Open manual trade token does not match the current live market token",
+        )
+    bid_price = _paper_current_price(snapshot, side, "bid")
+    if bid_price is None or bid_price < 0:
+        raise HTTPException(422, f"No live {side} bid is available")
+    stored_real_quantity = _number_or_none(trade.get("real_open_quantity"))
+    close_quantity = (
+        math.floor(stored_real_quantity * 1_000_000) / 1_000_000
+        if stored_real_quantity is not None and stored_real_quantity > 0
+        else None
+    )
+    if close_quantity is None or close_quantity <= 0:
+        raise HTTPException(422, "No Polymarket token balance is available to close this manual trade")
+    response = _paper_live_order_executor(request).market_sell(
+        PolymarketLiveOrderRequest(
+            token_id=token_id,
+            amount=close_quantity,
+            side="SELL",
+            order_type=_paper_real_order_type(),
+            price=_paper_aggressive_limit_price("SELL"),
+        )
+    )
+    now = utc_iso()
+    exit_value = round(close_quantity * bid_price, 8)
+    entry_cost = float(trade.get("margin_locked") or 0) + float(trade.get("entry_fee") or 0)
+    pnl = round(exit_value - entry_cost, 8)
+    balance_before = float(trade.get("balance_before") or 0)
+    updated = _store(request).update_user_record(
+        user_id,
+        "transactions",
+        trade["id"],
+        {
+            "status": "closed",
+            "real_close_response": response,
+            "closed_at": now,
+            "quantity": close_quantity,
+            "contracts_volume": close_quantity,
+            "actual_token_balance_before_close": (
+                round(stored_real_quantity, 8) if stored_real_quantity is not None else None
+            ),
+            "closed_quantity": close_quantity,
+            "closed_quantity_source": "stored_open_balance",
+            "exit_price": round(bid_price, 8),
+            "exit_bid_price": round(bid_price, 8),
+            "exit_type": "manual_market",
+            "settlement_value": exit_value,
+            "pnl": pnl,
+            "available_cash_after_close": round(balance_before + pnl, 4),
+            "balance_after": round(balance_before + pnl, 4),
+            "holding_seconds": (
+                round(datetime.fromisoformat(now).timestamp() - _timestamp_from_iso(trade.get("opened_at")), 3)
+                if _timestamp_from_iso(trade.get("opened_at")) is not None
+                else None
+            ),
+        },
+    )
+    paper_id = str(updated.get("paper_trade_id") or "")
+    if paper_id:
+        _update_paper_trade_totals(_store(request), user_id, paper_id)
+    refreshed_group = _store(request).get_user_record(user_id, "groups", run_group["id"]) or run_group
+    refreshed_strategy = _store(request).get_user_record(user_id, "strategies", run_strategy["id"]) or run_strategy
+    _refresh_paper_run_summary(_store(request), user_id, refreshed_group, refreshed_strategy)
+    return updated
+
+
+def _execute_paper_real_trading_signals(
+    request: Request,
+    user_id: str,
+    run_group: dict,
+    run_strategy: dict,
+    session_id: str,
+    event_payload: dict,
+    snapshot: dict,
+    trades: list[dict],
+) -> list[dict]:
+    paper_meta = run_group.get("paper_trading") or {}
+    if not paper_meta.get("real_trading_enabled"):
+        return []
+    store = _store(request)
+    event_key = _paper_event_key(session_id, event_payload)
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{event_key}",
+    ).hex
+    results = []
+    for trade in trades:
+        order_id = _paper_real_order_id(paper_id, trade)
+        signal_status = str(trade.get("status") or "").lower()
+        token_id = _paper_token_id_for_side(snapshot, str(trade.get("side") or ""))
+        amount = _paper_real_order_amount()
+        if signal_status == "closed":
+            open_record = store.get_user_record(user_id, "real_orders", order_id)
+            if not open_record or str(open_record.get("status") or "") != "submitted":
+                continue
+            close_order_id = _paper_real_close_order_id(paper_id, trade)
+            existing_close = store.get_user_record(user_id, "real_orders", close_order_id)
+            if existing_close and not _paper_real_order_retryable(existing_close):
+                results.append(existing_close)
+                continue
+            token_id = str(open_record.get("token_id") or token_id or "").strip() or None
+            stored_quantity = _number_or_none(open_record.get("real_open_quantity"))
+            quantity, quantity_source = _paper_open_record_quantity(open_record)
+            error_balance_quantity = _paper_error_balance_quantity(existing_close)
+            if (
+                error_balance_quantity is not None
+                and error_balance_quantity > 0
+                and quantity is not None
+                and error_balance_quantity < quantity
+                and _paper_real_order_retryable(existing_close or {})
+            ):
+                quantity = error_balance_quantity
+                quantity_source = "previous_clob_error_balance"
+            paper_signal_at = _paper_clock_ms()
+            close_base = {
+                "user_id": user_id,
+                "group_id": run_group["id"],
+                "strategy_id": run_strategy["id"],
+                "source_group_id": paper_meta.get("source_group_id"),
+                "source_strategy_id": paper_meta.get("source_strategy_id"),
+                "session_id": session_id,
+                "paper_trade_id": paper_id,
+                "live_event_key": event_key,
+                "side": str(trade.get("side") or "").upper(),
+                "token_id": token_id,
+                "amount": quantity,
+                "order_type": _paper_real_order_type(),
+                "limit_price": _paper_aggressive_limit_price("SELL"),
+                "order_action": "close",
+                "open_order_id": order_id,
+                "signal_opened_at": trade.get("opened_at"),
+                "signal_closed_at": trade.get("closed_at"),
+                "paper_signal_at": paper_signal_at,
+                "signal_exit_price": trade.get("exit_price") or trade.get("exit_bid_price"),
+                "event_slug": event_payload.get("slug"),
+                "event_title": event_payload.get("title") or event_payload.get("event_title"),
+                "retry_count": int((existing_close or {}).get("retry_count") or 0) + (1 if existing_close else 0),
+                "last_attempt_at": utc_iso(),
+            }
+            try:
+                if not token_id:
+                    raise ValueError("Could not resolve Polymarket token_id for signal side.")
+                if quantity is None or quantity <= 0:
+                    raise ValueError("Could not resolve quantity to close for signal.")
+                quantity = math.floor(float(quantity) * 1_000_000) / 1_000_000
+                response = _paper_live_order_executor(request).market_sell(
+                    PolymarketLiveOrderRequest(
+                        token_id=token_id,
+                        amount=quantity,
+                        side="SELL",
+                        order_type=_paper_real_order_type(),
+                        price=_paper_aggressive_limit_price("SELL"),
+                    )
+                )
+                timing = _paper_timing_from_response(response)
+                clob_send_at = timing.get("send_at")
+                submitted_close = {
+                    **close_base,
+                    "status": "submitted",
+                    "submitted_at": utc_iso(),
+                    "response": response,
+                    "amount": quantity,
+                    "actual_token_balance_before_close": (
+                        round(stored_quantity, 8)
+                        if stored_quantity is not None
+                        else None
+                    ),
+                    "close_quantity_source": quantity_source,
+                    "clob_send_at": clob_send_at,
+                    "signal_to_clob_ms": _paper_signal_to_clob_ms(paper_signal_at, clob_send_at),
+                    "clob_duration_ms": timing.get("duration_ms"),
+                }
+                if existing_close:
+                    record = store.update_user_record(
+                        user_id,
+                        "real_orders",
+                        close_order_id,
+                        _paper_mutable_real_order_fields(submitted_close),
+                    )
+                else:
+                    record = store.append_user_record(
+                        user_id,
+                        "real_orders",
+                        {
+                            "id": close_order_id,
+                            "created_at": utc_iso(),
+                            **submitted_close,
+                        },
+                    )
+                store.log(user_id, "paper_real_order_closed", {
+                    "order_id": close_order_id,
+                    "open_order_id": order_id,
+                    "session_id": session_id,
+                    "side": record["side"],
+                    "amount": quantity,
+                    "token_id": token_id,
+                })
+            except Exception as error:
+                failed_close = {
+                    **close_base,
+                    "status": "failed",
+                    "failed_at": utc_iso(),
+                    "error": _error_message(error),
+                }
+                if existing_close:
+                    record = store.update_user_record(
+                        user_id,
+                        "real_orders",
+                        close_order_id,
+                        _paper_mutable_real_order_fields(failed_close),
+                    )
+                else:
+                    record = store.append_user_record(
+                        user_id,
+                        "real_orders",
+                        {
+                            "id": close_order_id,
+                            "created_at": utc_iso(),
+                            **failed_close,
+                        },
+                    )
+                logger.exception("Paper real trading close order failed")
+                store.log(user_id, "paper_real_order_close_failed", {
+                    "order_id": close_order_id,
+                    "open_order_id": order_id,
+                    "session_id": session_id,
+                    "side": record.get("side"),
+                    "amount": quantity,
+                    "token_id": token_id,
+                    "error": _error_message(error),
+                })
+            results.append(record)
+            continue
+        if signal_status != "open":
+            continue
+        existing = store.get_user_record(user_id, "real_orders", order_id)
+        if existing and not _paper_real_order_retryable(existing):
+            results.append(existing)
+            continue
+        paper_signal_at = _paper_clock_ms()
+        open_base = {
+            "user_id": user_id,
+            "group_id": run_group["id"],
+            "strategy_id": run_strategy["id"],
+            "source_group_id": paper_meta.get("source_group_id"),
+            "source_strategy_id": paper_meta.get("source_strategy_id"),
+            "session_id": session_id,
+            "paper_trade_id": paper_id,
+            "live_event_key": event_key,
+            "side": str(trade.get("side") or "").upper(),
+            "token_id": token_id,
+            "amount": amount,
+            "order_type": _paper_real_order_type(),
+            "limit_price": _paper_aggressive_limit_price("BUY"),
+            "order_action": "open",
+            "signal_opened_at": trade.get("opened_at"),
+            "paper_signal_at": paper_signal_at,
+            "signal_entry_price": trade.get("entry_price") or trade.get("ask_price"),
+            "event_slug": event_payload.get("slug"),
+            "event_title": event_payload.get("title") or event_payload.get("event_title"),
+            "retry_count": int((existing or {}).get("retry_count") or 0) + (1 if existing else 0),
+            "last_attempt_at": utc_iso(),
+        }
+        try:
+            if not token_id:
+                raise ValueError("Could not resolve Polymarket token_id for signal side.")
+            response = _paper_live_order_executor(request).market_buy(
+                PolymarketLiveOrderRequest(
+                    token_id=token_id,
+                    amount=amount,
+                    order_type=_paper_real_order_type(),
+                    price=_paper_aggressive_limit_price("BUY"),
+                )
+            )
+            real_open_balance = None
+            real_open_quantity, real_open_quantity_source = _paper_open_fill_quantity(response)
+            real_open_balance_info = None
+            executor = _paper_live_order_executor(request)
+            if hasattr(executor, "token_balance") or hasattr(executor, "token_balance_info"):
+                try:
+                    real_open_balance, real_open_balance_info, balance_source = _paper_open_balance_info(
+                        executor,
+                        token_id,
+                    )
+                    if real_open_quantity is None and real_open_balance is not None:
+                        real_open_quantity = math.floor(real_open_balance * 1_000_000) / 1_000_000
+                        real_open_quantity_source = balance_source
+                except Exception:
+                    logger.exception("Paper real trading balance lookup failed after signal open")
+            if real_open_quantity_source is None:
+                real_open_quantity_source = "post_open_balance"
+            timing = _paper_timing_from_response(response)
+            clob_send_at = timing.get("send_at")
+            real_open_avg_price = (
+                round(amount / real_open_quantity, 8)
+                if real_open_quantity is not None and real_open_quantity > 0
+                else None
+            )
+            logger.warning(
+                "POLYMARKET_OPEN_BALANCE_RESULT side=%s token_id=%s dollars=%.8f contracts=%s avg_price=%s source=%s balance_info=%s",
+                str(trade.get("side") or "").upper(),
+                token_id,
+                amount,
+                real_open_quantity,
+                real_open_avg_price,
+                real_open_quantity_source,
+                json.dumps(real_open_balance_info, ensure_ascii=False, sort_keys=True, default=str),
+            )
+            submitted_open = {
+                **open_base,
+                "status": "submitted",
+                "submitted_at": utc_iso(),
+                "response": response,
+                "real_open_balance_after_open": (
+                    round(real_open_balance, 8) if real_open_balance is not None else None
+                ),
+                "real_open_quantity": real_open_quantity,
+                "real_open_quantity_source": real_open_quantity_source,
+                "real_open_balance_response": real_open_balance_info,
+                "real_open_notional_amount": amount,
+                "real_open_avg_price": real_open_avg_price,
+                "clob_send_at": clob_send_at,
+                "signal_to_clob_ms": _paper_signal_to_clob_ms(paper_signal_at, clob_send_at),
+                "clob_duration_ms": timing.get("duration_ms"),
+            }
+            if existing:
+                record = store.update_user_record(
+                    user_id,
+                    "real_orders",
+                    order_id,
+                    _paper_mutable_real_order_fields(submitted_open),
+                )
+            else:
+                record = store.append_user_record(
+                    user_id,
+                    "real_orders",
+                    {
+                        "id": order_id,
+                        "created_at": utc_iso(),
+                        **submitted_open,
+                    },
+                )
+            store.log(user_id, "paper_real_order_submitted", {
+                "order_id": order_id,
+                "session_id": session_id,
+                "side": record["side"],
+                "amount": amount,
+                "token_id": token_id,
+            })
+        except Exception as error:
+            failed_open = {
+                **open_base,
+                "status": "failed",
+                "failed_at": utc_iso(),
+                "error": _error_message(error),
+            }
+            if existing:
+                record = store.update_user_record(
+                    user_id,
+                    "real_orders",
+                    order_id,
+                    _paper_mutable_real_order_fields(failed_open),
+                )
+            else:
+                record = store.append_user_record(
+                    user_id,
+                    "real_orders",
+                    {
+                        "id": order_id,
+                        "created_at": utc_iso(),
+                        **failed_open,
+                    },
+                )
+            logger.exception("Paper real trading order failed")
+            store.log(user_id, "paper_real_order_failed", {
+                "order_id": order_id,
+                "session_id": session_id,
+                "side": record.get("side"),
+                "amount": amount,
+                "token_id": token_id,
+                "error": _error_message(error),
+            })
+        results.append(record)
+    return results
 
 
 def _paper_visual_preview_key(session_id: str, run_strategy: dict, snapshot: dict) -> str:
@@ -2953,6 +3850,7 @@ async def start_paper_trading_monitor(
     strategy_id: str,
     event_url: Annotated[str, Form()],
     starting_balance: Annotated[float, Form()] = 100.0,
+    real_trading: Annotated[bool, Form()] = False,
 ):
     user, _store_obj, _group, _strategy = _paper_trading_strategy_scope(
         request, group_id, strategy_id
@@ -2971,7 +3869,17 @@ async def start_paper_trading_monitor(
         session.id,
         session.event,
         starting_balance,
+        bool(real_trading),
     )
+    if real_trading:
+        asyncio.create_task(
+            asyncio.to_thread(
+                _warm_paper_live_order_executor,
+                request,
+                user["id"],
+                session.id,
+            )
+        )
     payload = _paper_session_payload(
         request, user["id"], _group, _strategy, run_group, run_strategy, session
     )
@@ -3063,11 +3971,42 @@ async def paper_trading_monitor_events(
                     asyncio.create_task(finalize_saved_contract())
                 snapshot = session.snapshot(history_limit=None)
                 cache_key = _paper_visual_preview_key(session_id, run_strategy, snapshot)
-                paper_payload = (
-                    _paper_cached_visual_preview(cache_key)
-                    or _paper_existing_trade_preview(request, user["id"], run_group, snapshot)
-                )
-                if not _paper_preview_running(cache_key, time.time()):
+                if (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            _warm_paper_live_order_tokens,
+                            request,
+                            _paper_snapshot_token_ids(snapshot),
+                        )
+                    )
+                    preview_snapshot = dict(snapshot)
+                    preview_snapshot["history"] = list(snapshot.get("history") or [])
+                    try:
+                        paper_payload = await asyncio.to_thread(
+                            _paper_live_trade_preview,
+                            request,
+                            user["id"],
+                            source_group,
+                            source_strategy,
+                            run_group,
+                            run_strategy,
+                            preview_snapshot,
+                            persist=False,
+                        )
+                        _store_paper_visual_preview(cache_key, paper_payload)
+                    except Exception as error:
+                        logger.exception("Paper trading real-time preview failed")
+                        paper_payload = {
+                            "paper_trades": [],
+                            "paper_trade_status": {"status": "error", "message": _error_message(error)},
+                        }
+                        _store_paper_visual_preview(cache_key, None, error)
+                else:
+                    paper_payload = (
+                        _paper_cached_visual_preview(cache_key)
+                        or _paper_existing_trade_preview(request, user["id"], run_group, snapshot)
+                    )
+                if not (run_group.get("paper_trading") or {}).get("real_trading_enabled") and not _paper_preview_running(cache_key, time.time()):
                     preview_snapshot = dict(snapshot)
                     preview_snapshot["history"] = list(snapshot.get("history") or [])
 
@@ -3106,6 +4045,56 @@ async def paper_trading_monitor_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/sessions/{session_id}/manual/open")
+def open_manual_paper_trade(request: Request, group_id: str, strategy_id: str, session_id: str):
+    user = _require_user(request)
+    source_group, source_strategy, run_group, run_strategy, _session, snapshot = _paper_manual_scope(
+        request, user["id"], group_id, strategy_id, session_id
+    )
+    if not (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+        raise HTTPException(422, "Start this paper session with Real trading enabled first")
+    trade = _paper_manual_open_transaction(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        session_id,
+        snapshot,
+        "UP",
+    )
+    snapshot.update(_paper_existing_trade_preview(request, user["id"], run_group, snapshot))
+    return {
+        "status": "opened",
+        "trade": _paper_trade_marker_payload(trade),
+        "snapshot": snapshot,
+    }
+
+
+@router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/sessions/{session_id}/manual/close")
+def close_manual_paper_trade(request: Request, group_id: str, strategy_id: str, session_id: str):
+    user = _require_user(request)
+    _source_group, _source_strategy, run_group, run_strategy, _session, snapshot = _paper_manual_scope(
+        request, user["id"], group_id, strategy_id, session_id
+    )
+    if not (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+        raise HTTPException(422, "Start this paper session with Real trading enabled first")
+    trade = _paper_manual_close_transaction(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        snapshot,
+    )
+    snapshot.update(_paper_existing_trade_preview(request, user["id"], run_group, snapshot))
+    return {
+        "status": "closed",
+        "trade": _paper_trade_marker_payload(trade),
+        "snapshot": snapshot,
+    }
 
 
 @router.post("/api/paper-trading/{group_id}/strategies/{strategy_id}/sync")

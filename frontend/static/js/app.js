@@ -613,6 +613,12 @@ function initLiveMonitor(){
   const fmtSeconds=value=>Number.isFinite(value)?Math.round(value)+'s':'-';
   const fmtSecondsPrecise=value=>Number.isFinite(value)?Number(value).toFixed(1).replace(/\\.0$/,'')+'s':'-';
   const fmtAge=timestamp=>timestamp?new Date(timestamp*1000).toLocaleTimeString():'Waiting';
+  const fmtClockMs=value=>{
+    const date=value?new Date(value):new Date();
+    if(Number.isNaN(date.getTime()))return String(value||'');
+    const pad=(number,size=2)=>String(number).padStart(size,'0');
+    return pad(date.getHours())+':'+pad(date.getMinutes())+':'+pad(date.getSeconds())+'.'+pad(date.getMilliseconds(),3);
+  };
   const fmtSavedDate=value=>value?new Date(value).toLocaleString():'-';
   const shortToken=value=>value?value.slice(0,8)+'...'+value.slice(-6):'-';
   const categoryLabel=value=>{
@@ -640,7 +646,7 @@ function initLiveMonitor(){
   const setDot=(element,connected,error=false)=>{if(!element)return;element.classList.toggle('connected',!!connected&&!error);element.classList.toggle('error',!!error)};
   const setBusy=busy=>{
     const button=form.querySelector('button[type="submit"]');
-    button.disabled=busy;button.textContent=busy?'Starting...':'Start tracking';
+    button.disabled=busy;button.textContent=busy?'Starting...':(savedMode==='paper'?'Start trading':'Start tracking');
   };
   const resetSavedChart=()=>{if(savedChart){savedChart.destroy();savedChart=null}};
   const setSavedControlsBusy=busy=>{
@@ -706,7 +712,7 @@ function initLiveMonitor(){
     card.innerHTML=[
       '<div class="section-title">',
       '<div><p class="eyebrow">Live monitor</p><h2 class="text-xl" data-live-event-title>Live session</h2><p class="muted" data-live-event-slug>-</p></div>',
-      '<div class="live-card-actions"><button class="secondary" type="button" data-live-chart-toggle>Show chart</button><button class="secondary" type="button" data-live-stop>Stop</button></div>',
+      '<div class="live-card-actions"><button class="secondary hidden" type="button" data-paper-manual-open>Open UP $1</button><button class="secondary hidden" type="button" data-paper-manual-close>Close manual</button><button class="secondary" type="button" data-live-chart-toggle>Show chart</button><button class="secondary" type="button" data-live-stop>Stop</button></div>',
       '</div>',
       '<div class="live-status-grid">',
       '<div class="metric-card"><p>Crypto price</p><strong data-live-crypto-price>-</strong><span class="muted"><span class="ws-dot" data-live-crypto-dot></span><span data-live-crypto-status>Waiting</span></span></div>',
@@ -722,6 +728,8 @@ function initLiveMonitor(){
       id,
       stopUrl:payload.stop_url,
       eventsUrl:payload.events_url,
+      manualOpenUrl:payload.manual_open_url||'',
+      manualCloseUrl:payload.manual_close_url||'',
       runUrl:payload.run_url||'',
       source:null,
       chart:null,
@@ -731,6 +739,7 @@ function initLiveMonitor(){
       lastPayloadAt:0,
       staleWarningShown:false,
       streamWarningShown:false,
+      paperRealOrderLogKeys:new Set(),
       eventTitle:card.querySelector('[data-live-event-title]'),
       eventSlug:card.querySelector('[data-live-event-slug]'),
       cryptoPrice:card.querySelector('[data-live-crypto-price]'),
@@ -744,12 +753,18 @@ function initLiveMonitor(){
       chartElement:card.querySelector('[data-live-chart]'),
       chartWrap:card.querySelector('[data-live-chart-wrap]'),
       chartToggle:card.querySelector('[data-live-chart-toggle]'),
+      manualOpenButton:card.querySelector('[data-paper-manual-open]'),
+      manualCloseButton:card.querySelector('[data-paper-manual-close]'),
       stopButton:card.querySelector('[data-live-stop]'),
       sessionShort:card.querySelector('[data-live-session-short]')
     };
     controller.sessionShort.textContent=shortToken(id);
     controller.chartToggle.addEventListener('click',()=>toggleChart(controller));
+    controller.manualOpenButton.addEventListener('click',()=>manualPaperAction(controller,'open'));
+    controller.manualCloseButton.addEventListener('click',()=>manualPaperAction(controller,'close'));
     controller.stopButton.addEventListener('click',()=>stopSession(controller));
+    controller.manualOpenButton.classList.toggle('hidden',!controller.manualOpenUrl);
+    controller.manualCloseButton.classList.toggle('hidden',!controller.manualCloseUrl);
     sessionControllers.set(id,controller);
     return controller;
   };
@@ -758,7 +773,11 @@ function initLiveMonitor(){
     if(existing){
       existing.stopUrl=payload.stop_url;
       existing.eventsUrl=payload.events_url;
+      existing.manualOpenUrl=payload.manual_open_url||existing.manualOpenUrl||'';
+      existing.manualCloseUrl=payload.manual_close_url||existing.manualCloseUrl||'';
       existing.runUrl=payload.run_url||existing.runUrl||'';
+      existing.manualOpenButton?.classList.toggle('hidden',!existing.manualOpenUrl);
+      existing.manualCloseButton?.classList.toggle('hidden',!existing.manualCloseUrl);
       return existing;
     }
     return createSessionCard(payload);
@@ -1048,6 +1067,60 @@ function initLiveMonitor(){
       controller.rows.appendChild(tr);
     }
   };
+  const renderRealOrderLogs=(payload,controller)=>{
+    if(savedMode!=='paper'||!controller||!Array.isArray(payload.real_orders))return;
+    for(const order of payload.real_orders){
+      const status=String(order.status||'');
+      const action=order.order_action==='close'?'CLOSE':'OPEN';
+      const side=String(order.side||'').toUpperCase()||'-';
+      const timing=order.response?._timing||{};
+      const signalAt=order.paper_signal_at||order.last_attempt_at||'';
+      const sent=order.clob_send_at||timing.send_at||'';
+      const duration=Number.isFinite(Number(timing.duration_ms))?' '+Number(timing.duration_ms).toFixed(2)+'ms':'';
+      const delay=Number.isFinite(Number(order.signal_to_clob_ms))?' delay '+Number(order.signal_to_clob_ms).toFixed(2)+'ms':'';
+      const token=order.token_id?shortToken(String(order.token_id)):'-';
+      const amount=Number.isFinite(Number(order.amount))?Number(order.amount).toFixed(6):'-';
+      const price=Number.isFinite(Number(order.limit_price))?' @ '+Number(order.limit_price).toFixed(2):'';
+      const error=order.error?' error: '+order.error:'';
+      const signalKey=[order.id,'paper-signal',order.order_action,signalAt,order.retry_count].join(':');
+      if(signalAt&&!controller.paperRealOrderLogKeys.has(signalKey)){
+        controller.paperRealOrderLogKeys.add(signalKey);
+        appendLog({
+          level:'info',
+          source:'paper',
+          time:fmtClockMs(signalAt),
+          message:'PAPER SIGNAL '+action+' '+side+' amount '+amount+' token '+token
+        },controller);
+      }
+      const clobKey=[order.id,'clob-send',order.order_action,status,sent||order.submitted_at||order.failed_at||order.last_attempt_at,order.retry_count].join(':');
+      if(!controller.paperRealOrderLogKeys.has(clobKey)){
+        controller.paperRealOrderLogKeys.add(clobKey);
+        appendLog({
+          level:status==='failed'?'error':'info',
+          source:'clob',
+          time:fmtClockMs(sent||order.submitted_at||order.failed_at||order.last_attempt_at),
+          message:'CLOB SEND '+action+' '+side+' '+status+' amount '+amount+price+' token '+token+delay+duration+error
+        },controller);
+      }
+      if(action==='OPEN'&&status==='submitted'){
+        const balanceKey=[order.id,'post-open-balance',order.submitted_at,order.real_open_quantity,order.real_open_balance_after_open].join(':');
+        if(!controller.paperRealOrderLogKeys.has(balanceKey)){
+          controller.paperRealOrderLogKeys.add(balanceKey);
+          const dollarValue=order.real_open_notional_amount??order.amount;
+          const dollars=dollarValue!==null&&dollarValue!==undefined&&Number.isFinite(Number(dollarValue))?Number(dollarValue).toFixed(6):'-';
+          const contracts=order.real_open_quantity!==null&&order.real_open_quantity!==undefined&&Number.isFinite(Number(order.real_open_quantity))?Number(order.real_open_quantity).toFixed(6):'-';
+          const avg=order.real_open_avg_price!==null&&order.real_open_avg_price!==undefined&&Number.isFinite(Number(order.real_open_avg_price))?' avg '+Number(order.real_open_avg_price).toFixed(4):'';
+          const source=order.real_open_quantity_source?' source '+order.real_open_quantity_source:'';
+          appendLog({
+            level:Number.isFinite(Number(order.real_open_quantity))&&Number(order.real_open_quantity)>0?'info':'warning',
+            source:'balance',
+            time:fmtClockMs(order.submitted_at||sent||order.last_attempt_at),
+            message:'OPEN BALANCE '+side+' dollars '+dollars+' contracts '+contracts+avg+' token '+token+source
+          },controller);
+        }
+      }
+    }
+  };
   const render=(payload,controller)=>{
     controller.latestPayload=payload;
     controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false;
@@ -1065,7 +1138,7 @@ function initLiveMonitor(){
     if(payload.status?.last_error)controller.samplePath.textContent='Last error: '+payload.status.last_error;
     setDot(controller.quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
     setDot(controller.cryptoDot,!!payload.health?.crypto?.connected,!!payload.status?.last_error&&payload.status?.crypto==='reconnecting');
-    renderRows(payload,controller);updateChart(payload,controller);
+    renderRows(payload,controller);renderRealOrderLogs(payload,controller);updateChart(payload,controller);
   };
   const connectSession=payload=>{
     const controller=getOrCreateController(payload);
@@ -1205,6 +1278,28 @@ function initLiveMonitor(){
       console.error('[live-monitor] stop failed',error);
       appendLog({level:'error',source:'browser',message:error.message},controller);
       controller.stopButton.disabled=false;
+    }
+  };
+  const manualPaperAction=async(controller,action)=>{
+    const isOpen=action==='open';
+    const button=isOpen?controller.manualOpenButton:controller.manualCloseButton;
+    const url=isOpen?controller.manualOpenUrl:controller.manualCloseUrl;
+    if(!url||!button)return;
+    const original=button.textContent;
+    button.disabled=true;
+    button.textContent=isOpen?'Opening...':'Closing...';
+    try{
+      const response=await fetch(url,{method:'POST',headers:{Accept:'application/json'}});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,isOpen?'Unable to open manual trade':'Unable to close manual trade'));
+      appendLog({level:'info',source:'browser',message:isOpen?'Manual UP market trade opened.':'Manual market trade closed.'},controller);
+      if(payload.snapshot)render(payload.snapshot,controller);
+      await loadSaved(false);
+    }catch(error){
+      appendLog({level:'error',source:'browser',message:error.message},controller);
+    }finally{
+      button.disabled=false;
+      button.textContent=original;
     }
   };
   window.addEventListener('pagehide',()=>sessionControllers.forEach(closeController),{once:true});

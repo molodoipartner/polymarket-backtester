@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     admin_password: str = "Admin1234!"
 
     gamma_api_url: str = "https://gamma-api.polymarket.com"
+    polymarket_clob_url: str = "https://clob.polymarket.com"
+    polymarket_chain_id: int = 137
+    polymarket_private_key: str = ""
+    polymarket_proxy_address: str = ""
+    polymarket_funder: str = ""
+    polymarket_signature_type: int = 1
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_api_passphrase: str = ""
+    polymarket_live_trading_enabled: bool = False
+    polymarket_live_order_amount: float = 1.0
     history_page_size: int = 500
     history_max_events_per_series: int = 5_000
     history_chunk_days: int = 3

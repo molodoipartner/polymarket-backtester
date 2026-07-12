@@ -82,7 +82,7 @@
   <div class="grid gap-4 md:grid-cols-2">
     <label>Group name<input name="group_name" maxlength="80" value="Live_{{ selected_asset }}_5m" required></label>
     <label>Starting balance<input type="number" name="starting_balance" min="1" step="0.01" value="{{ '%.2f'|format(default_balance) }}" required></label>
-    <label>Number of strategies<input type="number" name="strategy_count" min="1" max="1000" value="12" required><small class="muted">{{ 'Intrachart value, momentum, reversion, spread, late-conviction and acceleration families' if selected_strategy_mode == 'smart' else 'Quote momentum/reversal and crypto breakout/reversion families' }}</small></label>
+    <label>Number of strategies<input type="number" name="strategy_count" min="1" max="1000" value="12" required><small class="muted">{{ 'Intrachart value, momentum, reversion, spread, late-conviction, acceleration, and 70/40 stop families' if selected_strategy_mode == 'smart' else 'Quote momentum/reversal and crypto breakout/reversion families' }}</small></label>
     <label>Contract mode<input data-live-analysis-contract-mode value="{{ 'Full + partial suitable contracts' if include_partial_contracts else 'Full suitable contracts only' }}" disabled><small class="muted">Unsuitable contracts are never used.</small></label>
   </div>
   <div class="mt-6">

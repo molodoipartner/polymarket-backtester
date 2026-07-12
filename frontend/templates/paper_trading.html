@@ -48,6 +48,11 @@
       Starting balance
       <input name="starting_balance" type="number" min="1" step="0.01" value="{{ '%.2f'|format(group.starting_balance) }}" required>
     </label>
+    <label class="live-real-trading-toggle">
+      <input name="real_trading" type="checkbox" value="true">
+      Real trading
+      <span class="muted">Market BUY $1.00 on each live signal</span>
+    </label>
     <div class="live-monitor-actions">
       <button class="primary paper-start-button" type="submit">Start trading</button>
     </div>

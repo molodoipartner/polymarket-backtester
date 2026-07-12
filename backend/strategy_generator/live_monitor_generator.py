@@ -35,6 +35,7 @@ SMART_LIVE_FAMILY_LABELS = {
     "smart_breakout_confirmation": "Smart Breakout Confirmation",
     "smart_pullback_continuation": "Smart Pullback Continuation",
     "smart_settlement_drift": "Smart Settlement Drift",
+    "price_threshold_70_stop_40": "Price Threshold 70 Stop 40",
 }
 
 ACTIVE_SMART_LIVE_FAMILIES = (
@@ -45,6 +46,7 @@ ACTIVE_SMART_LIVE_FAMILIES = (
     "smart_breakout_confirmation",
     "smart_pullback_continuation",
     "smart_settlement_drift",
+    "price_threshold_70_stop_40",
 )
 
 ALL_LIVE_FAMILY_LABELS = {
@@ -1164,6 +1166,32 @@ class LiveMonitorStrategyGenerator:
         prior_outcomes: list[str] = []
 
         for event in events:
+            if strategy["family"] == "price_threshold_70_stop_40":
+                threshold_trades, available_after_threshold = self._price_threshold_70_stop_40_trades(
+                    event,
+                    strategy,
+                    available_cash,
+                    allocation_pct,
+                    fee_rate,
+                    metrics_only=metrics_only,
+                )
+                prior_outcomes.append(event["resolved_outcome"])
+                if not threshold_trades:
+                    if not metrics_only:
+                        equity_curve.append({
+                            "t": event["expiration_time"],
+                            "value": round(available_cash, 4),
+                        })
+                    continue
+                available_cash = available_after_threshold
+                transactions.extend(threshold_trades)
+                if not metrics_only:
+                    equity_curve.append({
+                        "t": threshold_trades[-1]["closed_at"],
+                        "value": round(available_cash, 4),
+                    })
+                continue
+
             if strategy["family"] in SMART_LIVE_FAMILY_LABELS:
                 smart_trades, available_after_smart = self._smart_trades(
                     event,
@@ -1317,6 +1345,134 @@ class LiveMonitorStrategyGenerator:
             "equity_curve": equity_curve,
             "transactions": transactions,
         }
+
+    def _price_threshold_70_stop_40_trades(
+        self,
+        event: dict,
+        strategy: dict,
+        available_cash: float,
+        allocation_pct: float,
+        fee_rate: float,
+        metrics_only: bool = False,
+    ) -> tuple[list[dict], float]:
+        if available_cash <= 0:
+            return [], available_cash
+        rows = [
+            row for row in event["history"]
+            if self._float_or_none(row.get("t")) is not None
+            and event["start_ts"] <= float(row["t"]) <= event["end_ts"]
+        ]
+        rows = sorted(rows, key=lambda row: float(row["t"]))
+        if not rows:
+            return [], available_cash
+
+        entry_threshold = float(strategy.get("entry_price_cents", 70.0)) / 100
+        stop_loss = float(strategy.get("stop_loss_cents", 40.0)) / 100
+        min_entry_ts = event["start_ts"] + float(strategy.get("entry_second", 0.0))
+        entry = None
+        for index, row in enumerate(rows):
+            current_ts = self._cached_float(row, "t")
+            if current_ts is None or current_ts < min_entry_ts:
+                continue
+            candidates = []
+            for side in ("up", "down"):
+                ask_price = self._side_ask(row, side)
+                if ask_price is not None and ask_price >= entry_threshold:
+                    candidates.append((side, ask_price))
+            if candidates:
+                side, ask_price = max(candidates, key=lambda item: item[1])
+                entry = {
+                    "index": index,
+                    "row": row,
+                    "side": side,
+                    "ask_price": ask_price,
+                }
+                break
+        if not entry:
+            return [], available_cash
+
+        budget = min(available_cash, available_cash * allocation_pct)
+        if budget < MIN_POSITION_BUDGET:
+            return [], available_cash
+        margin_locked = budget / (1 + fee_rate)
+        entry_fee = budget - margin_locked
+        contracts_volume = margin_locked / entry["ask_price"]
+        cash_before_entry = available_cash
+        cash_after_entry = available_cash - margin_locked - entry_fee
+
+        exit_row = None
+        for row in rows[entry["index"] + 1:]:
+            bid_price = self._side_bid(row, entry["side"])
+            if bid_price is not None and bid_price <= stop_loss:
+                exit_row = row
+                break
+        if exit_row:
+            exit_price = self._side_bid(exit_row, entry["side"])
+            if exit_price is None:
+                return [], available_cash
+            closed_at = datetime.fromtimestamp(float(exit_row["t"]), timezone.utc).isoformat()
+            exit_type = "stop_loss_bid"
+        else:
+            exit_price = 1.0 if entry["side"] == event["resolved_outcome"] else 0.0
+            closed_at = event["expiration_time"]
+            exit_type = "settlement"
+
+        settlement_value = contracts_volume * exit_price
+        available_after_close = cash_after_entry + settlement_value
+        pnl = settlement_value - margin_locked - entry_fee
+        if metrics_only:
+            return ([{
+                "event_id": event["id"],
+                "side": entry["side"].upper(),
+                "pnl": pnl,
+                "margin_locked": margin_locked,
+                "entry_fee": entry_fee,
+                "allocation_pct_used": allocation_pct,
+            }], available_after_close)
+
+        holding_seconds = (
+            (float(exit_row["t"]) if exit_row else event["end_ts"])
+            - float(entry["row"]["t"])
+        )
+        transaction = {
+            "event_id": event["id"],
+            "market_id": event["market_id"],
+            "market_question": event["question"],
+            "asset": event["asset"],
+            "timeframe": event["timeframe"],
+            "side": entry["side"].upper(),
+            "resolved_outcome": event["resolved_outcome"].upper(),
+            "opened_at": datetime.fromtimestamp(float(entry["row"]["t"]), timezone.utc).isoformat(),
+            "closed_at": closed_at,
+            "expiration_time": event["expiration_time"],
+            "entry_price": round(entry["ask_price"], 8),
+            "ask_price": round(entry["ask_price"], 8),
+            "allocation_pct_used": round(allocation_pct, 8),
+            "analysis_history_count": len(event["history"]),
+            "entry_history_count": entry["index"] + 1,
+            "contracts_volume": round(contracts_volume, 8),
+            "quantity": round(contracts_volume, 8),
+            "margin_locked": round(margin_locked, 8),
+            "entry_fee": round(entry_fee, 8),
+            "fee_bps": float(strategy["fee_bps"]),
+            "available_cash_before_entry": round(cash_before_entry, 4),
+            "available_cash_after_entry": round(cash_after_entry, 4),
+            "available_cash_after_close": round(available_after_close, 4),
+            "balance_before": round(cash_before_entry, 4),
+            "balance_after": round(available_after_close, 4),
+            "holding_seconds": round(holding_seconds, 3),
+            "exit_price": round(exit_price, 8),
+            "exit_bid_price": round(exit_price, 8) if exit_type != "settlement" else None,
+            "exit_type": exit_type,
+            "settlement_value": round(settlement_value, 8),
+            "pnl": round(pnl, 8),
+            "quote_source": "live_monitor_threshold_history",
+            "entry_trigger_cents": float(strategy.get("entry_price_cents", 70.0)),
+            "stop_loss_cents": float(strategy.get("stop_loss_cents", 40.0)),
+            "saved_record_id": event.get("saved_record_id"),
+            "partial_contract": event.get("partial_contract", False),
+        }
+        return [transaction], available_after_close
 
     def _smart_trades(
         self,
@@ -2053,6 +2209,28 @@ class LiveMonitorStrategyGenerator:
             return float(rng.choice(values))
 
         def sample_for_family(family: str) -> dict:
+            if family == "price_threshold_70_stop_40":
+                allocation = rng.choice((0.03, 0.05, 0.075, 0.1, 0.15, 0.2))
+                return {
+                    "family": family,
+                    "entry_second": 0.0,
+                    "entry_price_cents": 70.0,
+                    "stop_loss_cents": 40.0,
+                    "min_hold_seconds": 0.0,
+                    "target_hold_seconds": 0.0,
+                    "max_hold_seconds": 300.0,
+                    "exit_edge_floor_cents": 0.0,
+                    "time_exit_edge_cents": 0.0,
+                    "entry_mode": "single_entry",
+                    "max_entries_per_contract": 1,
+                    "allocation_pct": allocation,
+                    "max_allocation_pct": allocation,
+                    "fee_bps": 10.0,
+                    "exit_condition": "stop_loss_40_or_settlement",
+                    "price_source": "saved_live_monitor_bid_ask",
+                    "generation_method": "system_random_parameter_sample",
+                    "generation_nonce": secrets.token_hex(8),
+                }
             profile_name = rng.choice(family_profiles[family])
             profile = risk_profiles[profile_name]
             max_hold_seconds = pick(profile["max_hold_seconds"])
@@ -2162,6 +2340,18 @@ class LiveMonitorStrategyGenerator:
         entry_second = specification["entry_second"]
         allocation = specification["allocation_pct"]
         family = specification["family"]
+        if family == "price_threshold_70_stop_40":
+            return (
+                f"This live-monitor algorithm trades saved {asset} {timeframe} contracts inside "
+                f"the chart using a fixed price threshold rule. It scans both UP and DOWN from "
+                f"the start of each contract, buys the first side whose saved ask is at or above "
+                f"{specification['entry_price_cents']:g}c, then exits that same side at the saved "
+                f"bid if it falls to {specification['stop_loss_cents']:g}c. There is no take "
+                f"profit; if the stop loss never appears, it waits for settlement. It locks "
+                f"{allocation:.1%} of available cash and charges a {specification['fee_bps']:.0f} "
+                f"bps entry fee. Full-contract-only analysis excludes interrupted partial records; "
+                f"the mixed mode includes partial records but still excludes unsuitable records."
+            )
         if family in SMART_LIVE_FAMILY_LABELS:
             family_rules = {
                 "smart_value_edge": (
@@ -2261,17 +2451,30 @@ class LiveMonitorStrategyGenerator:
                 f"waits {entry_second:g} seconds, then follows the live crypto move when price "
                 f"is at least {specification['deviation_threshold_pct']:g}% away from the target"
             )
-        else:
+        elif family == "crypto_mean_reversion":
             rule = (
                 f"waits {entry_second:g} seconds, then fades the live crypto move when price "
                 f"is at least {specification['deviation_threshold_pct']:g}% away from the target"
             )
+        else:
+            rule = (
+                f"scans both UP and DOWN from the start of the contract, buys the first side whose "
+                f"saved ask is at or above {specification['entry_price_cents']:g}c, then sells that "
+                f"side at the saved bid once it reaches {specification['take_profit_cents']:g}c. "
+                f"There is no stop loss; if the take-profit bid never appears, it waits for settlement"
+            )
+        exit_sentence = (
+            "It exits inside the saved chart on the take-profit bid trigger when available, otherwise it "
+            "waits for contract settlement."
+            if family == "price_threshold_70_stop_40"
+            else "It holds until the contract settlement."
+        )
         return (
             f"This live-monitor algorithm trades saved {asset} {timeframe} contracts only after "
             f"contracts marked unsuitable have been removed. It {rule}. Entry uses the actual "
             f"saved Polymarket ask quote for the chosen side, not a fixed assumed price. It locks "
             f"{allocation:.1%} of available cash, charges a {specification['fee_bps']:.0f} bps "
-            f"entry fee, and holds until the contract settlement. Full-contract-only analysis "
+            f"entry fee. {exit_sentence} Full-contract-only analysis "
             f"excludes interrupted partial records; the mixed mode includes partial records but "
             f"still excludes unsuitable records."
         )

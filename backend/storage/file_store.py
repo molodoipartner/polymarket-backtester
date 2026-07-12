@@ -32,6 +32,7 @@ class FileStore:
         "logs",
         "family_reports",
         "paper_trades",
+        "real_orders",
     )
 
     def __init__(self, root: Path | None = None) -> None:
