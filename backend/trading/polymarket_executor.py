@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-import json
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +26,8 @@ class PolymarketLiveOrderRequest:
 class PolymarketLiveOrderExecutor:
     def __init__(self) -> None:
         self._client = None
+        self._prepared_lock = threading.Lock()
+        self._prepared_orders: dict[tuple[str, str, float, str, float], dict[str, Any]] = {}
 
     def prepare(self) -> None:
         self.validate_ready()
@@ -50,6 +52,16 @@ class PolymarketLiveOrderExecutor:
                 client.get_tick_size(token)
             except Exception:
                 logger.exception("Polymarket CLOB market warmup failed token_id=%s", token)
+
+    def prepare_market_order(self, request: PolymarketLiveOrderRequest) -> None:
+        token_id = request.token_id.strip()
+        side = str(request.side or "BUY").upper()
+        amount = float(request.amount)
+        order_type = str(request.order_type or "FAK").upper()
+        price = self._aggressive_limit_price(side, request.price)
+        prepared = self._create_prepared_market_order(token_id, amount, side, order_type, price)
+        with self._prepared_lock:
+            self._prepared_orders[self._prepared_order_key(token_id, side, amount, order_type, price)] = prepared
 
     def validate_ready(self) -> None:
         if not self._live_trading_enabled():
@@ -138,21 +150,29 @@ class PolymarketLiveOrderExecutor:
     ) -> dict[str, Any]:
         client = self._get_client()
         limit_price = self._aggressive_limit_price(side, price)
+        prepared_key = self._prepared_order_key(token_id, side, amount, order_type, limit_price)
+        with self._prepared_lock:
+            prepared = self._prepared_orders.pop(prepared_key, None)
         try:
             from py_clob_client_v2 import MarketOrderArgs, OrderType
             from py_clob_client_v2.order_builder.constants import BUY, SELL
 
-            order_side = BUY if side == "BUY" else SELL
-            clob_order_type = self._clob_market_order_type(OrderType, order_type)
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=round(amount, 8),
-                side=order_side,
-                price=limit_price,
-                order_type=clob_order_type,
-            )
-            signed = client.create_market_order(order_args)
-            signed_meta = self._signed_order_metadata(signed, side)
+            if prepared:
+                signed = prepared["signed"]
+                signed_meta = prepared["signed_meta"]
+                clob_order_type = prepared["clob_order_type"]
+            else:
+                order_side = BUY if side == "BUY" else SELL
+                clob_order_type = self._clob_market_order_type(OrderType, order_type)
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=round(amount, 8),
+                    side=order_side,
+                    price=limit_price,
+                    order_type=clob_order_type,
+                )
+                signed = client.create_market_order(order_args)
+                signed_meta = self._signed_order_metadata(signed, side)
 
             send_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             started = time.perf_counter()
@@ -181,16 +201,6 @@ class PolymarketLiveOrderExecutor:
                 )
                 raise
             duration_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "POLYMARKET_OPEN_RAW_RESPONSE side=%s token_id=%s amount=%.8f price=%.4f order_type=%s signed_meta=%s response=%s",
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-                json.dumps(signed_meta, ensure_ascii=False, sort_keys=True),
-                json.dumps(response, ensure_ascii=False, sort_keys=True, default=str),
-            )
             logger.info(
                 "Polymarket CLOB order send complete send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
                 send_at,
@@ -239,7 +249,6 @@ class PolymarketLiveOrderExecutor:
                 amount,
                 limit_price,
                 clob_order_type,
-                signed_meta,
             )
             try:
                 response = client.post_order(signed, clob_order_type)
@@ -257,16 +266,6 @@ class PolymarketLiveOrderExecutor:
                 )
                 raise
             duration_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "POLYMARKET_OPEN_RAW_RESPONSE side=%s token_id=%s amount=%.8f price=%.4f order_type=%s signed_meta=%s response=%s",
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-                json.dumps(signed_meta, ensure_ascii=False, sort_keys=True),
-                json.dumps(response, ensure_ascii=False, sort_keys=True, default=str),
-            )
             logger.info(
                 "Polymarket CLOB legacy order send complete send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
                 send_at,
@@ -286,7 +285,52 @@ class PolymarketLiveOrderExecutor:
                 amount,
                 limit_price,
                 clob_order_type,
+                signed_meta,
             )
+
+    def _create_prepared_market_order(
+        self,
+        token_id: str,
+        amount: float,
+        side: str,
+        order_type: str,
+        price: float,
+    ) -> dict[str, Any]:
+        client = self._get_client()
+        from py_clob_client_v2 import MarketOrderArgs, OrderType
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
+
+        clob_order_type = self._clob_market_order_type(OrderType, order_type)
+        signed = client.create_market_order(
+            MarketOrderArgs(
+                token_id=token_id,
+                amount=round(amount, 8),
+                side=BUY if side == "BUY" else SELL,
+                price=price,
+                order_type=clob_order_type,
+            )
+        )
+        return {
+            "signed": signed,
+            "signed_meta": self._signed_order_metadata(signed, side),
+            "clob_order_type": clob_order_type,
+        }
+
+    @staticmethod
+    def _prepared_order_key(
+        token_id: str,
+        side: str,
+        amount: float,
+        order_type: str,
+        price: float,
+    ) -> tuple[str, str, float, str, float]:
+        return (
+            str(token_id).strip(),
+            str(side or "").upper(),
+            round(float(amount), 8),
+            str(order_type or "").upper(),
+            round(float(price), 4),
+        )
 
     @staticmethod
     def _response_with_timing(
@@ -309,6 +353,7 @@ class PolymarketLiveOrderExecutor:
             "amount": round(amount, 8),
             "price": round(price, 4),
             "order_type": str(order_type),
+            "clob_status": str(payload.get("status") or ""),
             **(signed_meta or {}),
         }
         return payload

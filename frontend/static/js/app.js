@@ -1081,6 +1081,7 @@ function initLiveMonitor(){
       const token=order.token_id?shortToken(String(order.token_id)):'-';
       const amount=Number.isFinite(Number(order.amount))?Number(order.amount).toFixed(6):'-';
       const price=Number.isFinite(Number(order.limit_price))?' @ '+Number(order.limit_price).toFixed(2):'';
+      const clobStatus=timing.clob_status?' clob_status '+timing.clob_status:'';
       const error=order.error?' error: '+order.error:'';
       const signalKey=[order.id,'paper-signal',order.order_action,signalAt,order.retry_count].join(':');
       if(signalAt&&!controller.paperRealOrderLogKeys.has(signalKey)){
@@ -1099,7 +1100,7 @@ function initLiveMonitor(){
           level:status==='failed'?'error':'info',
           source:'clob',
           time:fmtClockMs(sent||order.submitted_at||order.failed_at||order.last_attempt_at),
-          message:'CLOB SEND '+action+' '+side+' '+status+' amount '+amount+price+' token '+token+delay+duration+error
+          message:'CLOB SEND '+action+' '+side+' '+status+' amount '+amount+price+' token '+token+delay+duration+clobStatus+error
         },controller);
       }
       if(action==='OPEN'&&status==='submitted'){

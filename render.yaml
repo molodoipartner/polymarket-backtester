@@ -29,6 +29,18 @@ services:
         value: 200
       - key: LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT
         value: 16
+      - key: POLYMARKET_CLOB_URL
+        value: https://clob.polymarket.com
+      - key: POLYMARKET_CHAIN_ID
+        value: 137
+      - key: POLYMARKET_SIGNATURE_TYPE
+        value: 1
+      - key: SIGNATURE_TYPE
+        value: 1
+      - key: POLYMARKET_LIVE_TRADING_ENABLED
+        value: true
+      - key: POLYMARKET_LIVE_ORDER_AMOUNT
+        value: 1
       - key: ALLOWED_HOSTS
         value: "*.onrender.com"
       - key: SESSION_COOKIE_SECURE
@@ -44,4 +56,26 @@ services:
       - key: ADMIN_USERNAME
         sync: false
       - key: ADMIN_PASSWORD
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: PROXY_ADDRESS
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: API_SECRET
+        sync: false
+      - key: API_PASSPHRASE
+        sync: false
+      - key: POLYMARKET_PRIVATE_KEY
+        sync: false
+      - key: POLYMARKET_PROXY_ADDRESS
+        sync: false
+      - key: POLYMARKET_FUNDER
+        sync: false
+      - key: POLYMARKET_API_KEY
+        sync: false
+      - key: POLYMARKET_API_SECRET
+        sync: false
+      - key: POLYMARKET_API_PASSPHRASE
         sync: false

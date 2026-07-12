@@ -1576,6 +1576,8 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
             return {
                 "success": True,
                 "orderID": "fake-order",
+                "status": "matched",
+                "takingAmount": "1.8",
                 "_timing": {
                     "send_at": routes_module._paper_clock_ms(),
                     "duration_ms": 12.34,
@@ -1665,7 +1667,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert executor.calls[0].amount == 1.0
     assert executor.calls[0].order_type == "FAK"
     assert executor.calls[0].price == 0.99
-    assert executor.balance_checks == ["up-token"]
+    assert executor.balance_checks == []
     real_orders = store.list_user_records(user["id"], "real_orders")
     assert len(real_orders) == 1
     assert real_orders[0]["response"]["orderID"] == "fake-order"
@@ -1727,7 +1729,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert executor.sells[0].amount == pytest.approx(1.8)
     assert executor.sells[0].order_type == "FAK"
     assert executor.sells[0].price == 0.01
-    assert executor.balance_checks == ["up-token"]
+    assert executor.balance_checks == []
     real_orders = store.list_user_records(user["id"], "real_orders")
     assert len(real_orders) == 2
 
@@ -1756,7 +1758,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert down_open[0]["limit_price"] == 0.99
     assert executor.calls[-1].token_id == "down-token"
     assert executor.calls[-1].price == 0.99
-    assert executor.balance_checks[-1] == "down-token"
+    assert executor.balance_checks == []
 
     down_closed_trade = {
         **down_trade,
@@ -1897,6 +1899,61 @@ def test_polymarket_executor_extracts_balance_from_balance_allowance_response():
     assert executor_class._balance_value_from_response({"balance": "1350000"}) == "1350000"
     assert executor_class._balance_value_from_response({"data": {"balance": "1350000"}}) == "1350000"
     assert executor_class._balance_value_from_response({"allowance": "0"}) is None
+
+
+def test_polymarket_executor_uses_prepared_order_without_resigning(monkeypatch):
+    executor = routes_module.PolymarketLiveOrderExecutor()
+
+    class FakeOrderType:
+        FAK = "FAK"
+        FOK = "FOK"
+
+    class FakeMarketOrderArgs:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self):
+            self.create_calls = 0
+            self.post_calls = 0
+
+        def create_market_order(self, _order_args):
+            self.create_calls += 1
+            return SimpleNamespace(makerAmount="1000000", takerAmount="1250000")
+
+        def post_order(self, _signed, _order_type):
+            self.post_calls += 1
+            return {"success": True, "status": "matched", "takingAmount": "1.25"}
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(executor, "validate_ready", lambda: None)
+    monkeypatch.setattr(executor, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(settings, "polymarket_live_trading_enabled", True)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_clob_client_v2",
+        SimpleNamespace(MarketOrderArgs=FakeMarketOrderArgs, OrderType=FakeOrderType),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_clob_client_v2.order_builder.constants",
+        SimpleNamespace(BUY="BUY", SELL="SELL"),
+    )
+
+    request = routes_module.PolymarketLiveOrderRequest(
+        token_id="token",
+        amount=1.0,
+        order_type="FAK",
+        price=0.99,
+    )
+    executor.prepare_market_order(request)
+    assert fake_client.create_calls == 1
+    response = executor.market_buy(request)
+
+    assert response["success"] is True
+    assert fake_client.create_calls == 1
+    assert fake_client.post_calls == 1
+    assert response["_timing"]["signed_token_quantity"] == pytest.approx(1.25)
 
 
 def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path: Path, monkeypatch):
@@ -2044,14 +2101,14 @@ def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path
     )
 
     assert opened["real_orders"][0]["status"] == "submitted"
-    assert opened["real_orders"][0]["real_open_balance_after_open"] == 0
+    assert opened["real_orders"][0]["real_open_balance_after_open"] is None
     assert opened["real_orders"][0]["real_open_quantity"] == pytest.approx(1.42857)
     assert opened["real_orders"][0]["real_open_quantity_source"] == "order_response_taking_amount"
     assert opened["real_orders"][0]["real_open_avg_price"] == pytest.approx(0.7, abs=0.001)
     assert closed[0]["status"] == "submitted"
     assert closed[0]["amount"] == pytest.approx(1.42857)
     assert executor.sells[0].amount == pytest.approx(1.42857)
-    assert executor.balance_checks == ["down-token"]
+    assert executor.balance_checks == []
 
 
 def test_paper_real_trading_close_old_zero_quantity_open_does_not_sell_estimate(tmp_path: Path):

@@ -15,7 +15,7 @@ import traceback
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlencode
 
 import httpx
@@ -53,6 +53,7 @@ _PAPER_VISUAL_PREVIEW_LOCK = threading.Lock()
 _PAPER_VISUAL_PREVIEWS: dict[str, dict] = {}
 _PAPER_TOKEN_WARM_LOCK = threading.Lock()
 _PAPER_WARMED_TOKEN_IDS: set[str] = set()
+_PAPER_WARMING_TOKEN_IDS: set[str] = set()
 LOCAL_DATA_TOOLS_CONFIG = ROOT_DIR / ".local_data_tools.json"
 QUALITY_REPORT_CACHE_TTL_SECONDS = 900
 QUALITY_CONTRACT_LIMITS = {
@@ -3069,8 +3070,13 @@ def _paper_snapshot_token_ids(snapshot: dict) -> list[str]:
 
 def _warm_paper_live_order_tokens(request: Request, token_ids: list[str]) -> None:
     with _PAPER_TOKEN_WARM_LOCK:
-        pending = [token_id for token_id in token_ids if token_id not in _PAPER_WARMED_TOKEN_IDS]
-        _PAPER_WARMED_TOKEN_IDS.update(pending)
+        pending = [
+            token_id
+            for token_id in token_ids
+            if token_id not in _PAPER_WARMED_TOKEN_IDS
+            and token_id not in _PAPER_WARMING_TOKEN_IDS
+        ]
+        _PAPER_WARMING_TOKEN_IDS.update(pending)
     if not pending:
         return
     try:
@@ -3078,8 +3084,45 @@ def _warm_paper_live_order_tokens(request: Request, token_ids: list[str]) -> Non
         prepare_tokens = getattr(executor, "prepare_tokens", None)
         if callable(prepare_tokens):
             prepare_tokens(pending)
+        prepare_order = getattr(executor, "prepare_market_order", None)
+        if callable(prepare_order):
+            for token_id in pending:
+                prepare_order(
+                    PolymarketLiveOrderRequest(
+                        token_id=token_id,
+                        amount=_paper_real_order_amount(),
+                        order_type=_paper_real_order_type(),
+                        price=_paper_aggressive_limit_price("BUY"),
+                    )
+                )
     except Exception:
         logger.exception("Paper real trading token warmup failed")
+    else:
+        with _PAPER_TOKEN_WARM_LOCK:
+            _PAPER_WARMED_TOKEN_IDS.update(pending)
+    finally:
+        with _PAPER_TOKEN_WARM_LOCK:
+            _PAPER_WARMING_TOKEN_IDS.difference_update(pending)
+
+
+def _prepare_paper_close_order(request: Request, token_id: str | None, quantity: float | None) -> None:
+    if not token_id or quantity is None or quantity <= 0:
+        return
+    try:
+        executor = _paper_live_order_executor(request)
+        prepare_order = getattr(executor, "prepare_market_order", None)
+        if callable(prepare_order):
+            prepare_order(
+                PolymarketLiveOrderRequest(
+                    token_id=token_id,
+                    amount=quantity,
+                    side="SELL",
+                    order_type=_paper_real_order_type(),
+                    price=_paper_aggressive_limit_price("SELL"),
+                )
+            )
+    except Exception:
+        logger.exception("Paper real trading close order warmup failed")
 
 
 def _paper_real_order_retryable(record: dict) -> bool:
@@ -3660,18 +3703,6 @@ def _execute_paper_real_trading_signals(
             real_open_balance = None
             real_open_quantity, real_open_quantity_source = _paper_open_fill_quantity(response)
             real_open_balance_info = None
-            executor = _paper_live_order_executor(request)
-            if hasattr(executor, "token_balance") or hasattr(executor, "token_balance_info"):
-                try:
-                    real_open_balance, real_open_balance_info, balance_source = _paper_open_balance_info(
-                        executor,
-                        token_id,
-                    )
-                    if real_open_quantity is None and real_open_balance is not None:
-                        real_open_quantity = math.floor(real_open_balance * 1_000_000) / 1_000_000
-                        real_open_quantity_source = balance_source
-                except Exception:
-                    logger.exception("Paper real trading balance lookup failed after signal open")
             if real_open_quantity_source is None:
                 real_open_quantity_source = "post_open_balance"
             timing = _paper_timing_from_response(response)
@@ -3681,16 +3712,11 @@ def _execute_paper_real_trading_signals(
                 if real_open_quantity is not None and real_open_quantity > 0
                 else None
             )
-            logger.warning(
-                "POLYMARKET_OPEN_BALANCE_RESULT side=%s token_id=%s dollars=%.8f contracts=%s avg_price=%s source=%s balance_info=%s",
-                str(trade.get("side") or "").upper(),
-                token_id,
-                amount,
-                real_open_quantity,
-                real_open_avg_price,
-                real_open_quantity_source,
-                json.dumps(real_open_balance_info, ensure_ascii=False, sort_keys=True, default=str),
-            )
+            threading.Thread(
+                target=_prepare_paper_close_order,
+                args=(request, token_id, real_open_quantity),
+                daemon=True,
+            ).start()
             submitted_open = {
                 **open_base,
                 "status": "submitted",
@@ -3872,14 +3898,18 @@ async def start_paper_trading_monitor(
         bool(real_trading),
     )
     if real_trading:
-        asyncio.create_task(
-            asyncio.to_thread(
-                _warm_paper_live_order_executor,
-                request,
-                user["id"],
-                session.id,
+        token_ids = _paper_snapshot_token_ids(session.snapshot(history_limit=None))
+        if token_ids:
+            await asyncio.to_thread(_warm_paper_live_order_tokens, request, token_ids)
+        else:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _warm_paper_live_order_executor,
+                    request,
+                    user["id"],
+                    session.id,
+                )
             )
-        )
     payload = _paper_session_payload(
         request, user["id"], _group, _strategy, run_group, run_strategy, session
     )
@@ -3972,12 +4002,10 @@ async def paper_trading_monitor_events(
                 snapshot = session.snapshot(history_limit=None)
                 cache_key = _paper_visual_preview_key(session_id, run_strategy, snapshot)
                 if (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
-                    asyncio.create_task(
-                        asyncio.to_thread(
-                            _warm_paper_live_order_tokens,
-                            request,
-                            _paper_snapshot_token_ids(snapshot),
-                        )
+                    await asyncio.to_thread(
+                        _warm_paper_live_order_tokens,
+                        request,
+                        _paper_snapshot_token_ids(snapshot),
                     )
                     preview_snapshot = dict(snapshot)
                     preview_snapshot["history"] = list(snapshot.get("history") or [])
