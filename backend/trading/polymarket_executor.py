@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.trading.clob_proxy import configure_py_clob_http_client
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -406,7 +405,6 @@ class PolymarketLiveOrderExecutor:
             raise RuntimeError(
                 "py-clob-client-v2 is not installed. Run pip install -r requirements.txt."
             ) from error
-        configure_py_clob_http_client()
         api_key, api_secret, api_passphrase = self._api_credentials()
         client = ClobClient(
             settings.polymarket_clob_url,

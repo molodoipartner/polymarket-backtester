@@ -41,8 +41,6 @@ services:
         value: true
       - key: POLYMARKET_LIVE_ORDER_AMOUNT
         value: 1
-      - key: POLYMARKET_CLOB_PROXY_URLS
-        value: socks4://81.12.157.98:5678,http://5.2.238.216:8787,http://92.86.207.198:8080
       - key: ALLOWED_HOSTS
         value: "*.onrender.com"
       - key: SESSION_COOKIE_SECURE

@@ -42,7 +42,6 @@ class Settings(BaseSettings):
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
     polymarket_api_passphrase: str = ""
-    polymarket_clob_proxy_urls: str = ""
     polymarket_live_trading_enabled: bool = False
     polymarket_live_order_amount: float = 1.0
     history_page_size: int = 500
