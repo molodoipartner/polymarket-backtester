@@ -59,8 +59,6 @@ HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
 LIVE_SNAPSHOT_HISTORY_LIMIT = 180
 SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES = 2 * 1024 * 1024
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
-SAMPLE_WRITE_MIN_INTERVAL_SECONDS = 0.5
-SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS = 2.0
 PARTIAL_CONTRACT_GRACE_SECONDS = 10
 TARGET_PRICE_LOCK_GRACE_SECONDS = 0.0
 HISTORY_INITIAL_MISSING_GRACE_SECONDS = 5.0
@@ -102,7 +100,6 @@ LIVE_STREAM_MIN_INTERVAL_SECONDS = _env_float(
     0.25,
     0.05,
 )
-SAMPLE_WRITE_QUEUE_SIZE = _env_int("LIVE_MONITOR_SAMPLE_WRITE_QUEUE_SIZE", 1000, 1)
 SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
     "LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT",
     32,
@@ -1134,7 +1131,6 @@ class LiveMonitorSession:
         self.started_at_ts = time.time()
         self.created_at = utc_iso()
         self.data_root = data_root
-        self.samples_path = data_root / "samples" / f"{session_id}.jsonl"
         self.meta_path = data_root / "sessions" / f"{session_id}.json"
         self.saved_dir = _saved_records_dir(data_root, user_id)
         self.tokens_by_id = {token.token_id: token for token in event.tokens}
@@ -1154,10 +1150,6 @@ class LiveMonitorSession:
             self._handle_update,
         )
         self._tasks: list[asyncio.Task] = []
-        self._sample_writer_task: asyncio.Task | None = None
-        self._sample_queue: asyncio.Queue[dict] = asyncio.Queue(
-            maxsize=SAMPLE_WRITE_QUEUE_SIZE
-        )
         self._subscribers: set[asyncio.Queue] = set()
         self._write_lock = asyncio.Lock()
         self._history: list[dict] = []
@@ -1181,11 +1173,6 @@ class LiveMonitorSession:
         self._rest_backoff_until = 0.0
         self._last_live_update_publish_at = 0.0
         self._pending_live_update_count = 0
-        self._last_sample_enqueue_at = 0.0
-        self._sample_write_count = 0
-        self._sample_drop_count = 0
-        self._last_sample_write_error_at = 0.0
-        self._last_sample_write_error: str | None = None
         self._preloaded_next: PreloadedPolymarketOrderBook | None = None
 
     @property
@@ -1195,7 +1182,6 @@ class LiveMonitorSession:
     async def start(self) -> None:
         self._write_meta()
         self._reset_history_schedule(time.time())
-        self._sample_writer_task = asyncio.create_task(self._sample_writer_loop())
         self._tasks = [
             asyncio.create_task(self.polymarket.run()),
             asyncio.create_task(self.crypto.run()),
@@ -1221,20 +1207,6 @@ class LiveMonitorSession:
             close_tasks.append(preloaded.orderbook.close())
         await asyncio.gather(*close_tasks, return_exceptions=True)
         await self._cancel_runtime_tasks()
-        if self._sample_writer_task:
-            try:
-                await asyncio.wait_for(
-                    self._sample_queue.join(),
-                    timeout=SAMPLE_WRITE_DRAIN_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Timed out while flushing %s live monitor sample(s)",
-                    self._sample_queue.qsize(),
-                )
-            self._sample_writer_task.cancel()
-            await asyncio.gather(self._sample_writer_task, return_exceptions=True)
-            self._sample_writer_task = None
         payload = self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT)
         payload["saved_record"] = saved_record
         await self._publish("status", payload)
@@ -1753,40 +1725,22 @@ class LiveMonitorSession:
             should_publish = bool(self._subscribers) and (
                 target_locked or interval_elapsed
             )
-            should_sample = target_locked or (
-                now - self._last_sample_enqueue_at
-                >= SAMPLE_WRITE_MIN_INTERVAL_SECONDS
-            )
-            if not should_publish and not should_sample:
+            if not should_publish:
                 return
-            include_stream_history = bool(
-                self._subscribers and (target_locked or interval_elapsed)
-            )
-            payload = self.snapshot(
-                history_limit=(
-                    LIVE_STREAM_HISTORY_LIMIT
-                    if include_stream_history
-                    else 0
-                )
-            )
+            payload = self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT)
             payload["update"] = {
                 "type": update_type,
                 **detail,
                 "coalesced_count": self._pending_live_update_count,
             }
-            if should_sample:
-                self._last_sample_enqueue_at = now
-                self._queue_sample(update_type, detail, payload)
-            if should_publish:
-                self._last_live_update_publish_at = now
-                self._pending_live_update_count = 0
-                await self._publish(update_type, payload)
+            self._last_live_update_publish_at = now
+            self._pending_live_update_count = 0
+            await self._publish(update_type, payload)
             return
         payload = self.snapshot(
             history_limit=LIVE_STREAM_HISTORY_LIMIT if self._subscribers else 0
         )
         payload["update"] = {"type": update_type, **detail}
-        self._queue_sample(update_type, detail, payload)
         await self._publish(update_type, payload)
 
     async def _publish(self, event: str, data: dict) -> None:
@@ -1846,52 +1800,6 @@ class LiveMonitorSession:
                 **self.snapshot(history_limit=LIVE_STREAM_HISTORY_LIMIT),
             },
         )
-
-    def _queue_sample(self, update_type: str, detail: dict, payload: dict) -> None:
-        row = {
-            "id": uuid.uuid4().hex,
-            "session_id": self.id,
-            "created_at": utc_iso(),
-            "update_type": update_type,
-            "detail": detail,
-            "crypto_price": self.state.crypto_price,
-            "quotes": payload["quotes"],
-        }
-        try:
-            self._sample_queue.put_nowait(row)
-        except asyncio.QueueFull:
-            self._sample_drop_count += 1
-            self._last_sample_write_error = (
-                f"Sample writer queue is full; dropped {self._sample_drop_count} row(s)."
-            )
-
-    async def _sample_writer_loop(self) -> None:
-        while True:
-            if self._stopped and self._sample_queue.empty():
-                return
-            try:
-                row = await asyncio.wait_for(self._sample_queue.get(), timeout=0.25)
-            except asyncio.TimeoutError:
-                continue
-            try:
-                async with self._write_lock:
-                    await asyncio.to_thread(_append_jsonl, self.samples_path, row)
-                self._sample_write_count += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                self._last_sample_write_error = _error_message(error)
-                now = time.time()
-                if now - self._last_sample_write_error_at >= 10:
-                    self._last_sample_write_error_at = now
-                    logger.exception("Live monitor sample writer failed")
-                    await self._log(
-                        "error",
-                        "storage",
-                        f"Sample writer failed: {self._last_sample_write_error}",
-                    )
-            finally:
-                self._sample_queue.task_done()
 
     def _reset_history_schedule(self, anchor_ts: float | None = None) -> None:
         anchor = time.time() if anchor_ts is None else anchor_ts
@@ -2796,7 +2704,6 @@ class LiveMonitorSession:
                 "user_id": self.user_id,
                 "created_at": self.created_at,
                 "event": self.event_payload(),
-                "samples_path": str(self.samples_path),
                 "saved_dir": str(self.saved_dir),
             },
         )
@@ -2871,7 +2778,6 @@ class LiveMonitorSession:
             "history_truncated_count": self._history_truncated_count,
             "history_truncated_before_ts": self._history_truncated_before_ts,
             "history_retention_limit": LIVE_HISTORY_MEMORY_LIMIT,
-            "samples_path": str(self.samples_path),
             "saved_path": str(self.saved_dir),
             "logs": list(self._logs[-100:]),
             "health": {
@@ -2880,12 +2786,6 @@ class LiveMonitorSession:
                 "rest": {
                     "last_poll_at": self._last_rest_poll_at,
                     "poll_count": self._rest_poll_count,
-                },
-                "storage": {
-                    "sample_queue_size": self._sample_queue.qsize(),
-                    "sample_write_count": self._sample_write_count,
-                    "sample_drop_count": self._sample_drop_count,
-                    "last_error": self._last_sample_write_error,
                 },
                 "stream": {
                     "pending_live_update_count": self._pending_live_update_count,
@@ -2903,7 +2803,6 @@ class LiveMonitorManager:
         self._gamma_quality_cache: dict[str, tuple[float, dict]] = {}
         self.data_root.mkdir(parents=True, exist_ok=True)
         (self.data_root / "sessions").mkdir(exist_ok=True)
-        (self.data_root / "samples").mkdir(exist_ok=True)
 
     async def start(
         self,
@@ -2942,8 +2841,6 @@ class LiveMonitorManager:
             "active_sessions": len(active),
             "subscribers": sum(len(session._subscribers) for session in active),
             "history_rows": sum(len(session._history) for session in active),
-            "sample_queue_size": sum(session._sample_queue.qsize() for session in active),
-            "sample_drop_count": sum(session._sample_drop_count for session in active),
         }
 
     def active_session(self, user_id: str) -> LiveMonitorSession | None:
@@ -4281,13 +4178,6 @@ def _error_message(error: BaseException) -> str:
         if isinstance(error, ConnectionClosedOK):
             return "server closed the WebSocket normally"
     return str(error) or error.__class__.__name__
-
-
-def _append_jsonl(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
 
 
 def _safe_file_id(value: str) -> str:

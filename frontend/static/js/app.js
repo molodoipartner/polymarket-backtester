@@ -715,7 +715,7 @@ function initLiveMonitor(){
       '</div>',
       '<div class="live-status-grid">',
       '<div class="metric-card"><p>Crypto price</p><strong data-live-crypto-price>-</strong><span class="muted"><span class="ws-dot" data-live-crypto-dot></span><span data-live-crypto-status>Waiting</span></span></div>',
-      '<div class="metric-card"><p>Order book</p><strong data-live-quote-status>Idle</strong><span class="muted"><span class="ws-dot" data-live-quote-dot></span><span data-live-sample-path>Saved samples will appear after start.</span></span></div>',
+      '<div class="metric-card"><p>Order book</p><strong data-live-quote-status>Idle</strong><span class="muted"><span class="ws-dot" data-live-quote-dot></span><span data-live-sample-path>Saved contracts will appear after start.</span></span></div>',
       '<div class="metric-card"><p>Session</p><strong data-live-session-short>-</strong><span class="muted">Separate stream and console</span></div>',
       '</div>',
       '<div class="live-monitor-log" data-live-log><p class="muted">Live WebSocket events and errors will appear here.</p></div>',
@@ -1137,7 +1137,7 @@ function initLiveMonitor(){
     const wsAge=payload.health?.polymarket?.last_message_age;
     const wsAgeText=Number.isFinite(wsAge)?' | ws age '+wsAge.toFixed(1)+'s':'';
     const restPolls=payload.health?.rest?.poll_count||0;
-    controller.samplePath.textContent=(payload.saved_path||payload.samples_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
+    controller.samplePath.textContent=(payload.saved_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
     if(savedMode==='paper'&&controller.runUrl)controller.samplePath.textContent+=' | run group saved';
     if(savedMode==='paper'&&payload.server_optimized)controller.samplePath.textContent+=' | server optimized';
     if(savedMode==='paper'&&payload.paper_trade_status?.message)controller.samplePath.textContent+=' | '+payload.paper_trade_status.message;
