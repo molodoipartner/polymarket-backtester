@@ -1243,6 +1243,16 @@ class LiveMonitorSession:
                 )
                 await asyncio.sleep(max(0, sample_ts - time.time()))
                 captured_at = time.time()
+                sample_delay_ms = max(0.0, (captured_at - sample_ts) * 1000.0)
+                if sample_delay_ms >= 250.0:
+                    logger.warning(
+                        "Live sampler delayed session=%s delay_ms=%.1f history_rows=%s "
+                        "subscribers=%s",
+                        self.id,
+                        sample_delay_ms,
+                        len(self._history),
+                        len(self._subscribers),
+                    )
                 self._tick_count += 1
                 self._last_tick_at = captured_at
                 self._capture_history_row(

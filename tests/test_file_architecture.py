@@ -1595,7 +1595,7 @@ def test_threshold_worker_recomputes_only_on_entry_and_stop_transitions():
         )
 
     watching = [{"t": start_ts + 1, "yes_ask": 69, "no_ask": 31}]
-    assert changed(watching)  # Initial contract preview.
+    assert not changed(watching)  # A rollover without a signal needs no full preview.
     assert not changed(watching + [{"t": start_ts + 2, "yes_ask": 69, "no_ask": 31}])
 
     opened = watching + [

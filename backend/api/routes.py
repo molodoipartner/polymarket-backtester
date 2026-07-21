@@ -4039,17 +4039,33 @@ def _schedule_paper_contract_finalization(
 ) -> None:
     if not saved_preview:
         return
+
+    def finalize() -> None:
+        started = time.perf_counter()
+        try:
+            _finalize_paper_live_contract(
+                request,
+                user_id,
+                source_group,
+                source_strategy,
+                run_group,
+                run_strategy,
+                saved_preview,
+            )
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            if duration_ms >= 250.0:
+                logger.warning(
+                    "Slow paper contract finalization session=%s strategy=%s "
+                    "duration_ms=%.1f saved_record=%s",
+                    (run_group.get("paper_trading") or {}).get("session_id"),
+                    run_strategy.get("id"),
+                    duration_ms,
+                    saved_preview.get("id"),
+                )
+
     task = asyncio.create_task(
-        asyncio.to_thread(
-            _finalize_paper_live_contract,
-            request,
-            user_id,
-            source_group,
-            source_strategy,
-            run_group,
-            run_strategy,
-            saved_preview,
-        )
+        asyncio.to_thread(finalize)
     )
     _background_tasks(request.app).add(task)
 
@@ -4168,7 +4184,11 @@ def _paper_threshold_signal_changed(
 
     state["processed_rows"] = len(rows)
     state["last_processed_ts"] = float(rows[-1]["t"]) if rows else None
-    return event_changed or prefix_changed or target_became_known or signal_changed
+    # A rollover by itself cannot open or close this strategy. Running the full
+    # file-backed preview here used to contend with old-contract finalization at
+    # exactly the moment the new sampler needed to stay responsive.
+    has_entry = state.get("entry_index") is not None
+    return signal_changed or (target_became_known and has_entry)
 
 
 async def _paper_real_trading_worker(
