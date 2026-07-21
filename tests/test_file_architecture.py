@@ -1521,6 +1521,76 @@ def test_paper_trading_requires_target_price_at_window_start():
     assert not routes_module._paper_target_known_at_window_start(late)
 
 
+def test_paper_open_signal_timing_uses_open_timestamp_with_preloaded_history():
+    start_ts = 1782639600
+    history = [
+        {"t": start_ts - 10, "captured_at": start_ts - 10, "sample_delay_ms": 1.0},
+        {"t": start_ts + 12, "captured_at": start_ts + 12.003, "sample_delay_ms": 3.0},
+    ]
+    trade = {
+        "opened_at": datetime.fromtimestamp(start_ts + 12, timezone.utc).isoformat(),
+        # This index is relative to generator history filtered at window_start_ts.
+        "entry_history_count": 1,
+        "status": "open",
+    }
+
+    routes_module._paper_attach_signal_timing([trade], history)
+
+    assert trade["signal_history_at"] == routes_module._iso_from_ts(start_ts + 12)
+    assert trade["signal_tick_captured_at"] == routes_module._iso_from_ts(start_ts + 12.003)
+    assert trade["signal_sample_delay_ms"] == 3.0
+
+
+def test_threshold_worker_recomputes_only_on_entry_and_stop_transitions():
+    start_ts = 1782639600
+    source_strategy = {
+        "family": "price_threshold_70_stop_40",
+        "parameters": {
+            "family": "price_threshold_70_stop_40",
+            "entry_second": 0,
+            "entry_price_cents": 70,
+            "stop_loss_cents": 40,
+        },
+    }
+    run_strategy = {"id": "threshold-run", "parameters": {}}
+    event_payload = {
+        "slug": "btc-updown-5m-1782639600",
+        "window_start_ts": start_ts,
+        "window_end_ts": start_ts + 300,
+        "target_price_ts": start_ts,
+        "target_price": 100,
+    }
+    state = {}
+
+    def changed(history):
+        return routes_module._paper_threshold_signal_changed(
+            "session", source_strategy, run_strategy,
+            {"event": event_payload, "history": history}, state,
+        )
+
+    watching = [{"t": start_ts + 1, "yes_ask": 69, "no_ask": 31}]
+    assert changed(watching)  # Initial contract preview.
+    assert not changed(watching + [{"t": start_ts + 2, "yes_ask": 69, "no_ask": 31}])
+
+    opened = watching + [
+        {"t": start_ts + 2, "yes_ask": 69, "no_ask": 31},
+        {"t": start_ts + 3, "yes_ask": 71, "yes_bid": 70, "no_ask": 30, "no_bid": 29},
+    ]
+    assert changed(opened)
+    assert not changed(opened + [
+        {"t": start_ts + 4, "yes_ask": 72, "yes_bid": 60, "no_ask": 29, "no_bid": 28},
+    ])
+
+    stopped = opened + [
+        {"t": start_ts + 4, "yes_ask": 72, "yes_bid": 60, "no_ask": 29, "no_bid": 28},
+        {"t": start_ts + 5, "yes_ask": 39, "yes_bid": 38, "no_ask": 62, "no_bid": 61},
+    ]
+    assert changed(stopped)
+    assert not changed(stopped + [
+        {"t": start_ts + 6, "yes_ask": 38, "yes_bid": 37, "no_ask": 63, "no_bid": 62},
+    ])
+
+
 def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     store = FileStore(tmp_path / "server_data")
     user = store.create_user("real-paper@example.com", "Real Paper", hash_password("secure-pass"))

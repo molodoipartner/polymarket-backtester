@@ -2885,6 +2885,9 @@ def _paper_history_row_by_timestamp(history: list[dict], timestamp_iso: str | No
 
 def _paper_signal_row(history: list[dict], trade: dict, action: str) -> dict | None:
     if action == "open":
+        timestamp_row = _paper_history_row_by_timestamp(history, trade.get("opened_at"))
+        if timestamp_row is not None:
+            return timestamp_row
         entry_index = int(trade.get("entry_history_count") or 0) - 1
         return _paper_history_row_by_index(history, entry_index)
     return _paper_history_row_by_timestamp(history, trade.get("closed_at"))
@@ -4064,6 +4067,99 @@ def _paper_decision_key(session_id: str, run_strategy: dict, snapshot: dict) -> 
     )
 
 
+def _paper_threshold_signal_changed(
+    session_id: str,
+    source_strategy: dict,
+    run_strategy: dict,
+    snapshot: dict,
+    state: dict,
+) -> bool:
+    """Return true only when the threshold strategy can change trading state.
+
+    Its canonical preview still creates and executes the trade. This small scanner only
+    avoids rerunning the full backtest and file-backed accounting on every quote tick.
+    """
+    spec = _paper_strategy_spec(source_strategy, run_strategy)
+    if str(spec.get("family") or "") != "price_threshold_70_stop_40":
+        return True
+
+    event = snapshot.get("event") or {}
+    event_key = _paper_event_key(session_id, event)
+    event_changed = state.get("event_key") != event_key
+    if event_changed:
+        state.clear()
+        state.update({
+            "event_key": event_key,
+            "processed_rows": 0,
+            "entry_index": None,
+            "entry_side": None,
+            "last_processed_ts": None,
+            "target_known": False,
+        })
+
+    window_start = _number_or_none(event.get("window_start_ts"))
+    window_end = _number_or_none(event.get("window_end_ts"))
+    rows = sorted(
+        (
+            row for row in snapshot.get("history") or []
+            if isinstance(row, dict)
+            and _number_or_none(row.get("t")) is not None
+            and (window_start is None or float(row["t"]) >= window_start)
+            and (window_end is None or float(row["t"]) <= window_end)
+        ),
+        key=lambda row: float(row["t"]),
+    )
+    processed_rows = int(state.get("processed_rows") or 0)
+    prefix_changed = (
+        processed_rows > len(rows)
+        or (
+            processed_rows > 0
+            and state.get("last_processed_ts") != float(rows[processed_rows - 1]["t"])
+        )
+    )
+    if prefix_changed:
+        processed_rows = 0
+        state["entry_index"] = None
+        state["entry_side"] = None
+        state.pop("stop_index", None)
+
+    target_known = _paper_target_known_at_window_start(event, rows)
+    target_became_known = target_known and not bool(state.get("target_known"))
+    state["target_known"] = target_known
+
+    entry_threshold = float(spec.get("entry_price_cents", 70.0)) / 100
+    stop_loss = float(spec.get("stop_loss_cents", 40.0)) / 100
+    min_entry_ts = (window_start or 0.0) + float(spec.get("entry_second", 0.0))
+    signal_changed = False
+    for index in range(processed_rows, len(rows)) if state.get("stop_index") is None else ():
+        row = rows[index]
+        if state.get("entry_index") is None:
+            if float(row["t"]) < min_entry_ts:
+                continue
+            candidates = []
+            for side in ("up", "down"):
+                ask = LiveMonitorStrategyGenerator._side_ask(row, side)
+                if ask is not None and ask >= entry_threshold:
+                    candidates.append((side, ask))
+            if candidates:
+                side, _ = max(candidates, key=lambda item: item[1])
+                state["entry_index"] = index
+                state["entry_side"] = side
+                signal_changed = True
+            continue
+        if index <= int(state["entry_index"]):
+            continue
+        bid = LiveMonitorStrategyGenerator._side_bid(row, str(state["entry_side"]))
+        if bid is not None and bid <= stop_loss:
+            state["stop_index"] = index
+            signal_changed = True
+            break
+
+    state["processed_rows"] = len(rows)
+    state["last_processed_ts"] = float(rows[-1]["t"]) if rows else None
+    return event_changed or prefix_changed or target_became_known or signal_changed
+
+
 async def _paper_real_trading_worker(
     request: Request,
     user_id: str,
@@ -4076,6 +4172,7 @@ async def _paper_real_trading_worker(
     queue = session.add_subscriber()
     last_decision_key = None
     last_health_log_at = 0.0
+    threshold_signal_state: dict = {}
     logger.info(
         "Paper real trading worker started session=%s strategy=%s",
         session.id,
@@ -4120,6 +4217,16 @@ async def _paper_real_trading_worker(
                     break
                 continue
             last_decision_key = decision_key
+            if not _paper_threshold_signal_changed(
+                session.id,
+                source_strategy,
+                run_strategy,
+                snapshot,
+                threshold_signal_state,
+            ):
+                if session.is_finished:
+                    break
+                continue
             cache_key = _paper_visual_preview_key(session.id, run_strategy, snapshot)
             preview_snapshot = dict(snapshot)
             preview_snapshot["history"] = list(snapshot.get("history") or [])
