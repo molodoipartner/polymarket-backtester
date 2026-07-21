@@ -4676,6 +4676,18 @@ def sync_paper_trading_contracts(request: Request, group_id: str, strategy_id: s
                 str(item.get("saved_at") or ""),
             )
         )
+        existing_saved_record_ids = {
+            str(record.get("saved_record_id") or "")
+            for record in store.list_user_records_filtered(
+                user["id"],
+                "paper_trades",
+                {
+                    "group_id": run_group["id"],
+                    "strategy_id": run_strategy["id"],
+                },
+            )
+            if str(record.get("saved_record_id") or "")
+        }
         for preview in previews:
             saved_record_id = str(preview.get("id") or "").strip()
             if not saved_record_id:
@@ -4687,16 +4699,7 @@ def sync_paper_trading_contracts(request: Request, group_id: str, strategy_id: s
             if saved_record_id in deleted_saved_record_ids:
                 skipped += 1
                 continue
-            existing = store.list_user_records_filtered(
-                user["id"],
-                "paper_trades",
-                {
-                    "group_id": run_group["id"],
-                    "strategy_id": run_strategy["id"],
-                    "saved_record_id": saved_record_id,
-                },
-            )
-            if existing:
+            if saved_record_id in existing_saved_record_ids:
                 skipped += 1
                 continue
             _finalize_paper_live_contract(
@@ -4719,6 +4722,7 @@ def sync_paper_trading_contracts(request: Request, group_id: str, strategy_id: s
             )
             if finalized:
                 created += 1
+                existing_saved_record_ids.add(saved_record_id)
             else:
                 no_trade += 1
     return {
