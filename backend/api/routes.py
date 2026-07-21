@@ -69,6 +69,16 @@ QUALITY_CONTRACT_LIMITS = {
 }
 
 
+async def _stream_json(payload: Any) -> str:
+    """Serialize an SSE payload without blocking live sampling or trade decisions."""
+    return await asyncio.to_thread(
+        json.dumps,
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _normalize_quality_contract_limit(value: str | int | None) -> str:
     normalized = str(value or "250").strip().lower()
     return normalized if normalized in QUALITY_CONTRACT_LIMITS else "250"
@@ -1709,9 +1719,10 @@ async def live_monitor_events(request: Request, session_id: str):
                         f"data: {json.dumps({'server_time': time.time()})}\n\n"
                     )
                     continue
+                encoded = await _stream_json(message["data"])
                 yield (
                     f"event: {message['event']}\n"
-                    f"data: {json.dumps(message['data'], ensure_ascii=False)}\n\n"
+                    f"data: {encoded}\n\n"
                 )
         finally:
             session.remove_subscriber(queue)
@@ -4563,9 +4574,10 @@ async def paper_trading_monitor_events(
 
                     asyncio.create_task(refresh_visual_preview())
                 snapshot.update(paper_payload)
+                encoded = await _stream_json(snapshot)
                 yield (
                     f"event: {event_name}\n"
-                    f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                    f"data: {encoded}\n\n"
                 )
         finally:
             session.remove_subscriber(queue)

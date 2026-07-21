@@ -1521,6 +1521,21 @@ def test_paper_trading_requires_target_price_at_window_start():
     assert not routes_module._paper_target_known_at_window_start(late)
 
 
+def test_live_stream_json_serialization_runs_off_event_loop(monkeypatch):
+    calls = []
+
+    async def fake_to_thread(function, *args, **kwargs):
+        calls.append((function, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(routes_module.asyncio, "to_thread", fake_to_thread)
+
+    encoded = asyncio.run(routes_module._stream_json({"message": "сигнал", "value": 1}))
+
+    assert calls and calls[0][0] is json.dumps
+    assert encoded == '{"message":"сигнал","value":1}'
+
+
 def test_paper_open_signal_timing_uses_open_timestamp_with_preloaded_history():
     start_ts = 1782639600
     history = [
