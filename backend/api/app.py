@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -16,6 +18,33 @@ from backend.data import DataCollector
 from backend.live_monitor import LiveMonitorManager
 from backend.storage import FileStore
 from config.settings import ROOT_DIR, settings
+
+
+logger = logging.getLogger(__name__)
+RUNTIME_WATCHDOG_INTERVAL_SECONDS = 10.0
+RUNTIME_LAG_WARNING_MS = 500.0
+
+
+async def _runtime_watchdog(app: FastAPI) -> None:
+    next_tick = time.monotonic() + RUNTIME_WATCHDOG_INTERVAL_SECONDS
+    report_count = 0
+    while True:
+        await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+        now = time.monotonic()
+        lag_ms = max(0.0, (now - next_tick) * 1000.0)
+        next_tick = now + RUNTIME_WATCHDOG_INTERVAL_SECONDS
+        stats = app.state.live_monitor.runtime_stats()
+        health = {
+            "event_loop_lag_ms": round(lag_ms, 1),
+            "background_tasks": len(app.state.background_tasks),
+            **stats,
+        }
+        app.state.runtime_health = health
+        report_count += 1
+        if lag_ms >= RUNTIME_LAG_WARNING_MS:
+            logger.warning("Runtime event loop is delayed: %s", health)
+        elif report_count % 6 == 0:
+            logger.info("Runtime health: %s", health)
 
 
 @asynccontextmanager
@@ -36,6 +65,8 @@ async def lifespan(app: FastAPI):
     app.state.started_at = datetime.now(timezone.utc)
     store.ensure_user(settings.username, hash_password(settings.password), "Test User")
     store.log_system("application_started", {"environment": settings.environment})
+    watchdog = asyncio.create_task(_runtime_watchdog(app))
+    app.state.background_tasks.add(watchdog)
     try:
         yield
     finally:
@@ -59,6 +90,16 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_host_list)
     app.mount("/static", StaticFiles(directory=ROOT_DIR / "frontend" / "static"), name="static")
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, object]:
+        runtime = dict(getattr(app.state, "runtime_health", {}))
+        runtime.setdefault("event_loop_lag_ms", 0.0)
+        runtime.setdefault("background_tasks", len(getattr(app.state, "background_tasks", ())))
+        if hasattr(app.state, "live_monitor"):
+            runtime.update(app.state.live_monitor.runtime_stats())
+        return {"status": "ok", "runtime": runtime}
+
     app.include_router(router)
     return app
 

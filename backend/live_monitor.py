@@ -55,7 +55,6 @@ SAVED_RECORD_READ_WORKER_LIMIT = 32
 NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
-LIVE_STREAM_MIN_INTERVAL_SECONDS = 0.25
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
 LIVE_SNAPSHOT_HISTORY_LIMIT = 180
 SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES = 2 * 1024 * 1024
@@ -80,6 +79,13 @@ logger = logging.getLogger(__name__)
 _SAVED_RECORD_PREVIEW_CACHE: dict[Path, dict[str, Any]] = {}
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     try:
         return max(minimum, int(os.getenv(name, str(default))))
@@ -91,6 +97,11 @@ LIVE_HISTORY_MEMORY_LIMIT = _env_int("LIVE_MONITOR_HISTORY_MEMORY_LIMIT", 7200)
 LIVE_DISCONNECT_PERIOD_LIMIT = _env_int("LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT", 500)
 LIVE_SUBSCRIBER_QUEUE_SIZE = _env_int("LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE", 50, 1)
 LIVE_STREAM_HISTORY_LIMIT = _env_int("LIVE_MONITOR_STREAM_HISTORY_LIMIT", 60)
+LIVE_STREAM_MIN_INTERVAL_SECONDS = _env_float(
+    "LIVE_MONITOR_STREAM_MIN_INTERVAL_SECONDS",
+    0.25,
+    0.05,
+)
 SAMPLE_WRITE_QUEUE_SIZE = _env_int("LIVE_MONITOR_SAMPLE_WRITE_QUEUE_SIZE", 1000, 1)
 SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
     "LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT",
@@ -1734,9 +1745,14 @@ class LiveMonitorSession:
                 now - self._last_live_update_publish_at
                 >= LIVE_STREAM_MIN_INTERVAL_SECONDS
             )
-            should_publish = (
-                update_type == "quote" and bool(self._subscribers)
-            ) or target_locked or interval_elapsed
+            # Order-book feeds can produce many quote messages per second.  Publishing
+            # every one used to make the configured stream interval ineffective and
+            # kept the single Fly CPU busy serializing snapshots.  Sample ticks still
+            # drive paper-trading decisions every 0.5s; stream updates only need the
+            # latest quote within the configured interval.
+            should_publish = bool(self._subscribers) and (
+                target_locked or interval_elapsed
+            )
             should_sample = target_locked or (
                 now - self._last_sample_enqueue_at
                 >= SAMPLE_WRITE_MIN_INTERVAL_SECONDS
@@ -2919,6 +2935,16 @@ class LiveMonitorManager:
 
     def get(self, session_id: str) -> LiveMonitorSession | None:
         return self.sessions.get(session_id)
+
+    def runtime_stats(self) -> dict[str, int]:
+        active = [session for session in self.sessions.values() if not session.is_finished]
+        return {
+            "active_sessions": len(active),
+            "subscribers": sum(len(session._subscribers) for session in active),
+            "history_rows": sum(len(session._history) for session in active),
+            "sample_queue_size": sum(session._sample_queue.qsize() for session in active),
+            "sample_drop_count": sum(session._sample_drop_count for session in active),
+        }
 
     def active_session(self, user_id: str) -> LiveMonitorSession | None:
         sessions = self.active_sessions(user_id)

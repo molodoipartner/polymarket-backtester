@@ -1,0 +1,42 @@
+app = "polymarket-backtester"
+primary_region = "arn"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ENVIRONMENT = "production"
+  DATA_ROOT = "/var/data/polymarket-backtester"
+  DATA_SNAPSHOTS_ROOT = "/var/data/polymarket-backtester-snapshots"
+  WORKERS = "1"
+  LIVE_MONITOR_HISTORY_MEMORY_LIMIT = "1800"
+  LIVE_MONITOR_SUBSCRIBER_QUEUE_SIZE = "2"
+  LIVE_MONITOR_STREAM_HISTORY_LIMIT = "60"
+  LIVE_MONITOR_STREAM_MIN_INTERVAL_SECONDS = "0.5"
+  LIVE_MONITOR_SAMPLE_WRITE_QUEUE_SIZE = "500"
+  LIVE_MONITOR_DISCONNECT_PERIOD_LIMIT = "200"
+  LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT = "16"
+  POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
+  POLYMARKET_CHAIN_ID = "137"
+  POLYMARKET_SIGNATURE_TYPE = "1"
+  SIGNATURE_TYPE = "1"
+  POLYMARKET_LIVE_TRADING_ENABLED = "true"
+  ALLOWED_HOSTS = "polymarket-backtester.fly.dev,*.fly.dev,*.internal,localhost,127.0.0.1"
+  SESSION_COOKIE_SECURE = "true"
+
+[[mounts]]
+  source = "polymarket_data"
+  destination = "/var/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

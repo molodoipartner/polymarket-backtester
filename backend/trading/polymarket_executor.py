@@ -82,8 +82,6 @@ class PolymarketLiveOrderExecutor:
         amount = float(request.amount)
         if not math.isfinite(amount) or amount <= 0:
             raise ValueError("Order amount must be greater than zero.")
-        if amount > 1.000001:
-            raise ValueError("Live Paper Trading is currently capped at $1.00 per order.")
         return self._market_order(token_id, amount, "BUY", request.order_type, request.price)
 
     def market_sell(self, request: PolymarketLiveOrderRequest) -> dict[str, Any]:
@@ -159,7 +157,7 @@ class PolymarketLiveOrderExecutor:
 
             if prepared:
                 signed = prepared["signed"]
-                signed_meta = prepared["signed_meta"]
+                signed_meta = {**prepared["signed_meta"], "prepared_order_used": True}
                 clob_order_type = prepared["clob_order_type"]
             else:
                 order_side = BUY if side == "BUY" else SELL
@@ -172,7 +170,7 @@ class PolymarketLiveOrderExecutor:
                     order_type=clob_order_type,
                 )
                 signed = client.create_market_order(order_args)
-                signed_meta = self._signed_order_metadata(signed, side)
+                signed_meta = {**self._signed_order_metadata(signed, side), "prepared_order_used": False}
 
             send_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             started = time.perf_counter()

@@ -1657,11 +1657,22 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
         run_strategy,
         snapshot,
     )
+    display_only = routes_module._paper_live_trade_preview(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        snapshot,
+        execute_real_orders=False,
+    )
 
     assert first["paper_trades"]
     assert first["real_orders"][0]["status"] == "submitted"
     assert first["real_orders"][0]["token_id"] == "up-token"
     assert second["real_orders"][0]["status"] == "submitted"
+    assert display_only["real_orders"][0]["status"] == "submitted"
     assert len(executor.calls) == 1
     assert executor.calls[0].token_id == "up-token"
     assert executor.calls[0].amount == 1.0
@@ -1954,6 +1965,7 @@ def test_polymarket_executor_uses_prepared_order_without_resigning(monkeypatch):
     assert fake_client.create_calls == 1
     assert fake_client.post_calls == 1
     assert response["_timing"]["signed_token_quantity"] == pytest.approx(1.25)
+    assert response["_timing"]["prepared_order_used"] is True
 
 
 def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path: Path, monkeypatch):

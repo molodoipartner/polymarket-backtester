@@ -991,7 +991,7 @@ def test_live_stream_queue_preserves_important_events():
 
 
 @pytest.mark.asyncio
-async def test_quote_updates_publish_without_live_stream_throttle(tmp_path, monkeypatch):
+async def test_quote_updates_respect_live_stream_throttle(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",
         slug="btc-updown-5m-1782639600",
@@ -1023,12 +1023,18 @@ async def test_quote_updates_publish_without_live_stream_throttle(tmp_path, monk
     clock["now"] = 1000.1
     session.state.quotes["token-1"] = LiveQuote(bid=0.42, ask=0.43)
     await session._handle_update("quote", {"token_id": "token-1"})
-    second = queue.get_nowait()
 
     assert first["event"] == "quote"
-    assert second["event"] == "quote"
     assert first["data"]["history"] == [{"t": 999.5, "crypto_price": 100.0}]
-    assert second["data"]["history"] == []
+    assert queue.empty()
+    assert session._pending_live_update_count == 1
+
+    clock["now"] = 1010.0
+    await session._handle_update("quote", {"token_id": "token-1"})
+    second = queue.get_nowait()
+
+    assert second["event"] == "quote"
+    assert second["data"]["update"]["coalesced_count"] == 2
     assert second["data"]["quotes"][0]["bid"] == 0.42
     assert second["data"]["quotes"][0]["ask"] == 0.43
 

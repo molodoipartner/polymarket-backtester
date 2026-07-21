@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}{{ app_name }}{% endblock %}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/css/tailwind.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}?v={{ asset_version }}">
-  <script src="{{ url_for('static', path='/vendor/chart.umd.js') }}"></script>
+  <link rel="stylesheet" href="/static/css/tailwind.css">
+  <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+  <script src="/static/vendor/chart.umd.js"></script>
 </head>
 <body class="min-h-screen bg-ink text-slate-100 antialiased">
   <header class="border-b border-line bg-ink/90 backdrop-blur">
@@ -51,7 +51,7 @@
     <div id="local-data-list" class="local-data-list"></div>
   </aside>
   {% endif %}
-  <script src="{{ url_for('static', path='/js/app.js') }}?v={{ asset_version }}"></script>
+  <script src="/static/js/app.js?v={{ asset_version }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

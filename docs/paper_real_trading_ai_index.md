@@ -1,222 +1,248 @@
-# Paper Trading Real Orders AI Index
+# Paper Real Trading Latency Handoff
 
-This file is a compact map for debugging Paper Trading real-order execution.
-Use it to avoid re-scanning the whole project.
+Compact index for the next AI agent. The goal is to avoid re-discovering the
+same code paths when debugging automatic Paper Trading real-order latency.
 
-## Current Problem
+## User-Facing Problem
 
-Automatic Paper Trading signals still open/close too slowly or incorrectly.
-The site log can show something like:
+The project is deployed on Fly and automatic Paper Trading can send real
+Polymarket CLOB orders. Locally, the time between tick and signal can be around
+`22ms`, but on the Fly server the user observed much larger delays:
 
 ```text
-17:40:12.545 [paper] PAPER SIGNAL OPEN DOWN amount 1.000000 token ...
-17:40:14.655 [clob] CLOB SEND OPEN DOWN submitted amount 1.000000 @ 0.99 token ... delay 2110.00ms 1047.90ms
+13:20:32.450 [paper] PAPER SIGNAL OPEN UP amount 2.000000 token 25631311...124740 signal lag 2450.00ms
+13:20:33.493 [clob] CLOB SEND OPEN UP submitted amount 2.000000 @ 0.99 token 25631311...124740 delay 1043.00ms 637.35ms clob_status matched
+13:21:35.979 [paper] PAPER SIGNAL CLOSE UP amount 2.941175 token 25631311...124740 signal lag 7479.00ms
+13:21:35.979 [clob] CLOB SEND CLOSE UP submitted amount 2.941175 @ 0.01 token 25631311...124740 delay 0.00ms 792.16ms clob_status matched
 ```
 
-Important interpretation:
+Interpretation:
 
-- `delay 2110.00ms` is backend delay between detecting the paper signal and reaching the CLOB order send start.
-- `1047.90ms` is the CLOB/client order call duration.
-- The desired target is very small signal-to-CLOB delay, ideally tens of milliseconds.
+- `PAPER SIGNAL ...` is the backend-created paper/real signal record displayed
+  by the browser.
+- `CLOB SEND ... delay N ms` is frontend display of
+  `order.signal_to_clob_ms`, computed from backend timestamps.
+- The final number such as `637.35ms` / `792.16ms` is CLOB request duration from
+  `PolymarketLiveOrderExecutor._market_order`.
+- A previous experiment added `signal lag ...ms` to measure tick-to-signal
+  decision latency, but the user said it did not improve the situation and asked
+  to roll it back. That experiment is currently reverted.
 
-The latest attempted fix moved real order record writes after CLOB order execution, but the user reports the delay/problem remains.
-So the next investigation should look earlier in the paper preview/signal path, not only inside `_execute_paper_real_trading_signals`.
+## Current Deployment Context
 
-## User Rules / Requirements
+- Fly app: `polymarket-backtester`
+- Public URL: `https://polymarket-backtester.fly.dev/login`
+- Region: `arn` Stockholm / Sweden
+- Machine observed after rollback: `287e605a591578`
+- Health endpoint: `/healthz`
+- `fly.toml` contains `LIVE_MONITOR_STREAM_MIN_INTERVAL_SECONDS = "0.5"`.
+- `POLYMARKET_LIVE_ORDER_AMOUNT` is intentionally not hardcoded in `fly.toml`;
+  it should come from Fly secrets / environment.
 
-- Do not add extra balance checks before closing.
-- Do not fetch balance at close time.
-- After successful open, do exactly one token balance request and save that quantity.
-- Close must use the saved `real_open_quantity`.
-- No fallback balance lookup on close.
-- Do not add extra verification loops unless explicitly asked.
-- Opening and closing should use aggressive orders:
-  - BUY uses limit price `0.99`.
-  - SELL uses limit price `0.01`.
-  - Order type currently is `FAK`.
-- UP and DOWN are different Polymarket token IDs:
-  - UP must use outcome `Up`.
-  - DOWN must use outcome `Down`.
-  - Close must sell the same saved `token_id` from the open record.
-- The website live console must show:
-  - exact paper signal time with milliseconds;
-  - exact CLOB send start time with milliseconds;
-  - delay between those two events.
+Useful commands:
 
-## Main Backend Files
+```powershell
+curl.exe -sS -L https://polymarket-backtester.fly.dev/healthz
+& "$env:USERPROFILE\.fly\bin\flyctl.exe" status --app polymarket-backtester
+& "$env:USERPROFILE\.fly\bin\flyctl.exe" deploy --app polymarket-backtester --remote-only
+```
+
+## Do Not Re-Do These Unless Asked
+
+- Do not re-add the rolled-back `signal lag` implementation as a fix. It was
+  only instrumentation and did not solve the user's server latency.
+- Do not re-cap real order amount at `$1`. That bug was fixed: orders should use
+  `POLYMARKET_LIVE_ORDER_AMOUNT`.
+- Do not add extra balance checks before close. The user explicitly wanted close
+  to use saved open quantity.
+- Do not add balance fetches at close time.
+- Do not add verification loops unless the user explicitly accepts extra delay.
+
+## Important Existing Behavior
+
+- Open order amount comes from `_paper_real_order_amount()`.
+- `_paper_real_order_amount()` reads `settings.polymarket_live_order_amount`,
+  falls back to `1.0` only if missing/invalid, then rounds to 2 decimals.
+- BUY/open uses aggressive limit price `0.99`.
+- SELL/close uses aggressive limit price `0.01`.
+- Order type is currently `FAK`.
+- After successful open, the code fetches token balance once and stores
+  `real_open_quantity`.
+- Close sells the saved quantity from the open record, not a newly fetched
+  balance.
+
+## Main Backend Map
 
 ### `backend/api/routes.py`
 
-This is the main file for Paper Trading live preview and automatic real-order execution.
+This is the central file for Paper Trading live preview and automatic real
+orders.
 
 Key functions:
 
-- `_paper_live_trade_preview(...)` around line 2652
-  - Builds live paper trades from the current snapshot.
-  - Calls `_execute_paper_real_trading_signals(...)`.
-  - If delay remains high, inspect work done before that call.
+- `_paper_live_trade_preview(...)` near line 2656
+  - Builds paper trades from the current live snapshot.
+  - Eventually calls `_execute_paper_real_trading_signals(...)`.
+  - If server tick-to-signal delay is high, inspect this function and the work
+    before the signal is persisted.
 
-- `_paper_real_order_id(...)` around line 2919
-  - Deterministic ID for open real orders.
-  - Used for deduplication.
+- `_paper_real_order_amount()` near line 2968
+  - Reads `settings.polymarket_live_order_amount`.
+  - No longer caps amount at `$1`.
 
-- `_paper_real_close_order_id(...)` near `_paper_real_order_id`
-  - Deterministic ID for close real orders.
-
-- `_paper_token_id_for_side(snapshot, side)` around line 2952
-  - Maps `UP` to outcome `Up`, `DOWN` to outcome `Down`.
-  - Falls back to first token for Up, second token for Down if outcomes are missing.
-
-- `_paper_real_order_amount()`
-  - Returns configured real order size, capped at `$1.00`.
-
-- `_paper_real_order_type()`
-  - Currently returns `"FAK"`.
-
-- `_paper_aggressive_limit_price(action)`
+- `_paper_aggressive_limit_price(action)` near line 2979
   - BUY -> `0.99`
   - SELL -> `0.01`
 
-- `_paper_clock_ms()` around line 2979
-  - Generates ISO timestamp with milliseconds for paper/CLOB timing.
+- `_warm_paper_live_order_tokens(...)` near line 3071
+  - Warms CLOB client/token/order data.
+  - In the live SSE route, when real trading is enabled, this is awaited via
+    `asyncio.to_thread(...)` before preview calculation. This may be a source of
+    blocking delay on the event stream.
 
-- `_paper_signal_to_clob_ms(...)`
-  - Computes signal-to-CLOB delay.
+- `_execute_paper_real_trading_signals(...)` near line 3495
+  - Main automatic real-order function.
+  - Creates deterministic real order ids.
+  - Sends open/close CLOB orders.
+  - Stores timing fields such as `paper_signal_at`, `clob_send_at`,
+    `signal_to_clob_ms`, and executor `_timing`.
 
-- `_execute_paper_real_trading_signals(...)` around line 3356
-  - Main automatic real trading function.
-  - For open:
-    - checks existing real order for dedupe;
-    - records `paper_signal_at`;
-    - sends `market_buy`;
-    - after successful open, calls `token_balance(token_id)` once;
-    - stores `real_open_quantity`, timing, response.
-  - For close:
-    - loads open record;
-    - reads saved `real_open_quantity`;
-    - sends `market_sell`;
-    - does not call `token_balance`.
-
-Manual trading helpers are also in this file:
-
-- `_paper_manual_open_transaction(...)`
-- `_paper_manual_close_transaction(...)`
-
-Manual flow is useful for comparison, but the reported issue is automatic Paper Trading signal execution.
-
-## CLOB Executor
+- Live SSE / streaming route around lines 4002-4031
+  - Gets `snapshot = session.snapshot(history_limit=None)`.
+  - Builds `cache_key`.
+  - If `real_trading_enabled`:
+    - awaits `_warm_paper_live_order_tokens(...)`;
+    - then awaits `_paper_live_trade_preview(..., persist=False)`;
+    - stores preview in cache.
+  - This synchronous real-trading branch is the highest-value place to inspect
+    for server-only delays.
 
 ### `backend/trading/polymarket_executor.py`
 
-Key class:
+Key class: `PolymarketLiveOrderExecutor`
 
-- `PolymarketLiveOrderExecutor` around line 25
+Important methods:
 
-Key methods:
+- `prepare_tokens(...)`
+  - Calls `client.get_version()` and `client.get_tick_size(token)`.
 
-- `market_buy(...)`
-- `market_sell(...)`
-- `token_balance(...)`
-- `_market_order(...)` around line 82
+- `prepare_market_order(...)`
+  - Pre-creates signed market orders and stores them in `_prepared_orders`.
 
-Important behavior:
+- `market_buy(...)` / `market_sell(...)`
+  - Validate and call `_market_order(...)`.
 
-- `_market_order(...)` logs CLOB send start and complete.
-- Response includes `_timing`:
-  - `send_at`
-  - `duration_ms`
-  - `side`
-  - `token_id`
-  - `amount`
-  - `price`
-  - `order_type`
+- `_market_order(...)` near line 141
+  - Uses prepared signed order if available.
+  - Otherwise creates order with `client.create_market_order(...)`.
+  - Measures only `client.post_order(...)` duration as `_timing.duration_ms`.
+  - Returns response with `_timing.send_at`, `duration_ms`, `price`,
+    `order_type`, etc.
 
-The CLOB duration shown in the website log comes from this `_timing.duration_ms`.
-If duration is around 1000ms, inspect py-clob-client behavior and any pre-order market metadata requests.
+If `CLOB SEND ... 700ms` is the issue, inspect network/client behavior here.
+If `PAPER SIGNAL` appears seconds after the tick, inspect upstream route and
+strategy generation instead.
 
-## Frontend Live Console
+## Frontend Map
 
 ### `frontend/static/js/app.js`
 
-Key locations:
+Key function:
 
-- `paperRealOrderLogKeys` around line 742
-  - Dedupes log rows in the browser.
+- `renderRealOrderLogs(...)` around line 1080
+  - Displays `[paper] PAPER SIGNAL ...`.
+  - Displays `[clob] CLOB SEND ... delay ... duration ... clob_status ...`.
+  - It only displays backend timestamps; it is not the source of backend order
+    latency.
 
-- `renderRealOrderLogs(...)` around line 1070
-  - Renders `[paper] PAPER SIGNAL ...`
-  - Renders `[clob] CLOB SEND ... delay ...`
+Current rolled-back state:
 
-- `render(...)` around line 1123
-  - Calls `renderRealOrderLogs(payload, controller)`.
+- There should be no `signal lag`, `signal_decision_ms`, or
+  `_paper_signal_decision_ms` in this file or `backend/api/routes.py`.
 
-The frontend only displays backend timestamps. It does not measure the actual backend delay itself.
+Quick check:
 
-## Strategy Involved
+```powershell
+rg -n "signal lag|signal_decision_ms|_paper_signal_decision_ms" backend frontend
+```
 
-### `backend/strategy_generator/live_monitor_generator.py`
+No matches are expected.
 
-Relevant strategy family:
+## Live Monitor / Streaming
 
-- `price_threshold_70_stop_40`
-- Label: `Price Threshold 70 Stop 40`
+### `backend/live_monitor.py`
 
-Key locations:
+Relevant setting:
 
-- Family label/registration near lines 38-49.
-- Trade generation references around lines 1169-1170.
-- `_price_threshold_70_stop_40_trades(...)` around line 1349.
-- More family-specific handling around lines 2212, 2343, 2469.
-
-If signal detection itself is late, inspect this strategy path and the live preview path before real-order execution.
+- `LIVE_MONITOR_STREAM_MIN_INTERVAL_SECONDS`
+  - Currently configured in `fly.toml` as `0.5`.
+  - This can throttle stream updates to the frontend, but be careful: reducing
+    frontend stream cadence may not fix real order execution if order decisions
+    are tied to the same streamed preview path.
 
 ## Tests
 
-### `tests/test_file_architecture.py`
-
-Relevant test:
-
-- `test_paper_real_trading_executes_signal_once(...)` around line 1524
-
-This test checks:
-
-- Auto real order opens once.
-- UP uses `up-token`.
-- DOWN uses `down-token`.
-- BUY uses `FAK` and `0.99`.
-- SELL uses `FAK` and `0.01`.
-- Close quantity comes from saved `real_open_quantity`.
-- Close does not trigger another balance check.
-
-Useful command:
+Useful tests for the amount/order behavior:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_file_architecture.py::test_paper_real_trading_executes_signal_once
+.\.venv\Scripts\python.exe -m pytest tests\test_live_order_amount.py tests\test_file_architecture.py -k "paper or real_order or live"
 ```
 
-Manual comparison test:
+Previously passed after rollback:
+
+```text
+40 passed, 39 deselected
+```
+
+Also useful:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_file_architecture.py::test_manual_paper_trade_open_and_close_updates_same_transaction
+.\.venv\Scripts\python.exe -m py_compile backend\api\routes.py
+node --check frontend\static\js\app.js
 ```
 
-## Likely Next Debugging Direction
+## Recommended Next Debugging Plan
 
-If `delay` is still around 2 seconds after moving real order storage after CLOB, likely causes are upstream of `_execute_paper_real_trading_signals(...)`, for example:
+Start by separating three different delays:
 
-- paper trades are generated late in `_paper_live_trade_preview(...)`;
-- live snapshot/polling cadence is slow;
-- frontend receives the signal only after backend work has already happened;
-- strategy generation or preview calculation is expensive;
-- file/storage work before `_execute_paper_real_trading_signals(...)` still blocks the signal path;
-- real order execution is called only after a slower periodic refresh instead of immediately when a live tick creates the signal.
+1. Tick received -> strategy decision/paper signal created.
+2. Paper signal created -> CLOB send start.
+3. CLOB send start -> CLOB response/match.
 
-Recommended next instrumentation:
+Recommended low-risk instrumentation:
 
-- Add timing around `_paper_live_trade_preview(...)`.
-- Add timing immediately before and after strategy trade generation.
-- Add timing immediately before `_execute_paper_real_trading_signals(...)`.
-- Compare those times with `paper_signal_at` and executor `_timing.send_at`.
+- Add server-side log timestamps around:
+  - `session.snapshot(history_limit=None)`;
+  - `_warm_paper_live_order_tokens(...)`;
+  - `_paper_live_trade_preview(...)`;
+  - strategy trade generation inside `_paper_live_trade_preview(...)`;
+  - `_execute_paper_real_trading_signals(...)`;
+  - `PolymarketLiveOrderExecutor.prepare_tokens(...)`;
+  - `prepare_market_order(...)`;
+  - `_market_order(...)`.
 
-Do not add extra balance checks or close verification while investigating latency.
+Do not make the instrumentation itself part of the user-visible frontend unless
+the user asks. Prefer backend logs first.
 
+Likely high-value hypothesis:
+
+- On Fly, the SSE real-trading branch may wait for warmup and full preview work
+  before the paper signal becomes visible/executable. If real order execution is
+  effectively coupled to preview rendering/streaming cadence, server load or
+  network calls in warmup can create seconds of delay.
+
+Potential direction to investigate, not yet proven:
+
+- Decouple real order decision/execution from the frontend preview/SSE render
+  path. Let the monitor/tick path execute real-order decisions immediately, then
+  let SSE only display already-recorded results.
+
+## Git / Change State Note
+
+At the time this handoff was written, the repository may contain uncommitted
+deployment and trading changes from the Render -> Fly migration and related
+fixes. Do not assume `git status` is clean. Inspect before editing:
+
+```powershell
+git status --short
+```

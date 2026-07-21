@@ -85,3 +85,84 @@ You can also download data using Render SSH/SCP after enabling SSH for the
 service.
 
 For a Render custom domain, also update `ALLOWED_HOSTS` to include that domain.
+
+## Fly.io app in Stockholm, Sweden
+
+Fly deployment is configured with `Dockerfile`, `.dockerignore`, and `fly.toml`.
+The Fly primary region is:
+
+```text
+arn
+```
+
+`arn` is Fly's Stockholm, Sweden region. The app uses one small shared CPU
+machine and a mounted persistent volume at:
+
+```text
+/var/data
+```
+
+The server writes production data to:
+
+```text
+DATA_ROOT=/var/data/polymarket-backtester
+```
+
+The default config uses `shared-cpu-1x` with 512 MB RAM. In Stockholm this is
+about $3.32/month when running continuously. Fly Volumes are $0.15/GB/month, so
+the recommended 3 GB volume is about $0.45/month. Outbound internet traffic from
+Europe is $0.02/GB.
+
+Create the Fly app and a 3 GB volume:
+
+```powershell
+flyctl apps create polymarket-backtester --org personal
+flyctl volumes create polymarket_data --region arn --size 3 --app polymarket-backtester
+```
+
+Set the required secrets before deploy. At minimum, set:
+
+```powershell
+flyctl secrets set `
+  SESSION_SECRET="replace-with-at-least-32-random-characters" `
+  EXPORT_TOKEN="replace-with-random-export-token" `
+  USERNAME="your-login" `
+  PASSWORD="your-password" `
+  ADMIN_USERNAME="your-admin-login" `
+  ADMIN_PASSWORD="your-admin-password" `
+  --app polymarket-backtester
+```
+
+For live Polymarket trading, also set the wallet/API secrets used by your
+account:
+
+```powershell
+flyctl secrets set `
+  PRIVATE_KEY="..." `
+  PROXY_ADDRESS="..." `
+  API_KEY="..." `
+  API_SECRET="..." `
+  API_PASSPHRASE="..." `
+  POLYMARKET_PRIVATE_KEY="..." `
+  POLYMARKET_PROXY_ADDRESS="..." `
+  POLYMARKET_FUNDER="..." `
+  POLYMARKET_API_KEY="..." `
+  POLYMARKET_API_SECRET="..." `
+  POLYMARKET_API_PASSPHRASE="..." `
+  --app polymarket-backtester
+```
+
+Deploy:
+
+```powershell
+flyctl deploy --app polymarket-backtester
+```
+
+The production URL will be:
+
+```text
+https://polymarket-backtester.fly.dev
+```
+
+If Fly reports that the app name is unavailable, create a unique app name and
+update `app` plus the first value in `ALLOWED_HOSTS` in `fly.toml`.

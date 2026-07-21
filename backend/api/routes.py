@@ -15,6 +15,7 @@ import traceback
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import urlencode
 
@@ -754,6 +755,14 @@ def _track_job_task(app, job_id: str, task: asyncio.Task) -> None:
         app.state.job_tasks.pop(job_id, None)
 
     task.add_done_callback(cleanup)
+
+
+def _background_tasks(app) -> set:
+    tasks = getattr(app.state, "background_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        app.state.background_tasks = tasks
+    return tasks
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -2012,6 +2021,7 @@ def _create_paper_run_group(
     initial_event: object | None = None,
     starting_balance: float | None = None,
     real_trading_enabled: bool = False,
+    server_optimized: bool = False,
 ) -> tuple[dict, dict]:
     now = utc_iso()
     group_id = uuid.uuid4().hex
@@ -2067,7 +2077,8 @@ def _create_paper_run_group(
             "source_strategy_name": source_strategy.get("name"),
             "session_id": session_id,
             "real_trading_enabled": bool(real_trading_enabled),
-            "real_order_amount": round(min(float(settings.polymarket_live_order_amount or 1.0), 1.0), 2),
+            "server_optimized": bool(server_optimized),
+            "real_order_amount": _paper_real_order_amount(),
             "initial_event_slug": getattr(initial_event, "slug", None),
             "initial_window_start_ts": getattr(initial_event, "window_start_ts", None),
             "deleted_saved_record_ids": [],
@@ -2093,7 +2104,8 @@ def _create_paper_run_group(
             "source_strategy_id": source_strategy["id"],
             "session_id": session_id,
             "real_trading_enabled": bool(real_trading_enabled),
-            "real_order_amount": round(min(float(settings.polymarket_live_order_amount or 1.0), 1.0), 2),
+            "server_optimized": bool(server_optimized),
+            "real_order_amount": _paper_real_order_amount(),
         },
         "created_at": now,
     }
@@ -2663,6 +2675,7 @@ def _paper_live_trade_preview(
     snapshot: dict,
     *,
     persist: bool = False,
+    execute_real_orders: bool = True,
 ) -> dict:
     store = _store(request)
     run_group = store.get_user_record(user_id, "groups", run_group["id"]) or run_group
@@ -2776,6 +2789,7 @@ def _paper_live_trade_preview(
         marker["preview"] = True
         marker["status"] = "closed" if is_live_exit else "open"
         trades.append(marker)
+    _paper_attach_signal_timing(trades, history)
     if persist:
         _persist_paper_live_trades(
             request,
@@ -2789,16 +2803,26 @@ def _paper_live_trade_preview(
             history,
             trades,
         )
-    real_orders = _execute_paper_real_trading_signals(
-        request,
-        user_id,
-        run_group,
-        run_strategy,
-        session_id,
-        event_payload,
-        snapshot,
-        trades,
-    )
+    if execute_real_orders:
+        real_orders = _execute_paper_real_trading_signals(
+            request,
+            user_id,
+            run_group,
+            run_strategy,
+            session_id,
+            event_payload,
+            snapshot,
+            trades,
+        )
+    else:
+        real_orders = _paper_existing_real_orders_for_trades(
+            request,
+            user_id,
+            run_strategy,
+            session_id,
+            event_payload,
+            trades,
+        )
     real_order_failures = [
         order for order in real_orders if str(order.get("status") or "") == "failed"
     ]
@@ -2834,6 +2858,55 @@ def _timestamp_from_iso(value) -> float | None:
         return None
 
 
+def _iso_from_ts(value) -> str | None:
+    timestamp = _number_or_none(value)
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _paper_history_row_by_index(history: list[dict], index: int | None) -> dict | None:
+    if index is None or index < 0 or index >= len(history):
+        return None
+    row = history[index]
+    return row if isinstance(row, dict) else None
+
+
+def _paper_history_row_by_timestamp(history: list[dict], timestamp_iso: str | None) -> dict | None:
+    timestamp = _timestamp_from_iso(timestamp_iso)
+    if timestamp is None:
+        return None
+    for row in reversed(history):
+        row_ts = _number_or_none(row.get("t")) if isinstance(row, dict) else None
+        if row_ts is not None and abs(row_ts - timestamp) <= 1e-6:
+            return row
+    return None
+
+
+def _paper_signal_row(history: list[dict], trade: dict, action: str) -> dict | None:
+    if action == "open":
+        entry_index = int(trade.get("entry_history_count") or 0) - 1
+        return _paper_history_row_by_index(history, entry_index)
+    return _paper_history_row_by_timestamp(history, trade.get("closed_at"))
+
+
+def _paper_attach_signal_timing(trades: list[dict], history: list[dict]) -> None:
+    for trade in trades:
+        action = "close" if str(trade.get("status") or "").lower() == "closed" else "open"
+        row = _paper_signal_row(history, trade, action)
+        if not row:
+            continue
+        captured_at = _number_or_none(row.get("captured_at"))
+        if captured_at is not None:
+            trade["signal_tick_captured_at"] = _iso_from_ts(captured_at)
+        sample_delay = _number_or_none(row.get("sample_delay_ms"))
+        if sample_delay is not None:
+            trade["signal_sample_delay_ms"] = sample_delay
+        row_ts = _number_or_none(row.get("t"))
+        if row_ts is not None:
+            trade["signal_history_at"] = _iso_from_ts(row_ts)
+
+
 def _paper_session_payload(
     request: Request,
     user_id: str,
@@ -2843,7 +2916,12 @@ def _paper_session_payload(
     run_strategy: dict,
     session,
 ) -> dict:
-    payload = _live_monitor_session_payload(session, history_limit=None)
+    paper_meta = run_group.get("paper_trading") or {}
+    server_optimized = bool(paper_meta.get("server_optimized"))
+    payload = _live_monitor_session_payload(
+        session,
+        history_limit=0 if server_optimized else None,
+    )
     payload["events_url"] = (
         f"/api/paper-trading/{source_group['id']}/strategies/"
         f"{source_strategy['id']}/sessions/{session.id}/events"
@@ -2864,10 +2942,9 @@ def _paper_session_payload(
         f"/api/paper-trading/{source_group['id']}/strategies/"
         f"{source_strategy['id']}/sessions/{session.id}/manual/close"
     )
-    payload["real_trading_enabled"] = bool(
-        (run_group.get("paper_trading") or {}).get("real_trading_enabled")
-    )
-    payload["real_order_amount"] = (run_group.get("paper_trading") or {}).get(
+    payload["real_trading_enabled"] = bool(paper_meta.get("real_trading_enabled"))
+    payload["server_optimized"] = server_optimized
+    payload["real_order_amount"] = paper_meta.get(
         "real_order_amount",
         _paper_real_order_amount(),
     )
@@ -2907,8 +2984,18 @@ def _paper_existing_trade_preview(
             user_id, "transactions", {"paper_trade_id": paper_id}
         )
     ]
+    real_orders = _store(request).list_user_records_filtered(
+        user_id,
+        "real_orders",
+        {
+            "group_id": run_group["id"],
+            "strategy_id": strategy_id,
+            "live_event_key": event_key,
+        },
+    )
     return {
         "paper_trades": trades,
+        "real_orders": real_orders,
         "paper_trade_status": {
             "status": "active" if trades else "watching",
             "message": (
@@ -2953,6 +3040,35 @@ def _paper_real_close_order_id(paper_id: str, trade: dict) -> str:
     ).hex
 
 
+def _paper_existing_real_orders_for_trades(
+    request: Request,
+    user_id: str,
+    run_strategy: dict,
+    session_id: str,
+    event_payload: dict,
+    trades: list[dict],
+) -> list[dict]:
+    if not trades:
+        return []
+    paper_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"paper-live:{run_strategy['id']}:{_paper_event_key(session_id, event_payload)}",
+    ).hex
+    store = _store(request)
+    orders = []
+    seen = set()
+    for trade in trades:
+        order_id = _paper_real_order_id(paper_id, trade)
+        for candidate_id in (order_id, _paper_real_close_order_id(paper_id, trade)):
+            if candidate_id in seen:
+                continue
+            record = store.get_user_record(user_id, "real_orders", candidate_id)
+            if record:
+                orders.append(record)
+                seen.add(candidate_id)
+    return orders
+
+
 def _paper_token_id_for_side(snapshot: dict, side: str) -> str | None:
     wanted = "up" if str(side or "").upper() == "UP" else "down"
     tokens = (snapshot.get("event") or {}).get("tokens") or []
@@ -2969,7 +3085,7 @@ def _paper_real_order_amount() -> float:
     amount = _number_or_none(settings.polymarket_live_order_amount)
     if amount is None or amount <= 0:
         amount = 1.0
-    return round(min(amount, 1.0), 2)
+    return round(amount, 2)
 
 
 def _paper_real_order_type() -> str:
@@ -3023,6 +3139,16 @@ def _paper_signal_to_clob_ms(signal_at: str | None, clob_send_at: str | None) ->
     except ValueError:
         return None
     return round((sent - start).total_seconds() * 1000, 3)
+
+
+def _paper_signal_lag_ms(signal_at: str | None, tick_at: str | None) -> float | None:
+    if not signal_at or not tick_at:
+        return None
+    signal_ts = _timestamp_from_iso(signal_at)
+    tick_ts = _timestamp_from_iso(tick_at)
+    if signal_ts is None or tick_ts is None:
+        return None
+    return round(max(0.0, signal_ts - tick_ts) * 1000, 3)
 
 
 def _paper_mutable_real_order_fields(record: dict) -> dict:
@@ -3103,6 +3229,20 @@ def _warm_paper_live_order_tokens(request: Request, token_ids: list[str]) -> Non
     finally:
         with _PAPER_TOKEN_WARM_LOCK:
             _PAPER_WARMING_TOKEN_IDS.difference_update(pending)
+
+
+def _schedule_paper_live_order_token_warmup(request: Request, token_ids: list[str]) -> None:
+    if not token_ids:
+        return
+    task = asyncio.create_task(
+        asyncio.to_thread(_warm_paper_live_order_tokens, request, token_ids)
+    )
+    _background_tasks(request.app).add(task)
+
+    def cleanup(done: asyncio.Task) -> None:
+        _background_tasks(request.app).discard(done)
+
+    task.add_done_callback(cleanup)
 
 
 def _prepare_paper_close_order(request: Request, token_id: str | None, quantity: float | None) -> None:
@@ -3540,6 +3680,7 @@ def _execute_paper_real_trading_signals(
                 quantity = error_balance_quantity
                 quantity_source = "previous_clob_error_balance"
             paper_signal_at = _paper_clock_ms()
+            signal_tick_at = trade.get("signal_tick_captured_at") or trade.get("closed_at")
             close_base = {
                 "user_id": user_id,
                 "group_id": run_group["id"],
@@ -3558,7 +3699,11 @@ def _execute_paper_real_trading_signals(
                 "open_order_id": order_id,
                 "signal_opened_at": trade.get("opened_at"),
                 "signal_closed_at": trade.get("closed_at"),
+                "signal_history_at": trade.get("signal_history_at") or trade.get("closed_at"),
+                "signal_sample_delay_ms": _number_or_none(trade.get("signal_sample_delay_ms")),
+                "signal_tick_at": signal_tick_at,
                 "paper_signal_at": paper_signal_at,
+                "signal_lag_ms": _paper_signal_lag_ms(paper_signal_at, signal_tick_at),
                 "signal_exit_price": trade.get("exit_price") or trade.get("exit_bid_price"),
                 "event_slug": event_payload.get("slug"),
                 "event_title": event_payload.get("title") or event_payload.get("event_title"),
@@ -3666,6 +3811,7 @@ def _execute_paper_real_trading_signals(
             results.append(existing)
             continue
         paper_signal_at = _paper_clock_ms()
+        signal_tick_at = trade.get("signal_tick_captured_at") or trade.get("opened_at")
         open_base = {
             "user_id": user_id,
             "group_id": run_group["id"],
@@ -3682,7 +3828,11 @@ def _execute_paper_real_trading_signals(
             "limit_price": _paper_aggressive_limit_price("BUY"),
             "order_action": "open",
             "signal_opened_at": trade.get("opened_at"),
+            "signal_history_at": trade.get("signal_history_at") or trade.get("opened_at"),
+            "signal_sample_delay_ms": _number_or_none(trade.get("signal_sample_delay_ms")),
+            "signal_tick_at": signal_tick_at,
             "paper_signal_at": paper_signal_at,
+            "signal_lag_ms": _paper_signal_lag_ms(paper_signal_at, signal_tick_at),
             "signal_entry_price": trade.get("entry_price") or trade.get("ask_price"),
             "event_slug": event_payload.get("slug"),
             "event_title": event_payload.get("title") or event_payload.get("event_title"),
@@ -3810,6 +3960,14 @@ def _paper_cached_visual_preview(cache_key: str) -> dict | None:
     return payload or None
 
 
+def _paper_lightweight_preview() -> dict:
+    return {
+        "paper_trades": [],
+        "real_orders": [],
+        "paper_trade_status": {"status": "watching"},
+    }
+
+
 def _paper_preview_running(cache_key: str, now: float, min_interval: float = 0.75) -> bool:
     with _PAPER_VISUAL_PREVIEW_LOCK:
         entry = _PAPER_VISUAL_PREVIEWS.setdefault(cache_key, {})
@@ -3834,6 +3992,239 @@ def _store_paper_visual_preview(cache_key: str, payload: dict | None, error: Exc
                 "paper_trades": [],
                 "paper_trade_status": {"status": "error", "message": _error_message(error)},
             }
+
+
+def _paper_real_trading_tasks(app) -> dict[str, asyncio.Task]:
+    tasks = getattr(app.state, "paper_real_trading_tasks", None)
+    if not isinstance(tasks, dict):
+        tasks = {}
+        app.state.paper_real_trading_tasks = tasks
+    return tasks
+
+
+def _track_paper_real_trading_task(app, key: str, task: asyncio.Task) -> None:
+    _background_tasks(app).add(task)
+    _paper_real_trading_tasks(app)[key] = task
+
+    def cleanup(done: asyncio.Task) -> None:
+        _background_tasks(app).discard(done)
+        if _paper_real_trading_tasks(app).get(key) is done:
+            _paper_real_trading_tasks(app).pop(key, None)
+
+    task.add_done_callback(cleanup)
+
+
+def _schedule_paper_contract_finalization(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    saved_preview: dict | None,
+) -> None:
+    if not saved_preview:
+        return
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _finalize_paper_live_contract,
+            request,
+            user_id,
+            source_group,
+            source_strategy,
+            run_group,
+            run_strategy,
+            saved_preview,
+        )
+    )
+    _background_tasks(request.app).add(task)
+
+    def cleanup(done: asyncio.Task) -> None:
+        _background_tasks(request.app).discard(done)
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Paper trading contract finalization failed")
+
+    task.add_done_callback(cleanup)
+
+
+def _paper_decision_key(session_id: str, run_strategy: dict, snapshot: dict) -> tuple:
+    history = [
+        row for row in snapshot.get("history") or []
+        if isinstance(row, dict) and _number_or_none(row.get("t")) is not None
+    ]
+    last_history_ts = float(history[-1]["t"]) if history else None
+    return (
+        session_id,
+        str(run_strategy.get("id") or ""),
+        _paper_event_key(session_id, snapshot.get("event") or {}),
+        len(history),
+        last_history_ts,
+    )
+
+
+async def _paper_real_trading_worker(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session,
+) -> None:
+    queue = session.add_subscriber()
+    last_decision_key = None
+    last_health_log_at = 0.0
+    logger.info(
+        "Paper real trading worker started session=%s strategy=%s",
+        session.id,
+        run_strategy.get("id"),
+    )
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=2)
+            except asyncio.TimeoutError:
+                if session.is_finished:
+                    break
+                continue
+            event_name = str(message.get("event") or "")
+            if event_name == "saved":
+                saved_preview = (message.get("data") or {}).get("record")
+                _schedule_paper_contract_finalization(
+                    request,
+                    user_id,
+                    source_group,
+                    source_strategy,
+                    run_group,
+                    run_strategy,
+                    saved_preview,
+                )
+                if session.is_finished:
+                    break
+                continue
+            if event_name not in {"snapshot", "tick", "rolled"}:
+                if session.is_finished:
+                    break
+                continue
+            snapshot = session.snapshot(history_limit=None)
+            if event_name in {"snapshot", "rolled"}:
+                _schedule_paper_live_order_token_warmup(
+                    request,
+                    _paper_snapshot_token_ids(snapshot),
+                )
+            decision_key = _paper_decision_key(session.id, run_strategy, snapshot)
+            if decision_key == last_decision_key:
+                if session.is_finished:
+                    break
+                continue
+            last_decision_key = decision_key
+            cache_key = _paper_visual_preview_key(session.id, run_strategy, snapshot)
+            preview_snapshot = dict(snapshot)
+            preview_snapshot["history"] = list(snapshot.get("history") or [])
+            decision_started = time.perf_counter()
+            try:
+                paper_payload = await asyncio.to_thread(
+                    _paper_live_trade_preview,
+                    request,
+                    user_id,
+                    source_group,
+                    source_strategy,
+                    run_group,
+                    run_strategy,
+                    preview_snapshot,
+                    persist=False,
+                    execute_real_orders=True,
+                )
+                _store_paper_visual_preview(cache_key, paper_payload)
+                duration_ms = (time.perf_counter() - decision_started) * 1000.0
+                history = preview_snapshot.get("history") or []
+                captured_at = (
+                    _number_or_none(history[-1].get("captured_at"))
+                    if history and isinstance(history[-1], dict)
+                    else None
+                )
+                decision_lag_ms = (
+                    max(0.0, (time.time() - captured_at) * 1000.0)
+                    if captured_at is not None
+                    else None
+                )
+                now = time.monotonic()
+                if duration_ms >= 500.0 or (decision_lag_ms or 0.0) >= 1000.0:
+                    logger.warning(
+                        "Slow paper decision session=%s strategy=%s duration_ms=%.1f "
+                        "decision_lag_ms=%s history_rows=%s queue_size=%s",
+                        session.id,
+                        run_strategy.get("id"),
+                        duration_ms,
+                        round(decision_lag_ms, 1) if decision_lag_ms is not None else None,
+                        len(history),
+                        queue.qsize(),
+                    )
+                elif now - last_health_log_at >= 60.0:
+                    last_health_log_at = now
+                    logger.info(
+                        "Paper decision health session=%s strategy=%s duration_ms=%.1f "
+                        "history_rows=%s queue_size=%s",
+                        session.id,
+                        run_strategy.get("id"),
+                        duration_ms,
+                        len(history),
+                        queue.qsize(),
+                    )
+            except Exception as error:
+                logger.exception("Paper real trading decision worker failed")
+                _store_paper_visual_preview(cache_key, None, error)
+            if session.is_finished:
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Paper real trading worker stopped unexpectedly session=%s strategy=%s",
+            session.id,
+            run_strategy.get("id"),
+        )
+        raise
+    finally:
+        session.remove_subscriber(queue)
+        logger.info(
+            "Paper real trading worker stopped session=%s strategy=%s",
+            session.id,
+            run_strategy.get("id"),
+        )
+
+
+def _ensure_paper_real_trading_worker(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_group: dict,
+    run_strategy: dict,
+    session,
+) -> None:
+    if not (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+        return
+    key = f"{user_id}:{session.id}:{run_strategy['id']}"
+    tasks = _paper_real_trading_tasks(request.app)
+    existing = tasks.get(key)
+    if existing and not existing.done():
+        return
+    request_proxy = SimpleNamespace(app=request.app)
+    task = asyncio.create_task(
+        _paper_real_trading_worker(
+            request_proxy,
+            user_id,
+            source_group,
+            source_strategy,
+            run_group,
+            run_strategy,
+            session,
+        )
+    )
+    _track_paper_real_trading_task(request.app, key, task)
 
 
 def _paper_deleted_saved_record_ids(group: dict) -> set[str]:
@@ -3877,6 +4268,7 @@ async def start_paper_trading_monitor(
     event_url: Annotated[str, Form()],
     starting_balance: Annotated[float, Form()] = 100.0,
     real_trading: Annotated[bool, Form()] = False,
+    server_optimized: Annotated[bool, Form()] = False,
 ):
     user, _store_obj, _group, _strategy = _paper_trading_strategy_scope(
         request, group_id, strategy_id
@@ -3896,11 +4288,24 @@ async def start_paper_trading_monitor(
         session.event,
         starting_balance,
         bool(real_trading),
+        bool(server_optimized),
+    )
+    _ensure_paper_real_trading_worker(
+        request,
+        user["id"],
+        _group,
+        _strategy,
+        run_group,
+        run_strategy,
+        session,
     )
     if real_trading:
         token_ids = _paper_snapshot_token_ids(session.snapshot(history_limit=None))
         if token_ids:
-            await asyncio.to_thread(_warm_paper_live_order_tokens, request, token_ids)
+            if server_optimized:
+                _schedule_paper_live_order_token_warmup(request, token_ids)
+            else:
+                await asyncio.to_thread(_warm_paper_live_order_tokens, request, token_ids)
         else:
             asyncio.create_task(
                 asyncio.to_thread(
@@ -3963,6 +4368,15 @@ async def paper_trading_monitor_events(
     if run_pair is None:
         raise HTTPException(404, "Paper trading run not found for this session")
     run_group, run_strategy = run_pair
+    _ensure_paper_real_trading_worker(
+        request,
+        user["id"],
+        source_group,
+        source_strategy,
+        run_group,
+        run_strategy,
+        session,
+    )
     queue = session.add_subscriber()
 
     async def stream():
@@ -3998,41 +4412,22 @@ async def paper_trading_monitor_events(
                         except Exception:
                             logger.exception("Paper trading contract finalization failed")
 
-                    asyncio.create_task(finalize_saved_contract())
-                snapshot = session.snapshot(history_limit=None)
+                    if not (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+                        asyncio.create_task(finalize_saved_contract())
+                snapshot = dict(message.get("data") or {})
+                if not snapshot:
+                    snapshot = session.snapshot(history_limit=0)
                 cache_key = _paper_visual_preview_key(session_id, run_strategy, snapshot)
+                cached_paper_payload = _paper_cached_visual_preview(cache_key)
                 if (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
-                    await asyncio.to_thread(
-                        _warm_paper_live_order_tokens,
-                        request,
-                        _paper_snapshot_token_ids(snapshot),
+                    paper_payload = (
+                        cached_paper_payload
+                        or _paper_lightweight_preview()
                     )
-                    preview_snapshot = dict(snapshot)
-                    preview_snapshot["history"] = list(snapshot.get("history") or [])
-                    try:
-                        paper_payload = await asyncio.to_thread(
-                            _paper_live_trade_preview,
-                            request,
-                            user["id"],
-                            source_group,
-                            source_strategy,
-                            run_group,
-                            run_strategy,
-                            preview_snapshot,
-                            persist=False,
-                        )
-                        _store_paper_visual_preview(cache_key, paper_payload)
-                    except Exception as error:
-                        logger.exception("Paper trading real-time preview failed")
-                        paper_payload = {
-                            "paper_trades": [],
-                            "paper_trade_status": {"status": "error", "message": _error_message(error)},
-                        }
-                        _store_paper_visual_preview(cache_key, None, error)
                 else:
                     paper_payload = (
-                        _paper_cached_visual_preview(cache_key)
-                        or _paper_existing_trade_preview(request, user["id"], run_group, snapshot)
+                        cached_paper_payload
+                        or _paper_lightweight_preview()
                     )
                 if not (run_group.get("paper_trading") or {}).get("real_trading_enabled") and not _paper_preview_running(cache_key, time.time()):
                     preview_snapshot = dict(snapshot)

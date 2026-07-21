@@ -1,0 +1,17 @@
+.git
+.claude
+.env
+.env.*
+!.env.example
+.local_data_tools.json
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+node_modules
+tools
+server_data
+data_snapshots
+*.tar.gz
+*.tmp

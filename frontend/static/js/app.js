@@ -600,7 +600,7 @@ function initLiveMonitor(){
   const savedCoverage=document.getElementById('live-saved-coverage'),savedAverageSpread=document.getElementById('live-saved-average-spread'),savedFinalDeviation=document.getElementById('live-saved-final-deviation'),savedYesRange=document.getElementById('live-saved-yes-range');
   const savedDisconnectCount=document.getElementById('live-saved-disconnect-count'),savedDisconnectedSeconds=document.getElementById('live-saved-disconnected-seconds');
   const savedCryptoDisconnectCount=document.getElementById('live-saved-crypto-disconnect-count'),savedCryptoDisconnectedSeconds=document.getElementById('live-saved-crypto-disconnected-seconds');
-  let savedChart=null,currentSavedRecord=null,selectedSavedCategory='all',savedPage=1;
+  let savedChart=null,currentSavedRecord=null,selectedSavedCategory='all',savedPage=1,skippedFirstContractLogged=false;
   const savedPageSize=20;
   const sessionControllers=new Map();
   const fmtCents=(value,empty='-')=>Number.isFinite(value)?(value*100).toFixed(2)+'c':empty;
@@ -636,7 +636,6 @@ function initLiveMonitor(){
     }
     if(level==='error')console.error('[live-monitor]',entry);
     else if(level==='warning')console.warn('[live-monitor]',entry);
-    else console.info('[live-monitor]',entry);
   };
   const renderSnapshotLogs=(logs,controller)=>{
     if(!controller?.log||!Array.isArray(logs)||!logs.length)return;
@@ -735,6 +734,8 @@ function initLiveMonitor(){
       chart:null,
       chartOpen:false,
       latestPayload:null,
+      lastRenderAt:0,
+      lastChartAt:0,
       card,
       lastPayloadAt:0,
       staleWarningShown:false,
@@ -1078,10 +1079,13 @@ function initLiveMonitor(){
       const sent=order.clob_send_at||timing.send_at||'';
       const duration=Number.isFinite(Number(timing.duration_ms))?' '+Number(timing.duration_ms).toFixed(2)+'ms':'';
       const delay=Number.isFinite(Number(order.signal_to_clob_ms))?' delay '+Number(order.signal_to_clob_ms).toFixed(2)+'ms':'';
+      const signalLag=Number.isFinite(Number(order.signal_lag_ms))?' signal lag '+Number(order.signal_lag_ms).toFixed(2)+'ms':'';
+      const sampleDelay=Number.isFinite(Number(order.signal_sample_delay_ms))?' sample delay '+Number(order.signal_sample_delay_ms).toFixed(2)+'ms':'';
       const token=order.token_id?shortToken(String(order.token_id)):'-';
       const amount=Number.isFinite(Number(order.amount))?Number(order.amount).toFixed(6):'-';
       const price=Number.isFinite(Number(order.limit_price))?' @ '+Number(order.limit_price).toFixed(2):'';
       const clobStatus=timing.clob_status?' clob_status '+timing.clob_status:'';
+      const prepared=typeof timing.prepared_order_used==='boolean'?' prepared '+(timing.prepared_order_used?'yes':'no'):'';
       const error=order.error?' error: '+order.error:'';
       const signalKey=[order.id,'paper-signal',order.order_action,signalAt,order.retry_count].join(':');
       if(signalAt&&!controller.paperRealOrderLogKeys.has(signalKey)){
@@ -1090,7 +1094,7 @@ function initLiveMonitor(){
           level:'info',
           source:'paper',
           time:fmtClockMs(signalAt),
-          message:'PAPER SIGNAL '+action+' '+side+' amount '+amount+' token '+token
+          message:'PAPER SIGNAL '+action+' '+side+' amount '+amount+' token '+token+signalLag+sampleDelay
         },controller);
       }
       const clobKey=[order.id,'clob-send',order.order_action,status,sent||order.submitted_at||order.failed_at||order.last_attempt_at,order.retry_count].join(':');
@@ -1100,7 +1104,7 @@ function initLiveMonitor(){
           level:status==='failed'?'error':'info',
           source:'clob',
           time:fmtClockMs(sent||order.submitted_at||order.failed_at||order.last_attempt_at),
-          message:'CLOB SEND '+action+' '+side+' '+status+' amount '+amount+price+' token '+token+delay+duration+clobStatus+error
+          message:'CLOB SEND '+action+' '+side+' '+status+' amount '+amount+price+' token '+token+delay+duration+clobStatus+prepared+error
         },controller);
       }
       if(action==='OPEN'&&status==='submitted'){
@@ -1135,6 +1139,7 @@ function initLiveMonitor(){
     const restPolls=payload.health?.rest?.poll_count||0;
     controller.samplePath.textContent=(payload.saved_path||payload.samples_path||'Saving to server_data/live_monitor')+' | tick '+(payload.tick_count||0)+wsAgeText+' | rest '+restPolls;
     if(savedMode==='paper'&&controller.runUrl)controller.samplePath.textContent+=' | run group saved';
+    if(savedMode==='paper'&&payload.server_optimized)controller.samplePath.textContent+=' | server optimized';
     if(savedMode==='paper'&&payload.paper_trade_status?.message)controller.samplePath.textContent+=' | '+payload.paper_trade_status.message;
     if(payload.status?.last_error)controller.samplePath.textContent='Last error: '+payload.status.last_error;
     setDot(controller.quoteDot,!!payload.health?.polymarket?.connected,!!payload.status?.last_error&&payload.status?.quotes==='reconnecting');
@@ -1200,7 +1205,10 @@ function initLiveMonitor(){
         if(syncResponse.ok){
           const syncPayload=await syncResponse.json();
           if(syncPayload.created)appendLog({level:'info',source:'browser',message:'Synced '+syncPayload.created+' paper-traded contract(s).'});
-          if(syncPayload.skipped_first_contract)appendLog({level:'warning',source:'browser',message:'Skipped the first contract after connection for paper trading.'});
+          if(syncPayload.skipped_first_contract&&!skippedFirstContractLogged){
+            skippedFirstContractLogged=true;
+            appendLog({level:'warning',source:'browser',message:'Skipped the first contract after connection for paper trading.'});
+          }
         }
       }
       const params=new URLSearchParams({page:String(savedPage),page_size:String(savedPageSize)});
