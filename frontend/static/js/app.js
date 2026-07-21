@@ -1162,9 +1162,12 @@ function initLiveMonitor(){
     controller.source.addEventListener('tick',listener);
     controller.source.addEventListener('ping',()=>{controller.lastPayloadAt=Date.now();controller.staleWarningShown=false;controller.streamWarningShown=false});
     controller.source.addEventListener('rolled',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Rolled to '+(data.event?.slug||'next contract')},controller)});
-    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);setTimeout(()=>loadSaved(Boolean(syncUrl)),750)});
+    // The backend finalizes each saved contract. Re-running the full recovery sync
+    // after every five-minute rollover grows progressively more expensive and can
+    // starve live sampling on a single shared CPU. Sync remains available via Refresh.
+    controller.source.addEventListener('saved',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog({level:'info',source:'browser',message:'Saved completed contract'},controller);setTimeout(()=>loadSaved(false),750)});
     controller.source.addEventListener('log',message=>{const data=JSON.parse(message.data);render(data,controller);appendLog(data.log,controller)});
-    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved(Boolean(syncUrl))});
+    controller.source.addEventListener('ended',message=>{render(JSON.parse(message.data),controller);appendLog({level:'warning',source:'browser',message:'Tracking ended'},controller);closeController(controller);controller.stopButton.classList.add('hidden');loadSaved(false)});
     controller.source.onerror=error=>{
       const age=controller.lastPayloadAt?(Date.now()-controller.lastPayloadAt)/1000:Infinity;
       controller.quoteStatus.textContent='Stream reconnecting';
@@ -1350,7 +1353,7 @@ function initLiveMonitor(){
   if(savedDeleteCategory)savedDeleteCategory.addEventListener('click',deleteSavedCategory);
   if(paperTradesDeleteAll)paperTradesDeleteAll.addEventListener('click',()=>deleteAllPaperTrades(paperTradesDeleteAll));
   if(savedDetailClose)savedDetailClose.addEventListener('click',()=>{savedDetail.classList.add('hidden');resetSavedChart()});
-  loadSaved(Boolean(syncUrl));
+  loadSaved(false);
   restoreActiveSession();
 }
 function initLocalDataTools(){

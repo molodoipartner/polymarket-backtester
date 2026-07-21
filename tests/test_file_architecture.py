@@ -1536,6 +1536,17 @@ def test_live_stream_json_serialization_runs_off_event_loop(monkeypatch):
     assert encoded == '{"message":"сигнал","value":1}'
 
 
+def test_paper_frontend_only_runs_recovery_sync_on_explicit_refresh():
+    source = (Path(__file__).parents[1] / "frontend" / "static" / "js" / "app.js").read_text(
+        encoding="utf-8"
+    )
+
+    # The one remaining call is the user's saved-contract Refresh button.
+    assert source.count("loadSaved(Boolean(syncUrl))") == 1
+    assert "setTimeout(()=>loadSaved(false),750)" in source
+    assert "loadSaved(false);\n  restoreActiveSession();" in source
+
+
 def test_paper_open_signal_timing_uses_open_timestamp_with_preloaded_history():
     start_ts = 1782639600
     history = [
