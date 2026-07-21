@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import pytest
+
 from backend.api import routes
 from backend.trading.polymarket_executor import (
     PolymarketLiveOrderExecutor,
@@ -53,3 +57,55 @@ def test_market_buy_allows_configured_amounts_above_one_dollar(monkeypatch):
         "order_type": "FAK",
         "price": 0.99,
     }
+
+
+def test_market_order_type_error_does_not_resubmit(monkeypatch):
+    executor = PolymarketLiveOrderExecutor()
+
+    class FakeOrderType:
+        FAK = "FAK"
+        FOK = "FOK"
+
+    class FakeMarketOrderArgs:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self):
+            self.create_calls = 0
+            self.post_calls = 0
+
+        def create_market_order(self, _order_args):
+            self.create_calls += 1
+            return SimpleNamespace(makerAmount="1000000", takerAmount="1250000")
+
+        def post_order(self, _signed, _order_type):
+            self.post_calls += 1
+            raise TypeError("response decoding failed after send")
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(executor, "validate_ready", lambda: None)
+    monkeypatch.setattr(executor, "_get_client", lambda: fake_client)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_clob_client_v2",
+        SimpleNamespace(MarketOrderArgs=FakeMarketOrderArgs, OrderType=FakeOrderType),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "py_clob_client_v2.order_builder.constants",
+        SimpleNamespace(BUY="BUY", SELL="SELL"),
+    )
+
+    with pytest.raises(TypeError, match="response decoding failed after send"):
+        executor.market_buy(
+            PolymarketLiveOrderRequest(
+                token_id="token-1",
+                amount=1.0,
+                order_type="FAK",
+                price=0.99,
+            )
+        )
+
+    assert fake_client.create_calls == 1
+    assert fake_client.post_calls == 1

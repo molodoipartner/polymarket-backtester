@@ -151,121 +151,43 @@ class PolymarketLiveOrderExecutor:
         prepared_key = self._prepared_order_key(token_id, side, amount, order_type, limit_price)
         with self._prepared_lock:
             prepared = self._prepared_orders.pop(prepared_key, None)
-        try:
-            from py_clob_client_v2 import MarketOrderArgs, OrderType
-            from py_clob_client_v2.order_builder.constants import BUY, SELL
+        from py_clob_client_v2 import MarketOrderArgs, OrderType
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
 
-            if prepared:
-                signed = prepared["signed"]
-                signed_meta = {**prepared["signed_meta"], "prepared_order_used": True}
-                clob_order_type = prepared["clob_order_type"]
-            else:
-                order_side = BUY if side == "BUY" else SELL
-                clob_order_type = self._clob_market_order_type(OrderType, order_type)
-                order_args = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=round(amount, 8),
-                    side=order_side,
-                    price=limit_price,
-                    order_type=clob_order_type,
-                )
-                signed = client.create_market_order(order_args)
-                signed_meta = {**self._signed_order_metadata(signed, side), "prepared_order_used": False}
-
-            send_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            started = time.perf_counter()
-            logger.info(
-                "Polymarket CLOB order send start send_at=%s side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
-                send_at,
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-            )
-            try:
-                response = client.post_order(signed, clob_order_type)
-            except Exception:
-                duration_ms = (time.perf_counter() - started) * 1000
-                logger.exception(
-                    "Polymarket CLOB order send failed send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
-                    send_at,
-                    duration_ms,
-                    side,
-                    token_id,
-                    amount,
-                    limit_price,
-                    clob_order_type,
-                )
-                raise
-            duration_ms = (time.perf_counter() - started) * 1000
-            logger.info(
-                "Polymarket CLOB order send complete send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
-                send_at,
-                duration_ms,
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-            )
-            return self._response_with_timing(
-                response,
-                send_at,
-                duration_ms,
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-                signed_meta,
-            )
-        except TypeError:
-            from py_clob_client_v2 import MarketOrderArgs, OrderType
-            from py_clob_client_v2.order_builder.constants import BUY, SELL
-
+        if prepared:
+            signed = prepared["signed"]
+            signed_meta = {**prepared["signed_meta"], "prepared_order_used": True}
+            clob_order_type = prepared["clob_order_type"]
+        else:
             order_side = BUY if side == "BUY" else SELL
             clob_order_type = self._clob_market_order_type(OrderType, order_type)
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=round(amount, 8),
+                side=order_side,
+                price=limit_price,
+                order_type=clob_order_type,
+            )
+            signed = client.create_market_order(order_args)
+            signed_meta = {**self._signed_order_metadata(signed, side), "prepared_order_used": False}
 
-            signed = client.create_market_order(
-                MarketOrderArgs(
-                    token_id=token_id,
-                    amount=round(amount, 8),
-                    side=order_side,
-                    price=limit_price,
-                    order_type=clob_order_type,
-                )
-            )
-            signed_meta = self._signed_order_metadata(signed, side)
-            send_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            started = time.perf_counter()
-            logger.info(
-                "Polymarket CLOB legacy order send start send_at=%s side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
-                send_at,
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-            )
-            try:
-                response = client.post_order(signed, clob_order_type)
-            except Exception:
-                duration_ms = (time.perf_counter() - started) * 1000
-                logger.exception(
-                    "Polymarket CLOB legacy order send failed send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
-                    send_at,
-                    duration_ms,
-                    side,
-                    token_id,
-                    amount,
-                    limit_price,
-                    clob_order_type,
-                )
-                raise
+        send_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        started = time.perf_counter()
+        logger.info(
+            "Polymarket CLOB order send start send_at=%s side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
+            send_at,
+            side,
+            token_id,
+            amount,
+            limit_price,
+            clob_order_type,
+        )
+        try:
+            response = client.post_order(signed, clob_order_type)
+        except Exception:
             duration_ms = (time.perf_counter() - started) * 1000
-            logger.info(
-                "Polymarket CLOB legacy order send complete send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
+            logger.exception(
+                "Polymarket CLOB order send failed send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
                 send_at,
                 duration_ms,
                 side,
@@ -274,17 +196,29 @@ class PolymarketLiveOrderExecutor:
                 limit_price,
                 clob_order_type,
             )
-            return self._response_with_timing(
-                response,
-                send_at,
-                duration_ms,
-                side,
-                token_id,
-                amount,
-                limit_price,
-                clob_order_type,
-                signed_meta,
-            )
+            raise
+        duration_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "Polymarket CLOB order send complete send_at=%s duration_ms=%.2f side=%s token_id=%s amount=%.8f price=%.4f order_type=%s",
+            send_at,
+            duration_ms,
+            side,
+            token_id,
+            amount,
+            limit_price,
+            clob_order_type,
+        )
+        return self._response_with_timing(
+            response,
+            send_at,
+            duration_ms,
+            side,
+            token_id,
+            amount,
+            limit_price,
+            clob_order_type,
+            signed_meta,
+        )
 
     def _create_prepared_market_order(
         self,
