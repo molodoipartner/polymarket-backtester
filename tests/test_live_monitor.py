@@ -2042,6 +2042,30 @@ def test_late_history_capture_records_current_sample_only(tmp_path):
     assert session._history[0]["captured_at"] == 1001.502
 
 
+@pytest.mark.parametrize(
+    ("scheduled_ts", "captured_at", "expected_ts", "expected_skipped"),
+    [
+        (1000.0, 1000.249, 1000.0, 0),
+        (1000.0, 1000.501, 1000.5, 1),
+        (1000.0, 1002.219, 1002.0, 4),
+    ],
+)
+def test_late_sampler_coalesces_missed_intervals(
+    scheduled_ts,
+    captured_at,
+    expected_ts,
+    expected_skipped,
+):
+    sample_ts, skipped = live_monitor._coalesce_late_history_sample(
+        scheduled_ts,
+        captured_at,
+    )
+
+    assert sample_ts == expected_ts
+    assert skipped == expected_skipped
+    assert sample_ts + live_monitor.HISTORY_CAPTURE_INTERVAL_SECONDS > captured_at
+
+
 def test_history_does_not_use_future_source_points(tmp_path):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/eth-updown-5m-1000",

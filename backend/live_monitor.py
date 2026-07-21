@@ -56,6 +56,7 @@ NEXT_CONTRACT_PRECONNECT_SECONDS = 30.0
 PRE_WINDOW_HISTORY_SECONDS = 10.0
 PRELOADED_HISTORY_PRIORITY_SECONDS = 0.05
 HISTORY_CAPTURE_INTERVAL_SECONDS = 0.5
+SAMPLER_DELAY_WARNING_INTERVAL_SECONDS = 10.0
 LIVE_SNAPSHOT_HISTORY_LIMIT = 180
 SAVED_RECORD_METADATA_FALLBACK_MAX_BYTES = 2 * 1024 * 1024
 SOURCE_TIMELINE_RETENTION_SECONDS = 15.0
@@ -1164,6 +1165,10 @@ class LiveMonitorSession:
         self._saved = False
         self._last_history_sample_ts: float | None = None
         self._next_history_sample_ts: float | None = None
+        self._last_sampler_delay_log_at: float | None = None
+        self._sampler_delayed_samples_since_log = 0
+        self._sampler_skipped_samples_since_log = 0
+        self._sampler_max_delay_ms_since_log = 0.0
         self._stopped = False
         self._tick_count = 0
         self._last_tick_at: float | None = None
@@ -1244,14 +1249,14 @@ class LiveMonitorSession:
                 await asyncio.sleep(max(0, sample_ts - time.time()))
                 captured_at = time.time()
                 sample_delay_ms = max(0.0, (captured_at - sample_ts) * 1000.0)
+                sample_ts, skipped_samples = _coalesce_late_history_sample(
+                    sample_ts,
+                    captured_at,
+                )
                 if sample_delay_ms >= 250.0:
-                    logger.warning(
-                        "Live sampler delayed session=%s delay_ms=%.1f history_rows=%s "
-                        "subscribers=%s",
-                        self.id,
+                    self._report_sampler_delay(
                         sample_delay_ms,
-                        len(self._history),
-                        len(self._subscribers),
+                        skipped_samples,
                     )
                 self._tick_count += 1
                 self._last_tick_at = captured_at
@@ -1274,6 +1279,39 @@ class LiveMonitorSession:
                     "sampler",
                     f"Sampler iteration failed: {self.state.last_error}",
                 )
+
+    def _report_sampler_delay(
+        self,
+        delay_ms: float,
+        skipped_samples: int,
+    ) -> None:
+        self._sampler_delayed_samples_since_log += 1
+        self._sampler_skipped_samples_since_log += skipped_samples
+        self._sampler_max_delay_ms_since_log = max(
+            self._sampler_max_delay_ms_since_log,
+            delay_ms,
+        )
+        now = time.monotonic()
+        if (
+            self._last_sampler_delay_log_at is not None
+            and now - self._last_sampler_delay_log_at
+            < SAMPLER_DELAY_WARNING_INTERVAL_SECONDS
+        ):
+            return
+        logger.warning(
+            "Live sampler delayed session=%s max_delay_ms=%.1f delayed_samples=%s "
+            "skipped_samples=%s history_rows=%s subscribers=%s",
+            self.id,
+            self._sampler_max_delay_ms_since_log,
+            self._sampler_delayed_samples_since_log,
+            self._sampler_skipped_samples_since_log,
+            len(self._history),
+            len(self._subscribers),
+        )
+        self._last_sampler_delay_log_at = now
+        self._sampler_delayed_samples_since_log = 0
+        self._sampler_skipped_samples_since_log = 0
+        self._sampler_max_delay_ms_since_log = 0.0
 
     async def _rest_quote_poll_loop(self) -> None:
         while not self._stopped:
@@ -1570,6 +1608,10 @@ class LiveMonitorSession:
             if self._stopped or preloaded.history_stopped:
                 return
             captured_at = time.time()
+            sample_ts, _skipped_samples = _coalesce_late_history_sample(
+                sample_ts,
+                captured_at,
+            )
             self._capture_preloaded_history_row(
                 preloaded,
                 timestamp=sample_ts,
@@ -3890,6 +3932,23 @@ def _ceil_history_sample_time(timestamp: float) -> float:
 def _floor_history_sample_time(timestamp: float) -> float:
     interval = HISTORY_CAPTURE_INTERVAL_SECONDS
     return round(math.floor((timestamp + 1e-9) / interval) * interval, 3)
+
+
+def _coalesce_late_history_sample(
+    scheduled_ts: float,
+    captured_at: float,
+) -> tuple[float, int]:
+    """Use only the latest observable slot instead of replaying stale live ticks."""
+    latest_observable_ts = _floor_history_sample_time(captured_at)
+    if latest_observable_ts <= scheduled_ts:
+        return scheduled_ts, 0
+    skipped_samples = int(
+        round(
+            (latest_observable_ts - scheduled_ts)
+            / HISTORY_CAPTURE_INTERVAL_SECONDS
+        )
+    )
+    return latest_observable_ts, max(0, skipped_samples)
 
 
 def _history_sample_timestamps(start: float, end: float) -> list[float]:
