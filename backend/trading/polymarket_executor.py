@@ -97,6 +97,25 @@ class PolymarketLiveOrderExecutor:
     def token_balance(self, token_id: str) -> float:
         return float(self.token_balance_info(token_id)["balance"])
 
+    def collateral_balance(self) -> float:
+        return float(self.collateral_balance_info()["balance"])
+
+    def collateral_balance_info(self) -> dict[str, Any]:
+        """Return the available USDC collateral balance used for BUY orders."""
+        self.validate_ready()
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        response = self._get_client().get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=self._signature_type(),
+            )
+        )
+        return self._normalized_balance_info(
+            response,
+            "Polymarket collateral balance",
+        )
+
     def token_balance_info(self, token_id: str) -> dict[str, Any]:
         self.validate_ready()
         token_id = token_id.strip()
@@ -111,13 +130,21 @@ class PolymarketLiveOrderExecutor:
                 signature_type=self._signature_type(),
             )
         )
+        return self._normalized_balance_info(
+            response,
+            f"Polymarket token balance for {token_id}",
+        )
+
+    def _normalized_balance_info(
+        self,
+        response: Any,
+        label: str,
+    ) -> dict[str, Any]:
         raw_balance = self._balance_value_from_response(response)
         try:
             balance = max(0.0, float(raw_balance) / 1_000_000)
         except (TypeError, ValueError):
-            raise RuntimeError(
-                f"Could not read Polymarket token balance for {token_id}: {response!r}"
-            )
+            raise RuntimeError(f"Could not read {label}: {response!r}")
         return {
             "balance": balance,
             "raw_balance": raw_balance,

@@ -3130,6 +3130,74 @@ def _paper_open_balance_info(executor, token_id: str) -> tuple[float | None, dic
     return executor.token_balance(token_id), None, "post_open_balance"
 
 
+def _paper_min_open_balance() -> float:
+    value = _number_or_none(settings.polymarket_min_open_balance)
+    return value if value is not None and value >= 0 else 130.0
+
+
+def _paper_collateral_balance_info(executor) -> tuple[float, dict]:
+    info = executor.collateral_balance_info()
+    if not isinstance(info, dict):
+        raise RuntimeError("Could not read Polymarket collateral balance response")
+    balance = _number_or_none(info.get("balance"))
+    if balance is None:
+        raise RuntimeError(f"Could not read Polymarket collateral balance: {info!r}")
+    return balance, info
+
+
+def _paper_signal_audit_snapshot(
+    snapshot: dict,
+    trade: dict,
+    action: str,
+) -> dict | None:
+    history = _paper_current_history(snapshot)
+    row = _paper_signal_row(history, trade, action)
+    if not row:
+        return None
+    fields = (
+        "t",
+        "captured_at",
+        "sample_delay_ms",
+        "crypto_price",
+        "target_price",
+        "target_price_ts",
+        "deviation_pct",
+        "yes_bid",
+        "yes_ask",
+        "no_bid",
+        "no_ask",
+    )
+    return {field: row.get(field) for field in fields}
+
+
+def _append_real_trade_audit(
+    store: FileStore,
+    user_id: str,
+    event: str,
+    order: dict,
+) -> None:
+    """Best-effort append-only audit; persistence must never alter order handling."""
+    try:
+        store.append_user_record(
+            user_id,
+            "real_trade_audit",
+            {
+                "audit_event": event,
+                "audited_at": utc_iso(),
+                "order_id": order.get("id"),
+                "session_id": order.get("session_id"),
+                "event_slug": order.get("event_slug"),
+                "order": dict(order),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Could not append real trade audit order_id=%s event=%s",
+            order.get("id"),
+            event,
+        )
+
+
 def _paper_open_fill_quantity(response: dict | None) -> tuple[float | None, str | None]:
     if not isinstance(response, dict):
         return None, None
@@ -3719,6 +3787,7 @@ def _execute_paper_real_trading_signals(
                 "paper_signal_at": paper_signal_at,
                 "signal_lag_ms": _paper_signal_lag_ms(paper_signal_at, signal_tick_at),
                 "signal_exit_price": trade.get("exit_price") or trade.get("exit_bid_price"),
+                "signal_snapshot": _paper_signal_audit_snapshot(snapshot, trade, "close"),
                 "event_slug": event_payload.get("slug"),
                 "event_title": event_payload.get("title") or event_payload.get("event_title"),
                 "retry_count": int((existing_close or {}).get("retry_count") or 0) + (1 if existing_close else 0),
@@ -3816,6 +3885,12 @@ def _execute_paper_real_trading_signals(
                     "token_id": token_id,
                     "error": _error_message(error),
                 })
+            _append_real_trade_audit(
+                store,
+                user_id,
+                f"close_{record.get('status') or 'unknown'}",
+                record,
+            )
             results.append(record)
             continue
         if signal_status != "open":
@@ -3848,6 +3923,7 @@ def _execute_paper_real_trading_signals(
             "paper_signal_at": paper_signal_at,
             "signal_lag_ms": _paper_signal_lag_ms(paper_signal_at, signal_tick_at),
             "signal_entry_price": trade.get("entry_price") or trade.get("ask_price"),
+            "signal_snapshot": _paper_signal_audit_snapshot(snapshot, trade, "open"),
             "event_slug": event_payload.get("slug"),
             "event_title": event_payload.get("title") or event_payload.get("event_title"),
             "retry_count": int((existing or {}).get("retry_count") or 0) + (1 if existing else 0),
@@ -3856,7 +3932,62 @@ def _execute_paper_real_trading_signals(
         try:
             if not token_id:
                 raise ValueError("Could not resolve Polymarket token_id for signal side.")
-            response = _paper_live_order_executor(request).market_buy(
+            executor = _paper_live_order_executor(request)
+            balance_check_started = time.perf_counter()
+            account_balance, account_balance_info = _paper_collateral_balance_info(executor)
+            open_base.update({
+                "account_balance_before_open": round(account_balance, 8),
+                "account_balance_threshold": round(_paper_min_open_balance(), 8),
+                "account_balance_response": account_balance_info,
+                "balance_check_duration_ms": round(
+                    (time.perf_counter() - balance_check_started) * 1000.0,
+                    2,
+                ),
+            })
+            if account_balance < _paper_min_open_balance():
+                blocked_open = {
+                    **open_base,
+                    "status": "blocked_low_balance",
+                    "blocked_at": utc_iso(),
+                    "monitor_stop_requested": True,
+                    "stop_reason": (
+                        f"Polymarket collateral balance ${account_balance:.2f} is below "
+                        f"the ${_paper_min_open_balance():.2f} minimum"
+                    ),
+                }
+                if existing:
+                    record = store.update_user_record(
+                        user_id,
+                        "real_orders",
+                        order_id,
+                        _paper_mutable_real_order_fields(blocked_open),
+                    )
+                else:
+                    record = store.append_user_record(
+                        user_id,
+                        "real_orders",
+                        {
+                            "id": order_id,
+                            "created_at": utc_iso(),
+                            **blocked_open,
+                        },
+                    )
+                _append_real_trade_audit(
+                    store,
+                    user_id,
+                    "open_blocked_low_balance",
+                    record,
+                )
+                logger.warning(
+                    "Paper real trading OPEN blocked by collateral balance "
+                    "session=%s balance=%.2f threshold=%.2f",
+                    session_id,
+                    account_balance,
+                    _paper_min_open_balance(),
+                )
+                results.append(record)
+                continue
+            response = executor.market_buy(
                 PolymarketLiveOrderRequest(
                     token_id=token_id,
                     amount=amount,
@@ -3955,6 +4086,12 @@ def _execute_paper_real_trading_signals(
                 "token_id": token_id,
                 "error": _error_message(error),
             })
+        _append_real_trade_audit(
+            store,
+            user_id,
+            f"open_{record.get('status') or 'unknown'}",
+            record,
+        )
         results.append(record)
     return results
 
@@ -4014,6 +4151,34 @@ def _paper_real_trading_tasks(app) -> dict[str, asyncio.Task]:
         tasks = {}
         app.state.paper_real_trading_tasks = tasks
     return tasks
+
+
+async def _stop_paper_monitor_for_low_balance(
+    request: Request,
+    session,
+    paper_payload: dict,
+) -> bool:
+    blocked = next(
+        (
+            order
+            for order in paper_payload.get("real_orders") or []
+            if str(order.get("status") or "") == "blocked_low_balance"
+            and order.get("monitor_stop_requested")
+        ),
+        None,
+    )
+    if not blocked:
+        return False
+    reason = str(blocked.get("stop_reason") or "Low Polymarket collateral balance")
+    await session._log("warning", "balance", f"{reason}. Monitoring stopped.")
+    stopped = await request.app.state.live_monitor.stop(session.id)
+    logger.warning(
+        "Paper monitor stopped by balance guard session=%s order_id=%s stopped=%s",
+        session.id,
+        blocked.get("id"),
+        stopped,
+    )
+    return stopped or session.is_finished
 
 
 def _track_paper_real_trading_task(app, key: str, task: asyncio.Task) -> None:
@@ -4276,6 +4441,12 @@ async def _paper_real_trading_worker(
                     execute_real_orders=True,
                 )
                 _store_paper_visual_preview(cache_key, paper_payload)
+                if await _stop_paper_monitor_for_low_balance(
+                    request,
+                    session,
+                    paper_payload,
+                ):
+                    break
                 duration_ms = (time.perf_counter() - decision_started) * 1000.0
                 history = preview_snapshot.get("history") or []
                 captured_at = (

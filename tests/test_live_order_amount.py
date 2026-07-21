@@ -59,6 +59,26 @@ def test_market_buy_allows_configured_amounts_above_one_dollar(monkeypatch):
     }
 
 
+def test_collateral_balance_uses_usdc_asset_without_token_id(monkeypatch):
+    executor = PolymarketLiveOrderExecutor()
+    captured = {}
+
+    class FakeClient:
+        def get_balance_allowance(self, params):
+            captured["asset_type"] = params.asset_type
+            captured["token_id"] = params.token_id
+            return {"balance": "135500000"}
+
+    monkeypatch.setattr(executor, "validate_ready", lambda: None)
+    monkeypatch.setattr(executor, "_get_client", lambda: FakeClient())
+
+    info = executor.collateral_balance_info()
+
+    assert captured == {"asset_type": "COLLATERAL", "token_id": None}
+    assert info["balance"] == pytest.approx(135.5)
+    assert info["raw_balance"] == "135500000"
+
+
 def test_market_order_type_error_does_not_resubmit(monkeypatch):
     executor = PolymarketLiveOrderExecutor()
 

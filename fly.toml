@@ -20,6 +20,7 @@ primary_region = "arn"
   POLYMARKET_SIGNATURE_TYPE = "1"
   SIGNATURE_TYPE = "1"
   POLYMARKET_LIVE_TRADING_ENABLED = "true"
+  POLYMARKET_MIN_OPEN_BALANCE = "130"
   ALLOWED_HOSTS = "polymarket-backtester.fly.dev,*.fly.dev,*.internal,localhost,127.0.0.1"
   SESSION_COOKIE_SECURE = "true"
 

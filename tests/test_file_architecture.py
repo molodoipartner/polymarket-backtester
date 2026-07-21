@@ -1665,6 +1665,11 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
             self.sells = []
             self.balance_checks = []
             self.balances = {}
+            self.collateral_checks = 0
+
+        def collateral_balance_info(self):
+            self.collateral_checks += 1
+            return {"balance": 200.0, "raw_balance": "200000000"}
 
         def market_buy(self, order_request):
             self.calls.append(order_request)
@@ -1774,6 +1779,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert executor.calls[0].amount == 1.0
     assert executor.calls[0].order_type == "FAK"
     assert executor.calls[0].price == 0.99
+    assert executor.collateral_checks == 1
     assert executor.balance_checks == []
     real_orders = store.list_user_records(user["id"], "real_orders")
     assert len(real_orders) == 1
@@ -1782,6 +1788,11 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert real_orders[0]["paper_signal_at"]
     assert real_orders[0]["clob_send_at"]
     assert real_orders[0]["clob_duration_ms"] == pytest.approx(12.34)
+    assert real_orders[0]["account_balance_before_open"] == 200.0
+    audit = store.list_user_records(user["id"], "real_trade_audit")
+    assert len(audit) == 1
+    assert audit[0]["audit_event"] == "open_submitted"
+    assert audit[0]["order"]["response"]["orderID"] == "fake-order"
     assert routes_module._paper_real_order_retryable({
         "status": "failed",
         "error": "order couldn't be fully filled. FOK orders are fully filled or killed.",
@@ -1890,6 +1901,144 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert down_close[0]["limit_price"] == 0.01
     assert executor.sells[-1].token_id == "down-token"
     assert executor.sells[-1].price == 0.01
+
+
+def test_paper_real_trading_low_collateral_blocks_open_and_writes_audit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user(
+        "low-collateral@example.com",
+        "Low Collateral",
+        hash_password("secure-pass"),
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.buys = []
+
+        def collateral_balance_info(self):
+            return {
+                "balance": 129.99,
+                "raw_balance": "129990000",
+                "response": {"balance": "129990000"},
+                "source": "get_balance_allowance",
+            }
+
+        def market_buy(self, order_request):
+            self.buys.append(order_request)
+            raise AssertionError("A low-balance OPEN must never reach CLOB")
+
+    executor = FakeExecutor()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                store=store,
+                polymarket_live_order_executor=executor,
+            )
+        )
+    )
+    monkeypatch.setattr(settings, "polymarket_live_order_amount", 2.0)
+    monkeypatch.setattr(settings, "polymarket_min_open_balance", 130.0)
+    start_ts = 1782639600
+    opened_at = datetime.fromtimestamp(start_ts + 10, timezone.utc).isoformat()
+    event = {
+        "slug": "btc-updown-5m-1782639600",
+        "title": "Bitcoin Up or Down",
+        "window_start_ts": start_ts,
+        "tokens": [
+            {"token_id": "up-token", "outcome": "Up"},
+            {"token_id": "down-token", "outcome": "Down"},
+        ],
+    }
+    snapshot = {
+        "event": event,
+        "history": [{
+            "t": start_ts + 10,
+            "captured_at": start_ts + 10.002,
+            "sample_delay_ms": 2.0,
+            "crypto_price": 100.1,
+            "target_price": 100.0,
+            "yes_bid": 0.69,
+            "yes_ask": 0.70,
+            "no_bid": 0.29,
+            "no_ask": 0.30,
+        }],
+    }
+    run_group = {
+        "id": "run-low-collateral",
+        "paper_trading": {"real_trading_enabled": True},
+    }
+    run_strategy = {"id": "strategy-low-collateral"}
+    trade = {
+        "status": "open",
+        "side": "UP",
+        "opened_at": opened_at,
+        "signal_tick_captured_at": opened_at,
+        "entry_price": 0.70,
+    }
+
+    orders = routes_module._execute_paper_real_trading_signals(
+        request,
+        user["id"],
+        run_group,
+        run_strategy,
+        "low-collateral-session",
+        event,
+        snapshot,
+        [trade],
+    )
+
+    assert executor.buys == []
+    assert orders[0]["status"] == "blocked_low_balance"
+    assert orders[0]["monitor_stop_requested"] is True
+    assert orders[0]["account_balance_before_open"] == pytest.approx(129.99)
+    assert orders[0]["account_balance_threshold"] == 130.0
+    assert orders[0]["signal_snapshot"]["crypto_price"] == 100.1
+    audit = store.list_user_records(user["id"], "real_trade_audit")
+    assert len(audit) == 1
+    assert audit[0]["audit_event"] == "open_blocked_low_balance"
+    assert audit[0]["order"]["status"] == "blocked_low_balance"
+
+
+@pytest.mark.asyncio
+async def test_low_balance_guard_stops_monitor():
+    calls = []
+
+    class FakeSession:
+        id = "low-balance-session"
+        is_finished = False
+
+        async def _log(self, level, source, message):
+            calls.append((level, source, message))
+
+    class FakeManager:
+        async def stop(self, session_id):
+            calls.append(("stop", session_id))
+            return True
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(live_monitor=FakeManager()))
+    )
+    payload = {
+        "real_orders": [{
+            "id": "blocked-order",
+            "status": "blocked_low_balance",
+            "monitor_stop_requested": True,
+            "stop_reason": "Balance is below minimum",
+        }]
+    }
+
+    stopped = await routes_module._stop_paper_monitor_for_low_balance(
+        request,
+        FakeSession(),
+        payload,
+    )
+
+    assert stopped is True
+    assert calls[0][0:2] == ("warning", "balance")
+    assert calls[1] == ("stop", "low-balance-session")
 
 
 def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):
@@ -2107,6 +2256,9 @@ def test_paper_real_trading_open_saves_taking_amount_from_matched_order(tmp_path
             self.buys = []
             self.sells = []
             self.balance_checks = []
+
+        def collateral_balance_info(self):
+            return {"balance": 200.0, "raw_balance": "200000000"}
 
         def market_buy(self, order_request):
             self.buys.append(order_request)
@@ -2367,6 +2519,9 @@ def test_manual_paper_trade_open_and_close_updates_same_transaction(tmp_path: Pa
             self.sells = []
             self.balance_checks = []
             self.balances = {}
+
+        def collateral_balance_info(self):
+            return {"balance": 200.0, "raw_balance": "200000000"}
 
         def market_buy(self, order_request):
             self.buys.append(order_request)

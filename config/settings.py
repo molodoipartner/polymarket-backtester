@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     polymarket_api_passphrase: str = ""
     polymarket_live_trading_enabled: bool = False
     polymarket_live_order_amount: float = 1.0
+    polymarket_min_open_balance: float = 130.0
     history_page_size: int = 500
     history_max_events_per_series: int = 5_000
     history_chunk_days: int = 3
