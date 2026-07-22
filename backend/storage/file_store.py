@@ -277,6 +277,40 @@ class FileStore:
                 self._apply_strategy_favorites(user_id, records)
             return records
 
+    def list_user_records_reverse_page(
+        self,
+        user_id: str,
+        collection: str,
+        filters: dict[str, Any],
+        page: int,
+        page_size: int,
+    ) -> tuple[list[dict], bool]:
+        """Return one newest-first page without materializing earlier pages."""
+        self._validate_collection(collection)
+        if page < 1 or page_size < 1:
+            raise ValueError("Invalid pagination parameters")
+
+        def matches(item: dict) -> bool:
+            return all(item.get(key) == value for key, value in filters.items())
+
+        path = self._user_dir(user_id) / f"{collection}.jsonl"
+        skip = (page - 1) * page_size
+        matched = 0
+        records = []
+        with self._guard():
+            for item in self._iter_jsonl_reverse(path):
+                if not matches(item):
+                    continue
+                if matched < skip:
+                    matched += 1
+                    continue
+                records.append(item)
+                if len(records) > page_size:
+                    break
+            if collection == "strategies":
+                self._apply_strategy_favorites(user_id, records[:page_size])
+        return records[:page_size], len(records) > page_size
+
     def count_user_records(self, user_id: str, collection: str) -> int:
         self._validate_collection(collection)
         path = self._user_dir(user_id) / f"{collection}.jsonl"

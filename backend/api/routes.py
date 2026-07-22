@@ -861,6 +861,19 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+def _account_recent_page(
+    store: FileStore,
+    user_id: str,
+    collection: str,
+    page: int,
+    page_size: int,
+) -> tuple[list[dict], bool]:
+    """Read only enough newest JSONL rows for one account page."""
+    return store.list_user_records_reverse_page(
+        user_id, collection, {}, page, page_size
+    )
+
+
 @router.get("/account", response_class=HTMLResponse)
 def account_page(request: Request):
     user = _user(request)
@@ -870,6 +883,13 @@ def account_page(request: Request):
     account_tab = str(request.query_params.get("tab") or "overview").strip().lower()
     if account_tab not in {"overview", "real-trades", "real-console"}:
         account_tab = "overview"
+    try:
+        account_page_number = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        account_page_number = 1
+    console_kind = str(request.query_params.get("kind") or "orders").strip().lower()
+    if console_kind not in {"orders", "connections"}:
+        console_kind = "orders"
     account = {
         "id": user.get("id"),
         "email": user.get("email", ""),
@@ -894,34 +914,27 @@ def account_page(request: Request):
     ] if show_overview else []
     real_orders = []
     real_console = []
+    account_has_next_page = False
     if not _is_admin(request) and account_tab in {"real-trades", "real-console"}:
-        saved_orders = sorted(
-            store.list_user_records_filtered_limited(
-                user["id"], "real_orders", {}, 250
-            ),
-            key=lambda item: str(
-                item.get("paper_signal_at")
-                or item.get("submitted_at")
-                or item.get("created_at")
-                or ""
-            ),
-            reverse=True,
-        )
         if account_tab == "real-trades":
-            real_orders = [_real_order_account_row(item) for item in saved_orders[:250]]
-        else:
-            lifecycle_entries = store.list_user_records_filtered_limited(
-                user["id"], "real_trade_console", {}, 500
+            saved_orders, account_has_next_page = _account_recent_page(
+                store, user["id"], "real_orders", account_page_number, 50
             )
-            trade_entries = [
+            real_orders = [_real_order_account_row(item) for item in saved_orders]
+        elif console_kind == "connections":
+            real_console, account_has_next_page = _account_recent_page(
+                store, user["id"], "real_trade_console", account_page_number, 100
+            )
+            real_console.reverse()
+        else:
+            saved_orders, account_has_next_page = _account_recent_page(
+                store, user["id"], "real_orders", account_page_number, 30
+            )
+            real_console = sorted([
                 entry
-                for order in saved_orders[:250]
+                for order in saved_orders
                 for entry in _real_order_console_rows(order)
-            ]
-            real_console = sorted(
-                [*lifecycle_entries[-500:], *trade_entries],
-                key=lambda item: str(item.get("created_at") or ""),
-            )[-750:]
+            ], key=lambda item: str(item.get("created_at") or ""))
     return templates.TemplateResponse(
         request,
         "account.html",
@@ -929,6 +942,9 @@ def account_page(request: Request):
             request,
             account=account,
             account_tab=account_tab,
+            account_page_number=account_page_number,
+            account_has_next_page=account_has_next_page,
+            console_kind=console_kind,
             smart_family_report=smart_family_report,
             paper_trading_groups=paper_trading_groups,
             real_orders=real_orders,
@@ -3262,6 +3278,29 @@ def _real_order_account_row(order: dict) -> dict:
         row["actual_quantity"] = row.get("real_open_quantity")
         row["actual_notional"] = row.get("real_open_notional_amount") or row.get("amount")
         row["actual_price"] = row.get("real_open_avg_price")
+    row["signal_price"] = _number_or_none(
+        row.get("signal_exit_price") if action == "close" else row.get("signal_entry_price")
+    )
+    actual_price = _number_or_none(row.get("actual_price"))
+    signal_price = row["signal_price"]
+    difference = (
+        round(actual_price - signal_price, 8)
+        if actual_price is not None and signal_price is not None
+        else None
+    )
+    row["execution_difference"] = difference
+    row["execution_difference_pct"] = (
+        round((difference / signal_price) * 100.0, 4)
+        if difference is not None and signal_price
+        else None
+    )
+    if difference is None:
+        row["execution_quality"] = None
+    elif abs(difference) <= 1e-9:
+        row["execution_quality"] = "same"
+    else:
+        favorable = difference < 0 if action == "open" else difference > 0
+        row["execution_quality"] = "better" if favorable else "worse"
     row["display_time"] = (
         row.get("submitted_at")
         or row.get("failed_at")
@@ -3272,6 +3311,7 @@ def _real_order_account_row(order: dict) -> dict:
 
 
 def _real_order_console_rows(order: dict) -> list[dict]:
+    account_row = _real_order_account_row(order)
     action = str(order.get("order_action") or "open").upper()
     side = str(order.get("side") or "-").upper()
     amount = _number_or_none(order.get("amount"))
@@ -3292,6 +3332,16 @@ def _real_order_console_rows(order: dict) -> list[dict]:
         ),
     }]
     response = order.get("response") if isinstance(order.get("response"), dict) else {}
+    price_comparison = ""
+    if account_row.get("signal_price") is not None:
+        price_comparison = f" signal_price {float(account_row['signal_price']):.6f}"
+    if account_row.get("actual_price") is not None:
+        price_comparison += f" actual_fill {float(account_row['actual_price']):.6f}"
+    if account_row.get("execution_difference") is not None:
+        price_comparison += (
+            f" difference {float(account_row['execution_difference']):+.6f} "
+            f"({account_row.get('execution_quality')})"
+        )
     rows.append({
         "created_at": order.get("clob_send_at") or order.get("submitted_at") or order.get("failed_at"),
         "level": "error" if str(order.get("status")) == "failed" else "info",
@@ -3304,6 +3354,7 @@ def _real_order_console_rows(order: dict) -> list[dict]:
             f"token {token_short} delay {float(order.get('signal_to_clob_ms') or 0):.2f}ms "
             f"duration {float(order.get('clob_duration_ms') or 0):.2f}ms "
             f"clob_status {response.get('status', '-')}"
+            + price_comparison
             + (f" error {order.get('error')}" if order.get("error") else "")
         ),
     })

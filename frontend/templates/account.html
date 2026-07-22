@@ -118,11 +118,11 @@
 <section class="panel">
   <div class="section-title">
     <div><p class="eyebrow">Polymarket CLOB</p><h2>Real executed orders</h2><p class="muted">Actual average fill price is calculated from the matched CLOB response, not from the paper signal price.</p></div>
-    <span class="badge">{{ real_orders|length }} latest</span>
+    <span class="badge">Page {{ account_page_number }}</span>
   </div>
   <div class="overflow-x-auto">
     <table>
-      <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Actual price</th><th>Quantity</th><th>Notional</th><th>Signal → CLOB</th><th>CLOB</th></tr></thead>
+      <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Signal price</th><th>Actual fill</th><th>Difference</th><th>Quantity</th><th>Notional</th><th>Signal to CLOB</th><th>CLOB</th></tr></thead>
       <tbody>
       {% for order in real_orders %}
         <tr>
@@ -131,25 +131,38 @@
           <td>{{ order.order_action|default('open')|upper }}</td>
           <td>{{ order.side or '-' }}</td>
           <td><span class="badge">{{ order.status or '-' }}</span>{% if order.error %}<p class="loss mt-1">{{ order.error }}</p>{% endif %}</td>
+          <td>{{ '%.6f'|format(order.signal_price) if order.signal_price is not none else '-' }}</td>
           <td>{{ '%.6f'|format(order.actual_price) if order.actual_price is not none else '-' }}</td>
+          <td class="{{ 'loss' if order.execution_quality == 'worse' else 'profit' if order.execution_quality == 'better' else '' }}">
+            {% if order.execution_difference is not none %}{{ '%+.6f'|format(order.execution_difference) }}<p class="muted">{{ '%+.3f%%'|format(order.execution_difference_pct) }} · {{ order.execution_quality }}</p>{% else %}-{% endif %}
+          </td>
           <td>{{ '%.6f'|format(order.actual_quantity) if order.actual_quantity is not none else '-' }}</td>
           <td>{{ '$%.6f'|format(order.actual_notional) if order.actual_notional is not none else '-' }}</td>
           <td>{{ '%.2f ms'|format(order.signal_to_clob_ms) if order.signal_to_clob_ms is not none else '-' }}</td>
           <td>{{ '%.2f ms'|format(order.clob_duration_ms) if order.clob_duration_ms is not none else '-' }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="10" class="empty">No real Polymarket orders have been saved yet.</td></tr>
+        <tr><td colspan="12" class="empty">No real Polymarket orders have been saved on this page.</td></tr>
       {% endfor %}
       </tbody>
     </table>
   </div>
+  <nav class="mt-5 flex items-center justify-between gap-3" aria-label="Real trades pages">
+    {% if account_page_number > 1 %}<a class="secondary" href="/account?tab=real-trades&page={{ account_page_number - 1 }}">Previous</a>{% else %}<span></span>{% endif %}
+    <span class="muted">Page {{ account_page_number }} · up to 50 orders</span>
+    {% if account_has_next_page %}<a class="secondary" href="/account?tab=real-trades&page={{ account_page_number + 1 }}">Next</a>{% else %}<span></span>{% endif %}
+  </nav>
 </section>
 {% elif account_tab == 'real-console' %}
 <section class="panel">
   <div class="section-title">
     <div><p class="eyebrow">Persistent server log</p><h2>Real trading console</h2><p class="muted">Saved connection, rollover, balance-guard, signal and CLOB timing events. This does not depend on the browser being open.</p></div>
-    <span class="badge">{{ real_console|length }} lines</span>
+    <span class="badge">Page {{ account_page_number }}</span>
   </div>
+  <nav class="mb-4 flex flex-wrap gap-3" aria-label="Console sections">
+    <a class="{{ 'primary' if console_kind == 'orders' else 'secondary' }}" href="/account?tab=real-console&kind=orders&page=1">Order timings</a>
+    <a class="{{ 'primary' if console_kind == 'connections' else 'secondary' }}" href="/account?tab=real-console&kind=connections&page=1">Connections / server</a>
+  </nav>
   <div class="live-log max-h-[720px] overflow-y-auto font-mono text-sm">
     {% for entry in real_console %}
       <div class="live-log-row {{ 'loss' if entry.level == 'error' else '' }}">
@@ -161,6 +174,11 @@
       <p class="empty">No real trading console events have been saved yet.</p>
     {% endfor %}
   </div>
+  <nav class="mt-5 flex items-center justify-between gap-3" aria-label="Console pages">
+    {% if account_page_number > 1 %}<a class="secondary" href="/account?tab=real-console&kind={{ console_kind }}&page={{ account_page_number - 1 }}">Previous</a>{% else %}<span></span>{% endif %}
+    <span class="muted">Page {{ account_page_number }} · {{ '30 orders' if console_kind == 'orders' else '100 events' }}</span>
+    {% if account_has_next_page %}<a class="secondary" href="/account?tab=real-console&kind={{ console_kind }}&page={{ account_page_number + 1 }}">Next</a>{% else %}<span></span>{% endif %}
+  </nav>
 </section>
 {% endif %}
 {% endblock %}

@@ -1993,17 +1993,23 @@ def test_real_order_account_rows_use_matched_fill_amounts():
         "real_open_quantity": 2.8169,
         "real_open_notional_amount": 2.0,
         "real_open_avg_price": 0.71,
+        "signal_entry_price": 0.70,
     })
     closed = routes_module._real_order_account_row({
         "order_action": "close",
+        "signal_exit_price": 0.72,
         "response": {"success": True, "makingAmount": "2.8", "takingAmount": "1.96"},
     })
 
     assert opened["actual_price"] == pytest.approx(0.71)
     assert opened["actual_quantity"] == pytest.approx(2.8169)
+    assert opened["execution_difference"] == pytest.approx(0.01)
+    assert opened["execution_quality"] == "worse"
     assert closed["actual_price"] == pytest.approx(0.7)
     assert closed["actual_quantity"] == pytest.approx(2.8)
     assert closed["actual_notional"] == pytest.approx(1.96)
+    assert closed["execution_difference"] == pytest.approx(-0.02)
+    assert closed["execution_quality"] == "worse"
 
 
 def test_account_real_trade_and_console_tabs_render_saved_data():
@@ -2019,6 +2025,9 @@ def test_account_real_trade_and_console_tabs_render_saved_data():
         "error": None,
         "smart_family_report": {"rows": []},
         "paper_trading_groups": [],
+        "account_page_number": 1,
+        "account_has_next_page": True,
+        "console_kind": "orders",
     }
     trade_html = template.render(
         **common,
@@ -2029,7 +2038,11 @@ def test_account_real_trade_and_console_tabs_render_saved_data():
             "order_action": "open",
             "side": "UP",
             "status": "submitted",
+            "signal_price": 0.70,
             "actual_price": 0.71,
+            "execution_difference": 0.01,
+            "execution_difference_pct": 1.4286,
+            "execution_quality": "worse",
             "actual_quantity": 2.8,
             "actual_notional": 2.0,
             "signal_to_clob_ms": 1.0,
@@ -2050,8 +2063,33 @@ def test_account_real_trade_and_console_tabs_render_saved_data():
     )
 
     assert "btc-updown-5m-test" in trade_html
+    assert "0.700000" in trade_html
     assert "0.710000" in trade_html
+    assert "+0.010000" in trade_html
+    assert "page=2" in trade_html
     assert "CLOB SEND OPEN UP submitted" in console_html
+
+
+def test_account_real_order_pagination_reads_newest_pages(tmp_path: Path):
+    store = FileStore(tmp_path / "server_data")
+    user = store.create_user("pages@example.com", "Pages", hash_password("secure-pass"))
+    for index in range(121):
+        store.append_user_record(
+            user["id"], "real_orders", {"id": f"order-{index}", "created_at": str(index)}
+        )
+
+    first, first_has_next = routes_module._account_recent_page(
+        store, user["id"], "real_orders", 1, 50
+    )
+    third, third_has_next = routes_module._account_recent_page(
+        store, user["id"], "real_orders", 3, 50
+    )
+
+    assert [row["id"] for row in first[:2]] == ["order-120", "order-119"]
+    assert first_has_next is True
+    assert third[0]["id"] == "order-20"
+    assert third[-1]["id"] == "order-0"
+    assert third_has_next is False
 
 
 def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):
