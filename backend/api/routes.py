@@ -867,6 +867,9 @@ def account_page(request: Request):
     if not user:
         return RedirectResponse("/login", status_code=303)
     store = _store(request)
+    account_tab = str(request.query_params.get("tab") or "overview").strip().lower()
+    if account_tab not in {"overview", "real-trades", "real-console"}:
+        account_tab = "overview"
     account = {
         "id": user.get("id"),
         "email": user.get("email", ""),
@@ -875,9 +878,10 @@ def account_page(request: Request):
         "role": "admin" if _is_admin(request) else "user",
         "data_root": str(store.root),
     }
+    show_overview = account_tab == "overview" or _is_admin(request)
     smart_family_report = (
         _smart_family_report(store, user["id"])
-        if not _is_admin(request)
+        if not _is_admin(request) and show_overview
         else {"rows": [], "copy_text": "", "analysis_count": 0, "strategy_count": 0}
     )
     paper_trading_groups = [
@@ -887,15 +891,48 @@ def account_page(request: Request):
             reverse=True,
         )
         if group.get("source") == "paper_trading_live"
-    ]
+    ] if show_overview else []
+    real_orders = []
+    real_console = []
+    if not _is_admin(request) and account_tab in {"real-trades", "real-console"}:
+        saved_orders = sorted(
+            store.list_user_records_filtered_limited(
+                user["id"], "real_orders", {}, 250
+            ),
+            key=lambda item: str(
+                item.get("paper_signal_at")
+                or item.get("submitted_at")
+                or item.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        if account_tab == "real-trades":
+            real_orders = [_real_order_account_row(item) for item in saved_orders[:250]]
+        else:
+            lifecycle_entries = store.list_user_records_filtered_limited(
+                user["id"], "real_trade_console", {}, 500
+            )
+            trade_entries = [
+                entry
+                for order in saved_orders[:250]
+                for entry in _real_order_console_rows(order)
+            ]
+            real_console = sorted(
+                [*lifecycle_entries[-500:], *trade_entries],
+                key=lambda item: str(item.get("created_at") or ""),
+            )[-750:]
     return templates.TemplateResponse(
         request,
         "account.html",
         _context(
             request,
             account=account,
+            account_tab=account_tab,
             smart_family_report=smart_family_report,
             paper_trading_groups=paper_trading_groups,
+            real_orders=real_orders,
+            real_console=real_console,
         ),
     )
 
@@ -2033,6 +2070,8 @@ def _create_paper_run_group(
     starting_balance: float | None = None,
     real_trading_enabled: bool = False,
     server_optimized: bool = False,
+    balance_guard_enabled: bool = False,
+    min_open_balance: float = 130.0,
 ) -> tuple[dict, dict]:
     now = utc_iso()
     group_id = uuid.uuid4().hex
@@ -2089,6 +2128,8 @@ def _create_paper_run_group(
             "session_id": session_id,
             "real_trading_enabled": bool(real_trading_enabled),
             "server_optimized": bool(server_optimized),
+            "balance_guard_enabled": bool(balance_guard_enabled),
+            "min_open_balance": round(float(min_open_balance), 2),
             "real_order_amount": _paper_real_order_amount(),
             "initial_event_slug": getattr(initial_event, "slug", None),
             "initial_window_start_ts": getattr(initial_event, "window_start_ts", None),
@@ -2116,6 +2157,8 @@ def _create_paper_run_group(
             "session_id": session_id,
             "real_trading_enabled": bool(real_trading_enabled),
             "server_optimized": bool(server_optimized),
+            "balance_guard_enabled": bool(balance_guard_enabled),
+            "min_open_balance": round(float(min_open_balance), 2),
             "real_order_amount": _paper_real_order_amount(),
         },
         "created_at": now,
@@ -3198,6 +3241,88 @@ def _append_real_trade_audit(
         )
 
 
+def _paper_close_fill(response: dict | None) -> tuple[float | None, float | None, float | None]:
+    if not isinstance(response, dict) or str(response.get("success")).lower() == "false":
+        return None, None, None
+    quantity = _number_or_none(response.get("makingAmount"))
+    proceeds = _number_or_none(response.get("takingAmount"))
+    average = proceeds / quantity if quantity and proceeds is not None else None
+    return quantity, proceeds, round(average, 8) if average is not None else None
+
+
+def _real_order_account_row(order: dict) -> dict:
+    row = dict(order)
+    action = str(row.get("order_action") or "open").lower()
+    if action == "close":
+        quantity, notional, average = _paper_close_fill(row.get("response"))
+        row["actual_quantity"] = row.get("real_close_quantity") or quantity
+        row["actual_notional"] = row.get("real_close_proceeds") or notional
+        row["actual_price"] = row.get("real_close_avg_price") or average
+    else:
+        row["actual_quantity"] = row.get("real_open_quantity")
+        row["actual_notional"] = row.get("real_open_notional_amount") or row.get("amount")
+        row["actual_price"] = row.get("real_open_avg_price")
+    row["display_time"] = (
+        row.get("submitted_at")
+        or row.get("failed_at")
+        or row.get("blocked_at")
+        or row.get("created_at")
+    )
+    return row
+
+
+def _real_order_console_rows(order: dict) -> list[dict]:
+    action = str(order.get("order_action") or "open").upper()
+    side = str(order.get("side") or "-").upper()
+    amount = _number_or_none(order.get("amount"))
+    token = str(order.get("token_id") or "")
+    token_short = f"{token[:8]}...{token[-6:]}" if len(token) > 16 else token or "-"
+    signal_lag = _number_or_none(order.get("signal_lag_ms"))
+    sample_delay = _number_or_none(order.get("signal_sample_delay_ms"))
+    rows = [{
+        "created_at": order.get("paper_signal_at") or order.get("created_at"),
+        "level": "info",
+        "source": "paper",
+        "session_id": order.get("session_id"),
+        "event_slug": order.get("event_slug"),
+        "message": (
+            f"PAPER SIGNAL {action} {side} amount {(amount or 0):.6f} "
+            f"token {token_short} signal lag {(signal_lag or 0):.2f}ms "
+            f"sample delay {(sample_delay or 0):.2f}ms"
+        ),
+    }]
+    response = order.get("response") if isinstance(order.get("response"), dict) else {}
+    rows.append({
+        "created_at": order.get("clob_send_at") or order.get("submitted_at") or order.get("failed_at"),
+        "level": "error" if str(order.get("status")) == "failed" else "info",
+        "source": "clob",
+        "session_id": order.get("session_id"),
+        "event_slug": order.get("event_slug"),
+        "message": (
+            f"CLOB SEND {action} {side} {order.get('status', 'unknown')} "
+            f"amount {(amount or 0):.6f} @ {float(order.get('limit_price') or 0):.2f} "
+            f"token {token_short} delay {float(order.get('signal_to_clob_ms') or 0):.2f}ms "
+            f"duration {float(order.get('clob_duration_ms') or 0):.2f}ms "
+            f"clob_status {response.get('status', '-')}"
+            + (f" error {order.get('error')}" if order.get("error") else "")
+        ),
+    })
+    if action == "OPEN" and order.get("real_open_quantity") is not None:
+        rows.append({
+            "created_at": order.get("submitted_at"),
+            "level": "info",
+            "source": "balance",
+            "session_id": order.get("session_id"),
+            "event_slug": order.get("event_slug"),
+            "message": (
+                f"OPEN FILL {side} dollars {float(order.get('real_open_notional_amount') or 0):.6f} "
+                f"contracts {float(order.get('real_open_quantity') or 0):.6f} "
+                f"avg {float(order.get('real_open_avg_price') or 0):.6f} token {token_short}"
+            ),
+        })
+    return [row for row in rows if row.get("created_at")]
+
+
 def _paper_open_fill_quantity(response: dict | None) -> tuple[float | None, str | None]:
     if not isinstance(response, dict):
         return None, None
@@ -3810,6 +3935,9 @@ def _execute_paper_real_trading_signals(
                 )
                 timing = _paper_timing_from_response(response)
                 clob_send_at = timing.get("send_at")
+                real_close_quantity, real_close_proceeds, real_close_avg_price = (
+                    _paper_close_fill(response)
+                )
                 submitted_close = {
                     **close_base,
                     "status": "submitted",
@@ -3822,6 +3950,9 @@ def _execute_paper_real_trading_signals(
                         else None
                     ),
                     "close_quantity_source": quantity_source,
+                    "real_close_quantity": real_close_quantity,
+                    "real_close_proceeds": real_close_proceeds,
+                    "real_close_avg_price": real_close_avg_price,
                     "clob_send_at": clob_send_at,
                     "signal_to_clob_ms": _paper_signal_to_clob_ms(paper_signal_at, clob_send_at),
                     "clob_duration_ms": timing.get("duration_ms"),
@@ -3933,60 +4064,6 @@ def _execute_paper_real_trading_signals(
             if not token_id:
                 raise ValueError("Could not resolve Polymarket token_id for signal side.")
             executor = _paper_live_order_executor(request)
-            balance_check_started = time.perf_counter()
-            account_balance, account_balance_info = _paper_collateral_balance_info(executor)
-            open_base.update({
-                "account_balance_before_open": round(account_balance, 8),
-                "account_balance_threshold": round(_paper_min_open_balance(), 8),
-                "account_balance_response": account_balance_info,
-                "balance_check_duration_ms": round(
-                    (time.perf_counter() - balance_check_started) * 1000.0,
-                    2,
-                ),
-            })
-            if account_balance < _paper_min_open_balance():
-                blocked_open = {
-                    **open_base,
-                    "status": "blocked_low_balance",
-                    "blocked_at": utc_iso(),
-                    "monitor_stop_requested": True,
-                    "stop_reason": (
-                        f"Polymarket collateral balance ${account_balance:.2f} is below "
-                        f"the ${_paper_min_open_balance():.2f} minimum"
-                    ),
-                }
-                if existing:
-                    record = store.update_user_record(
-                        user_id,
-                        "real_orders",
-                        order_id,
-                        _paper_mutable_real_order_fields(blocked_open),
-                    )
-                else:
-                    record = store.append_user_record(
-                        user_id,
-                        "real_orders",
-                        {
-                            "id": order_id,
-                            "created_at": utc_iso(),
-                            **blocked_open,
-                        },
-                    )
-                _append_real_trade_audit(
-                    store,
-                    user_id,
-                    "open_blocked_low_balance",
-                    record,
-                )
-                logger.warning(
-                    "Paper real trading OPEN blocked by collateral balance "
-                    "session=%s balance=%.2f threshold=%.2f",
-                    session_id,
-                    account_balance,
-                    _paper_min_open_balance(),
-                )
-                results.append(record)
-                continue
             response = executor.market_buy(
                 PolymarketLiveOrderRequest(
                     token_id=token_id,
@@ -4153,32 +4230,46 @@ def _paper_real_trading_tasks(app) -> dict[str, asyncio.Task]:
     return tasks
 
 
-async def _stop_paper_monitor_for_low_balance(
-    request: Request,
+def _persist_real_session_log(
+    store: FileStore,
+    user_id: str,
     session,
-    paper_payload: dict,
-) -> bool:
-    blocked = next(
-        (
-            order
-            for order in paper_payload.get("real_orders") or []
-            if str(order.get("status") or "") == "blocked_low_balance"
-            and order.get("monitor_stop_requested")
-        ),
-        None,
+    entry: dict,
+) -> None:
+    store.append_user_record(
+        user_id,
+        "real_trade_console",
+        {
+            **entry,
+            "session_id": session.id,
+            "event_slug": getattr(session.event, "slug", None),
+        },
     )
-    if not blocked:
-        return False
-    reason = str(blocked.get("stop_reason") or "Low Polymarket collateral balance")
-    await session._log("warning", "balance", f"{reason}. Monitoring stopped.")
-    stopped = await request.app.state.live_monitor.stop(session.id)
-    logger.warning(
-        "Paper monitor stopped by balance guard session=%s order_id=%s stopped=%s",
-        session.id,
-        blocked.get("id"),
-        stopped,
-    )
-    return stopped or session.is_finished
+
+
+async def _paper_balance_guard_check(
+    request: Request,
+    threshold: float,
+    session,
+) -> tuple[bool, str]:
+    started = time.perf_counter()
+    try:
+        balance, _response = await asyncio.to_thread(
+            _paper_collateral_balance_info,
+            _paper_live_order_executor(request),
+        )
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        allowed = balance >= threshold
+        message = (
+            f"Polymarket collateral balance ${balance:.2f}; minimum ${threshold:.2f}; "
+            f"check {duration_ms:.2f}ms."
+        )
+        await session._log("info" if allowed else "warning", "balance", message)
+        return allowed, message
+    except Exception as error:
+        message = f"Could not verify Polymarket collateral balance: {_error_message(error)}"
+        await session._log("error", "balance", message)
+        return False, message
 
 
 def _track_paper_real_trading_task(app, key: str, task: asyncio.Task) -> None:
@@ -4402,6 +4493,27 @@ async def _paper_real_trading_worker(
                     break
                 continue
             snapshot = session.snapshot(history_limit=None)
+            paper_meta = run_group.get("paper_trading") or {}
+            if event_name == "rolled" and paper_meta.get("balance_guard_enabled"):
+                configured_threshold = _number_or_none(paper_meta.get("min_open_balance"))
+                threshold = (
+                    configured_threshold
+                    if configured_threshold is not None and configured_threshold >= 0
+                    else _paper_min_open_balance()
+                )
+                allowed, reason = await _paper_balance_guard_check(
+                    request,
+                    threshold,
+                    session,
+                )
+                if not allowed:
+                    await session._log(
+                        "warning",
+                        "balance",
+                        f"{reason} Monitoring stopped before trading the new contract.",
+                    )
+                    await request.app.state.live_monitor.stop(session.id)
+                    break
             if event_name in {"snapshot", "rolled"}:
                 _schedule_paper_live_order_token_warmup(
                     request,
@@ -4441,12 +4553,6 @@ async def _paper_real_trading_worker(
                     execute_real_orders=True,
                 )
                 _store_paper_visual_preview(cache_key, paper_payload)
-                if await _stop_paper_monitor_for_low_balance(
-                    request,
-                    session,
-                    paper_payload,
-                ):
-                    break
                 duration_ms = (time.perf_counter() - decision_started) * 1000.0
                 history = preview_snapshot.get("history") or []
                 captured_at = (
@@ -4565,7 +4671,12 @@ def paper_trading_page(request: Request, group_id: str, strategy_id: str):
     return templates.TemplateResponse(
         request,
         "paper_trading.html",
-        _context(request, group=group, strategy=strategy),
+        _context(
+            request,
+            group=group,
+            strategy=strategy,
+            min_open_balance=_paper_min_open_balance(),
+        ),
     )
 
 
@@ -4578,16 +4689,71 @@ async def start_paper_trading_monitor(
     starting_balance: Annotated[float, Form()] = 100.0,
     real_trading: Annotated[bool, Form()] = False,
     server_optimized: Annotated[bool, Form()] = False,
+    balance_guard_enabled: Annotated[bool, Form()] = False,
+    min_open_balance: Annotated[float, Form()] = 130.0,
 ):
     user, _store_obj, _group, _strategy = _paper_trading_strategy_scope(
         request, group_id, strategy_id
     )
+    initial_balance_message = None
+    initial_guard_failure_logged = False
     try:
         if not math.isfinite(starting_balance) or starting_balance <= 0:
             raise ValueError("Starting balance must be greater than zero")
+        if not math.isfinite(min_open_balance) or min_open_balance < 0:
+            raise ValueError("Minimum Polymarket balance must be zero or greater")
+        if real_trading and balance_guard_enabled:
+            balance_started = time.perf_counter()
+            account_balance, _balance_response = await asyncio.to_thread(
+                _paper_collateral_balance_info,
+                _paper_live_order_executor(request),
+            )
+            balance_duration_ms = (time.perf_counter() - balance_started) * 1000.0
+            initial_balance_message = (
+                f"Polymarket collateral balance ${account_balance:.2f}; minimum "
+                f"${min_open_balance:.2f}; pre-monitor check {balance_duration_ms:.2f}ms."
+            )
+            if account_balance < min_open_balance:
+                _store(request).append_user_record(
+                    user["id"],
+                    "real_trade_console",
+                    {
+                        "created_at": _paper_clock_ms(),
+                        "level": "warning",
+                        "source": "balance",
+                        "message": initial_balance_message + " Monitoring was not started.",
+                    },
+                )
+                initial_guard_failure_logged = True
+                raise ValueError(initial_balance_message + " Monitoring was not started.")
         session = await request.app.state.live_monitor.start(user["id"], event_url)
-    except (httpx.HTTPError, ValueError, OSError) as error:
+    except (httpx.HTTPError, ValueError, OSError, RuntimeError) as error:
+        if real_trading and balance_guard_enabled and not initial_guard_failure_logged:
+            try:
+                _store(request).append_user_record(
+                    user["id"],
+                    "real_trade_console",
+                    {
+                        "created_at": _paper_clock_ms(),
+                        "level": "error",
+                        "source": "balance",
+                        "message": (
+                            "Pre-monitor balance check or monitor start failed: "
+                            f"{_error_message(error)}"
+                        ),
+                    },
+                )
+            except Exception:
+                logger.exception("Could not persist pre-monitor balance guard failure")
         raise HTTPException(422, _error_message(error)) from error
+    if real_trading:
+        await session.enable_persistent_log(
+            lambda entry: _persist_real_session_log(
+                _store(request), user["id"], session, entry
+            )
+        )
+        if initial_balance_message:
+            await session._log("info", "balance", initial_balance_message)
     run_group, run_strategy = _create_paper_run_group(
         _store(request),
         user["id"],
@@ -4598,6 +4764,8 @@ async def start_paper_trading_monitor(
         starting_balance,
         bool(real_trading),
         bool(server_optimized),
+        bool(balance_guard_enabled),
+        float(min_open_balance),
     )
     _ensure_paper_real_trading_worker(
         request,

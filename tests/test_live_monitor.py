@@ -326,6 +326,27 @@ async def test_midpoint_crossed_polymarket_quote_is_recorded():
 
 
 @pytest.mark.asyncio
+async def test_real_session_console_persists_existing_and_future_logs(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/test",
+        slug="btc-updown-5m-test",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[LiveToken("token-1", "Bitcoin Up or Down", "Up")],
+        crypto_symbol="btc/usd",
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+    persisted = []
+
+    await session._log("info", "session", "Started")
+    await session.enable_persistent_log(persisted.append)
+    await session._log("warning", "polymarket", "Reconnecting")
+
+    assert [entry["message"] for entry in persisted] == ["Started", "Reconnecting"]
+    assert all(entry.get("created_at") for entry in persisted)
+
+
+@pytest.mark.asyncio
 async def test_rest_poll_clears_crossed_ask_for_top_bid(tmp_path, monkeypatch):
     event = ResolvedPolymarketEvent(
         url="https://polymarket.com/event/btc-updown-5m-1782639600",

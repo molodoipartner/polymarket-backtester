@@ -6,6 +6,14 @@
   <h1>Account</h1>
   <p class="mt-2 muted">Use this page to check which local account and data profile are active.</p>
 </div>
+{% if account.role != 'admin' %}
+<nav class="mb-6 flex flex-wrap gap-3" aria-label="Account sections">
+  <a class="{{ 'primary' if account_tab == 'overview' else 'secondary' }}" href="/account?tab=overview">Overview</a>
+  <a class="{{ 'primary' if account_tab == 'real-trades' else 'secondary' }}" href="/account?tab=real-trades">Real Polymarket trades</a>
+  <a class="{{ 'primary' if account_tab == 'real-console' else 'secondary' }}" href="/account?tab=real-console">Real trading console</a>
+</nav>
+{% endif %}
+{% if account_tab == 'overview' or account.role == 'admin' %}
 <section class="panel max-w-3xl">
   <div class="section-title"><div><h2>Signed in as</h2><p class="muted">{{ account.role|title }} session</p></div><span class="badge">{{ account.role }}</span></div>
   <div class="mt-5 grid gap-3 sm:grid-cols-2">
@@ -104,6 +112,55 @@
   <form method="post" action="/account/clear-project-cache" onsubmit="return confirm('Delete all project cache and generated data except accounts? This cannot be undone.')">
     <button class="danger" type="submit">Delete all project cache</button>
   </form>
+</section>
+{% endif %}
+{% elif account_tab == 'real-trades' %}
+<section class="panel">
+  <div class="section-title">
+    <div><p class="eyebrow">Polymarket CLOB</p><h2>Real executed orders</h2><p class="muted">Actual average fill price is calculated from the matched CLOB response, not from the paper signal price.</p></div>
+    <span class="badge">{{ real_orders|length }} latest</span>
+  </div>
+  <div class="overflow-x-auto">
+    <table>
+      <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Actual price</th><th>Quantity</th><th>Notional</th><th>Signal → CLOB</th><th>CLOB</th></tr></thead>
+      <tbody>
+      {% for order in real_orders %}
+        <tr>
+          <td class="min-w-[190px]">{{ order.display_time or '-' }}</td>
+          <td class="min-w-[220px]">{{ order.event_slug or '-' }}</td>
+          <td>{{ order.order_action|default('open')|upper }}</td>
+          <td>{{ order.side or '-' }}</td>
+          <td><span class="badge">{{ order.status or '-' }}</span>{% if order.error %}<p class="loss mt-1">{{ order.error }}</p>{% endif %}</td>
+          <td>{{ '%.6f'|format(order.actual_price) if order.actual_price is not none else '-' }}</td>
+          <td>{{ '%.6f'|format(order.actual_quantity) if order.actual_quantity is not none else '-' }}</td>
+          <td>{{ '$%.6f'|format(order.actual_notional) if order.actual_notional is not none else '-' }}</td>
+          <td>{{ '%.2f ms'|format(order.signal_to_clob_ms) if order.signal_to_clob_ms is not none else '-' }}</td>
+          <td>{{ '%.2f ms'|format(order.clob_duration_ms) if order.clob_duration_ms is not none else '-' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="10" class="empty">No real Polymarket orders have been saved yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% elif account_tab == 'real-console' %}
+<section class="panel">
+  <div class="section-title">
+    <div><p class="eyebrow">Persistent server log</p><h2>Real trading console</h2><p class="muted">Saved connection, rollover, balance-guard, signal and CLOB timing events. This does not depend on the browser being open.</p></div>
+    <span class="badge">{{ real_console|length }} lines</span>
+  </div>
+  <div class="live-log max-h-[720px] overflow-y-auto font-mono text-sm">
+    {% for entry in real_console %}
+      <div class="live-log-row {{ 'loss' if entry.level == 'error' else '' }}">
+        <span>{{ entry.created_at or entry.time or '-' }}</span>
+        <strong>[{{ entry.source or 'server' }}]</strong>
+        <span>{{ entry.message }}</span>
+      </div>
+    {% else %}
+      <p class="empty">No real trading console events have been saved yet.</p>
+    {% endfor %}
+  </div>
 </section>
 {% endif %}
 {% endblock %}

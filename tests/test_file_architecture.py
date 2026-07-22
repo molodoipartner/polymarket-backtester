@@ -1779,7 +1779,8 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert executor.calls[0].amount == 1.0
     assert executor.calls[0].order_type == "FAK"
     assert executor.calls[0].price == 0.99
-    assert executor.collateral_checks == 1
+    # Balance is checked at session start/rollover, never in the OPEN path.
+    assert executor.collateral_checks == 0
     assert executor.balance_checks == []
     real_orders = store.list_user_records(user["id"], "real_orders")
     assert len(real_orders) == 1
@@ -1788,7 +1789,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert real_orders[0]["paper_signal_at"]
     assert real_orders[0]["clob_send_at"]
     assert real_orders[0]["clob_duration_ms"] == pytest.approx(12.34)
-    assert real_orders[0]["account_balance_before_open"] == 200.0
+    assert "account_balance_before_open" not in real_orders[0]
     audit = store.list_user_records(user["id"], "real_trade_audit")
     assert len(audit) == 1
     assert audit[0]["audit_event"] == "open_submitted"
@@ -1903,7 +1904,8 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert executor.sells[-1].price == 0.01
 
 
-def test_paper_real_trading_low_collateral_blocks_open_and_writes_audit(
+@pytest.mark.asyncio
+async def test_paper_real_trading_low_collateral_stops_before_contract(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -1928,7 +1930,6 @@ def test_paper_real_trading_low_collateral_blocks_open_and_writes_audit(
 
         def market_buy(self, order_request):
             self.buys.append(order_request)
-            raise AssertionError("A low-balance OPEN must never reach CLOB")
 
     executor = FakeExecutor()
     request = SimpleNamespace(
@@ -1941,104 +1942,116 @@ def test_paper_real_trading_low_collateral_blocks_open_and_writes_audit(
     )
     monkeypatch.setattr(settings, "polymarket_live_order_amount", 2.0)
     monkeypatch.setattr(settings, "polymarket_min_open_balance", 130.0)
-    start_ts = 1782639600
-    opened_at = datetime.fromtimestamp(start_ts + 10, timezone.utc).isoformat()
-    event = {
-        "slug": "btc-updown-5m-1782639600",
-        "title": "Bitcoin Up or Down",
-        "window_start_ts": start_ts,
-        "tokens": [
-            {"token_id": "up-token", "outcome": "Up"},
-            {"token_id": "down-token", "outcome": "Down"},
-        ],
-    }
-    snapshot = {
-        "event": event,
-        "history": [{
-            "t": start_ts + 10,
-            "captured_at": start_ts + 10.002,
-            "sample_delay_ms": 2.0,
-            "crypto_price": 100.1,
-            "target_price": 100.0,
-            "yes_bid": 0.69,
-            "yes_ask": 0.70,
-            "no_bid": 0.29,
-            "no_ask": 0.30,
-        }],
-    }
-    run_group = {
-        "id": "run-low-collateral",
-        "paper_trading": {"real_trading_enabled": True},
-    }
-    run_strategy = {"id": "strategy-low-collateral"}
-    trade = {
-        "status": "open",
-        "side": "UP",
-        "opened_at": opened_at,
-        "signal_tick_captured_at": opened_at,
-        "entry_price": 0.70,
-    }
-
-    orders = routes_module._execute_paper_real_trading_signals(
-        request,
-        user["id"],
-        run_group,
-        run_strategy,
-        "low-collateral-session",
-        event,
-        snapshot,
-        [trade],
+    logged = []
+    session = SimpleNamespace(
+        id="low-collateral-session",
+        _log=lambda *_args: None,
+    )
+    async def log(level, source, message):
+        logged.append((level, source, message))
+    session._log = log
+    allowed, reason = await routes_module._paper_balance_guard_check(
+        request, 130.0, session
     )
 
+    assert allowed is False
+    assert "$129.99" in reason
     assert executor.buys == []
-    assert orders[0]["status"] == "blocked_low_balance"
-    assert orders[0]["monitor_stop_requested"] is True
-    assert orders[0]["account_balance_before_open"] == pytest.approx(129.99)
-    assert orders[0]["account_balance_threshold"] == 130.0
-    assert orders[0]["signal_snapshot"]["crypto_price"] == 100.1
-    audit = store.list_user_records(user["id"], "real_trade_audit")
-    assert len(audit) == 1
-    assert audit[0]["audit_event"] == "open_blocked_low_balance"
-    assert audit[0]["order"]["status"] == "blocked_low_balance"
+    assert logged[0][0:2] == ("warning", "balance")
 
 
 @pytest.mark.asyncio
-async def test_low_balance_guard_stops_monitor():
+async def test_balance_guard_allows_contract_when_balance_is_sufficient():
     calls = []
 
     class FakeSession:
-        id = "low-balance-session"
-        is_finished = False
+        id = "balance-session"
 
         async def _log(self, level, source, message):
             calls.append((level, source, message))
 
-    class FakeManager:
-        async def stop(self, session_id):
-            calls.append(("stop", session_id))
-            return True
+    class FakeExecutor:
+        def collateral_balance_info(self):
+            return {"balance": 150.0}
 
     request = SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(live_monitor=FakeManager()))
+        app=SimpleNamespace(state=SimpleNamespace(polymarket_live_order_executor=FakeExecutor()))
     )
-    payload = {
-        "real_orders": [{
-            "id": "blocked-order",
-            "status": "blocked_low_balance",
-            "monitor_stop_requested": True,
-            "stop_reason": "Balance is below minimum",
-        }]
+    allowed, reason = await routes_module._paper_balance_guard_check(
+        request, 130.0, FakeSession()
+    )
+
+    assert allowed is True
+    assert "$150.00" in reason
+    assert calls[0][0:2] == ("info", "balance")
+
+
+def test_real_order_account_rows_use_matched_fill_amounts():
+    opened = routes_module._real_order_account_row({
+        "order_action": "open",
+        "amount": 2.0,
+        "real_open_quantity": 2.8169,
+        "real_open_notional_amount": 2.0,
+        "real_open_avg_price": 0.71,
+    })
+    closed = routes_module._real_order_account_row({
+        "order_action": "close",
+        "response": {"success": True, "makingAmount": "2.8", "takingAmount": "1.96"},
+    })
+
+    assert opened["actual_price"] == pytest.approx(0.71)
+    assert opened["actual_quantity"] == pytest.approx(2.8169)
+    assert closed["actual_price"] == pytest.approx(0.7)
+    assert closed["actual_quantity"] == pytest.approx(2.8)
+    assert closed["actual_notional"] == pytest.approx(1.96)
+
+
+def test_account_real_trade_and_console_tabs_render_saved_data():
+    template = routes_module.templates.env.get_template("account.html")
+    common = {
+        "app_name": "Test",
+        "asset_version": "test",
+        "is_admin": False,
+        "user": {"display_name": "Trader"},
+        "account": {"role": "user"},
+        "local_data_tools": False,
+        "message": None,
+        "error": None,
+        "smart_family_report": {"rows": []},
+        "paper_trading_groups": [],
     }
-
-    stopped = await routes_module._stop_paper_monitor_for_low_balance(
-        request,
-        FakeSession(),
-        payload,
+    trade_html = template.render(
+        **common,
+        account_tab="real-trades",
+        real_orders=[{
+            "display_time": "2026-07-22T12:00:00.000+00:00",
+            "event_slug": "btc-updown-5m-test",
+            "order_action": "open",
+            "side": "UP",
+            "status": "submitted",
+            "actual_price": 0.71,
+            "actual_quantity": 2.8,
+            "actual_notional": 2.0,
+            "signal_to_clob_ms": 1.0,
+            "clob_duration_ms": 400.0,
+        }],
+        real_console=[],
+    )
+    console_html = template.render(
+        **common,
+        account_tab="real-console",
+        real_orders=[],
+        real_console=[{
+            "created_at": "2026-07-22T12:00:00.000+00:00",
+            "level": "info",
+            "source": "clob",
+            "message": "CLOB SEND OPEN UP submitted",
+        }],
     )
 
-    assert stopped is True
-    assert calls[0][0:2] == ("warning", "balance")
-    assert calls[1] == ("stop", "low-balance-session")
+    assert "btc-updown-5m-test" in trade_html
+    assert "0.710000" in trade_html
+    assert "CLOB SEND OPEN UP submitted" in console_html
 
 
 def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):

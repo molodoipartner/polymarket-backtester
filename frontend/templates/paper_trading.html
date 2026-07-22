@@ -58,6 +58,15 @@
       Server optimized
       <span class="muted">Lighter stream for Fly/server trading</span>
     </label>
+    <label class="live-real-trading-toggle">
+      <input name="balance_guard_enabled" type="checkbox" value="true" checked>
+      Stop on low Polymarket balance
+      <span class="muted">Checked before monitoring starts and before each new contract, never before an OPEN signal</span>
+    </label>
+    <label>
+      Minimum Polymarket balance ($)
+      <input name="min_open_balance" type="number" min="0" step="0.01" value="{{ '%.2f'|format(min_open_balance) }}">
+    </label>
     <div class="live-monitor-actions">
       <button class="primary paper-start-button" type="submit">Start trading</button>
     </div>

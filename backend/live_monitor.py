@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -1162,6 +1162,7 @@ class LiveMonitorSession:
         self._crypto_timeline: list[tuple[float, float]] = []
         self._target_price_ts: float | None = None
         self._logs: list[dict] = []
+        self._persistent_log: Callable[[dict], None] | None = None
         self._saved = False
         self._last_history_sample_ts: float | None = None
         self._next_history_sample_ts: float | None = None
@@ -1623,9 +1624,11 @@ class LiveMonitorSession:
             )
 
     async def _log(self, level: str, source: str, message: str) -> None:
+        created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         entry = {
             "t": int(time.time()),
             "time": datetime.now().strftime("%H:%M:%S"),
+            "created_at": created_at,
             "level": level,
             "source": source,
             "message": message,
@@ -1638,6 +1641,11 @@ class LiveMonitorSession:
             logger.warning("[%s] %s", source, message)
         else:
             logger.info("[%s] %s", source, message)
+        if self._persistent_log is not None:
+            try:
+                await asyncio.to_thread(self._persistent_log, dict(entry))
+            except Exception:
+                logger.exception("Could not persist live monitor console entry")
         if self._subscribers:
             await self._publish(
                 "log",
@@ -1794,6 +1802,18 @@ class LiveMonitorSession:
         )
         payload["update"] = {"type": update_type, **detail}
         await self._publish(update_type, payload)
+
+    async def enable_persistent_log(
+        self,
+        callback: Callable[[dict], None],
+    ) -> None:
+        """Persist this real-trading session's existing and future lifecycle logs."""
+        self._persistent_log = callback
+        for entry in list(self._logs):
+            try:
+                await asyncio.to_thread(callback, dict(entry))
+            except Exception:
+                logger.exception("Could not persist existing live monitor console entry")
 
     async def _publish(self, event: str, data: dict) -> None:
         if not self._subscribers:
