@@ -2128,10 +2128,79 @@ def test_real_trade_balance_chart_starts_at_zero_and_uses_matched_cash_flow():
     assert [point["balance"] for point in payload["points"]] == [-2.0, 0.1]
     assert payload["summary"] == {
         "order_count": 2,
+        "resolution_count": 0,
         "final_balance": 0.1,
         "minimum_balance": -2.0,
         "maximum_balance": 0.1,
     }
+
+
+def test_real_trade_balance_chart_resolves_only_unclosed_token_remainder():
+    orders = [
+        {
+            "id": "open-up",
+            "paper_trade_id": "paper-up",
+            "status": "submitted",
+            "order_action": "open",
+            "side": "UP",
+            "submitted_at": "2026-07-23T10:00:00+00:00",
+            "event_slug": "btc-updown-5m-test",
+            "response": {"makingAmount": "2.0", "takingAmount": "2.8"},
+        },
+        {
+            "id": "close-up",
+            "open_order_id": "open-up",
+            "status": "submitted",
+            "order_action": "close",
+            "side": "UP",
+            "submitted_at": "2026-07-23T10:01:00+00:00",
+            "response": {"makingAmount": "1.0", "takingAmount": "0.5"},
+        },
+    ]
+    contracts = {
+        "paper-up": {
+            "id": "paper-up",
+            "winning_outcome": "Up",
+            "window_end_ts": datetime(2026, 7, 23, 10, 5, tzinfo=timezone.utc).timestamp(),
+        }
+    }
+
+    payload = routes_module._real_trade_balance_chart_payload(orders, 100, contracts)
+
+    assert [point["action"] for point in payload["points"]] == [
+        "open", "close", "resolution"
+    ]
+    assert payload["points"][-1]["actual_quantity"] == pytest.approx(1.8)
+    assert payload["points"][-1]["cash_flow"] == pytest.approx(1.8)
+    assert payload["points"][-1]["won"] is True
+    assert payload["summary"]["resolution_count"] == 1
+    assert payload["summary"]["final_balance"] == pytest.approx(0.3)
+
+
+def test_real_trade_balance_chart_marks_losing_unclosed_position_at_zero():
+    payload = routes_module._real_trade_balance_chart_payload(
+        [{
+            "id": "open-down",
+            "paper_trade_id": "paper-down",
+            "status": "submitted",
+            "order_action": "open",
+            "side": "DOWN",
+            "submitted_at": "2026-07-23T10:00:00+00:00",
+            "response": {"makingAmount": "1.0", "takingAmount": "2.0"},
+        }],
+        25,
+        {"paper-down": {
+            "id": "paper-down",
+            "winning_outcome": "Up",
+            "window_end_ts": datetime(2026, 7, 23, 10, 5, tzinfo=timezone.utc).timestamp(),
+        }},
+    )
+
+    resolution = payload["points"][-1]
+    assert resolution["action"] == "resolution"
+    assert resolution["cash_flow"] == 0.0
+    assert resolution["won"] is False
+    assert payload["summary"]["final_balance"] == -1.0
 
 
 def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):

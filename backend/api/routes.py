@@ -975,7 +975,21 @@ async def account_real_trades_balance_chart(
         1,
         limit,
     )
-    return _real_trade_balance_chart_payload(list(reversed(orders)), limit)
+    paper_trade_ids = {
+        str(order.get("paper_trade_id") or "").strip()
+        for order in orders
+        if str(order.get("paper_trade_id") or "").strip()
+    }
+    paper_trades = await asyncio.to_thread(
+        _store(request).list_user_records_by_ids,
+        user["id"],
+        "paper_trades",
+        paper_trade_ids,
+    )
+    resolved_contracts = {str(item.get("id")): item for item in paper_trades}
+    return _real_trade_balance_chart_payload(
+        list(reversed(orders)), limit, resolved_contracts
+    )
 
 
 @router.post("/account/clear-project-cache")
@@ -3338,12 +3352,35 @@ def _real_order_account_row(order: dict) -> dict:
     return row
 
 
-def _real_trade_balance_chart_payload(orders: list[dict], limit: int) -> dict:
+def _real_trade_balance_chart_payload(
+    orders: list[dict],
+    limit: int,
+    resolved_contracts: dict[str, dict] | None = None,
+) -> dict:
+    resolved_contracts = resolved_contracts or {}
+    closed_quantity_by_open: dict[str, float] = {}
+    unknown_close_quantity_by_open: set[str] = set()
+    for order in orders:
+        if (
+            str(order.get("status") or "").lower() != "submitted"
+            or str(order.get("order_action") or "").lower() != "close"
+        ):
+            continue
+        open_order_id = str(order.get("open_order_id") or "").strip()
+        quantity = _number_or_none(_real_order_account_row(order).get("actual_quantity"))
+        if open_order_id and quantity is not None and quantity > 0:
+            closed_quantity_by_open[open_order_id] = (
+                closed_quantity_by_open.get(open_order_id, 0.0) + quantity
+            )
+        elif open_order_id:
+            unknown_close_quantity_by_open.add(open_order_id)
+
+    events = []
+    order_count = 0
     balance = 0.0
     minimum = 0.0
     maximum = 0.0
-    points = []
-    for order in orders:
+    for sequence, order in enumerate(orders):
         if str(order.get("status") or "").lower() != "submitted":
             continue
         row = _real_order_account_row(order)
@@ -3352,29 +3389,82 @@ def _real_trade_balance_chart_payload(orders: list[dict], limit: int) -> dict:
             continue
         action = str(row.get("order_action") or "open").lower()
         cash_flow = actual_notional if action == "close" else -actual_notional
-        balance = round(balance + cash_flow, 8)
-        minimum = min(minimum, balance)
-        maximum = max(maximum, balance)
-        points.append({
+        order_count += 1
+        events.append({
             "t": (
                 row.get("clob_send_at")
                 or row.get("submitted_at")
                 or row.get("paper_signal_at")
                 or row.get("created_at")
             ),
-            "balance": balance,
             "cash_flow": round(cash_flow, 8),
             "action": action,
             "side": row.get("side"),
             "event_slug": row.get("event_slug"),
             "actual_price": row.get("actual_price"),
             "actual_quantity": row.get("actual_quantity"),
+            "_sequence": sequence,
         })
+        if action != "open":
+            continue
+        paper_trade_id = str(row.get("paper_trade_id") or "").strip()
+        contract = resolved_contracts.get(paper_trade_id) or {}
+        winning_outcome = str(contract.get("winning_outcome") or "").strip().upper()
+        side = str(row.get("side") or "").strip().upper()
+        opened_quantity = _number_or_none(row.get("actual_quantity"))
+        if winning_outcome not in {"UP", "DOWN"} or opened_quantity is None:
+            continue
+        remaining_quantity = max(
+            0.0,
+            opened_quantity - closed_quantity_by_open.get(str(row.get("id") or ""), 0.0),
+        )
+        if str(row.get("id") or "") in unknown_close_quantity_by_open:
+            continue
+        if remaining_quantity <= 1e-6:
+            continue
+        won = side == winning_outcome
+        resolution_time = (
+            _iso_from_ts(contract.get("window_end_ts"))
+            or contract.get("saved_at")
+            or contract.get("created_at")
+        )
+        if not resolution_time:
+            continue
+        events.append({
+            "t": resolution_time,
+            "cash_flow": round(remaining_quantity if won else 0.0, 8),
+            "action": "resolution",
+            "side": side,
+            "event_slug": row.get("event_slug") or contract.get("live_event_key"),
+            "actual_price": 1.0 if won else 0.0,
+            "actual_quantity": round(remaining_quantity, 8),
+            "winning_outcome": winning_outcome,
+            "won": won,
+            "_sequence": sequence,
+        })
+
+    events.sort(key=lambda item: (
+        _timestamp_from_iso(item.get("t")) or 0.0,
+        1 if item.get("action") == "resolution" else 0,
+        item.get("_sequence", 0),
+    ))
+    points = []
+    resolution_count = 0
+    for event in events:
+        balance = round(balance + float(event.get("cash_flow") or 0.0), 8)
+        minimum = min(minimum, balance)
+        maximum = max(maximum, balance)
+        if event.get("action") == "resolution":
+            resolution_count += 1
+        event["balance"] = balance
+        event.pop("_sequence", None)
+        points.append(event)
     return {
         "range": limit,
         "points": points,
         "summary": {
-            "order_count": len(points),
+            "order_count": order_count,
+            "resolution_count": resolution_count,
             "final_balance": round(balance, 8),
             "minimum_balance": round(minimum, 8),
             "maximum_balance": round(maximum, 8),

@@ -1594,7 +1594,8 @@ function initRealTradeBalanceChart(){
     const points=orders.map((order,index)=>({
       x:Date.parse(order.t),y:Number(order.balance),flow:Number(order.cash_flow),
       action:String(order.action||'').toUpperCase(),side:order.side||'-',
-      slug:order.event_slug||'-',price:finiteNumber(order.actual_price),index
+      slug:order.event_slug||'-',price:finiteNumber(order.actual_price),
+      won:order.won,winning:order.winning_outcome||null,index
     })).filter(point=>Number.isFinite(point.x)&&Number.isFinite(point.y));
     if(!points.length){
       const existing=chartInstances.get(canvas)||Chart.getChart(canvas);if(existing)existing.destroy();
@@ -1607,15 +1608,18 @@ function initRealTradeBalanceChart(){
     const tooltipLabel=context=>{
       const raw=context.raw||{},parts=['Balance '+money(raw.y)];
       if(raw.action&&raw.action!=='START')parts.push(raw.action+' '+raw.side+' '+money(raw.flow));
+      if(raw.action==='RESOLUTION')parts.push(raw.won?'won; payout $1':'lost; payout $0');
       if(raw.price!==null&&raw.price!==undefined)parts.push('fill '+Number(raw.price).toFixed(6));
       return parts.join(' · ');
     };
     replaceChart(canvas,{type:'line',data:{datasets:[
       {label:'Balance from zero',data:line,borderColor:neon,backgroundColor:'#29f19c14',fill:true,tension:.18,pointRadius:2,borderWidth:2,parsing:false},
       {label:'OPEN',type:'scatter',data:points.filter(point=>point.action==='OPEN'),backgroundColor:'#ff647c',pointStyle:'triangle',rotation:180,pointRadius:6,parsing:false},
-      {label:'CLOSE',type:'scatter',data:points.filter(point=>point.action==='CLOSE'),backgroundColor:neon,pointRadius:5,parsing:false}
+      {label:'CLOSE',type:'scatter',data:points.filter(point=>point.action==='CLOSE'),backgroundColor:neon,pointRadius:5,parsing:false},
+      {label:'Winning resolution',type:'scatter',data:points.filter(point=>point.action==='RESOLUTION'&&point.won),backgroundColor:'#60a5fa',pointStyle:'rectRot',pointRadius:7,parsing:false},
+      {label:'Losing resolution',type:'scatter',data:points.filter(point=>point.action==='RESOLUTION'&&!point.won),backgroundColor:'#8293aa',pointStyle:'crossRot',pointRadius:7,parsing:false}
     ]},options:{animation:false,normalized:true,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):'',label:tooltipLabel,afterLabel:context=>context.raw?.slug||''}}},scales:{x:timeScale,y:{ticks:{color:text,callback:value=>money(value)},grid:{color:grid}}}}});
-    if(status)status.textContent='Loaded '+points.length+' matched real orders. Range starts at $0.000000.';
+    if(status)status.textContent='Loaded '+Number(summary.order_count||0)+' matched real orders and '+Number(summary.resolution_count||0)+' remaining-position resolutions. Range starts at $0.000000.';
   };
   const load=async()=>{
     if(!range||!canvas)return;
