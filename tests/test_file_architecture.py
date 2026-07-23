@@ -345,6 +345,7 @@ def test_live_monitor_smart_generator_samples_unique_dynamic_parameters():
         "smart_pullback_continuation",
         "smart_settlement_drift",
         "price_threshold_70_stop_40",
+        "price_threshold_30_take_60",
     }
     assert {item["generation_method"] for item in first} == {
         "system_random_parameter_sample"
@@ -353,6 +354,7 @@ def test_live_monitor_smart_generator_samples_unique_dynamic_parameters():
         "dynamic_bid_or_settlement",
         "conviction_hold_or_stop",
         "stop_loss_40_or_settlement",
+        "take_profit_60_or_settlement",
     }
     assert {item["entry_mode"] for item in first} <= {"single_entry", "scale_in"}
     assert any(item["entry_mode"] == "scale_in" for item in first)
@@ -366,6 +368,49 @@ def test_live_monitor_smart_generator_supports_one_thousand_configurations():
     assert LiveMonitorStrategyGenerator.MAX_STRATEGIES == 1000
     assert len(specifications) == 1000
     assert len({tuple(sorted(item.items())) for item in specifications}) == 1000
+
+
+def test_inverted_price_threshold_family_buys_at_30_and_takes_profit_at_60():
+    start_ts = 1782639600
+    end_ts = start_ts + 300
+    event = {
+        "id": "inverted-threshold-event",
+        "market_id": "inverted-threshold-market",
+        "question": "BTC Up or Down?",
+        "asset": "BTC",
+        "timeframe": "5m",
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "start_time": datetime.fromtimestamp(start_ts, timezone.utc).isoformat(),
+        "expiration_time": datetime.fromtimestamp(end_ts, timezone.utc).isoformat(),
+        "resolved_outcome": "down",
+        "history": [
+            {"t": start_ts + 1, "yes_ask": 35, "yes_bid": 34, "no_ask": 66, "no_bid": 65},
+            {"t": start_ts + 2, "yes_ask": 30, "yes_bid": 29, "no_ask": 71, "no_bid": 70},
+            {"t": start_ts + 3, "yes_ask": 56, "yes_bid": 55, "no_ask": 45, "no_bid": 44},
+            {"t": start_ts + 4, "yes_ask": 61, "yes_bid": 60, "no_ask": 40, "no_bid": 39},
+        ],
+    }
+    strategy = {
+        "family": "price_threshold_30_take_60",
+        "entry_second": 0,
+        "entry_price_cents": 30,
+        "take_profit_cents": 60,
+        "allocation_pct": 0.1,
+        "fee_bps": 10,
+    }
+
+    result = LiveMonitorStrategyGenerator(None, None)._run([event], strategy, 100)
+
+    assert result["trade_count"] == 1
+    trade = result["transactions"][0]
+    assert trade["side"] == "UP"
+    assert trade["entry_price"] == 0.3
+    assert trade["exit_price"] == 0.6
+    assert trade["exit_type"] == "take_profit_bid"
+    assert trade["entry_trigger_cents"] == 30
+    assert trade["take_profit_cents"] == 60
+    assert "stop_loss_cents" not in trade
 
 
 def test_live_monitor_smart_exit_can_leave_on_time_decay_before_settlement():
@@ -1614,6 +1659,54 @@ def test_threshold_worker_recomputes_only_on_entry_and_stop_transitions():
     assert changed(stopped)
     assert not changed(stopped + [
         {"t": start_ts + 6, "yes_ask": 38, "yes_bid": 37, "no_ask": 63, "no_bid": 62},
+    ])
+
+
+def test_inverted_threshold_worker_recomputes_only_on_entry_and_profit_transitions():
+    start_ts = 1782639600
+    source_strategy = {
+        "family": "price_threshold_30_take_60",
+        "parameters": {
+            "family": "price_threshold_30_take_60",
+            "entry_second": 0,
+            "entry_price_cents": 30,
+            "take_profit_cents": 60,
+        },
+    }
+    run_strategy = {"id": "inverted-threshold-run", "parameters": {}}
+    event_payload = {
+        "slug": "btc-updown-5m-1782639600",
+        "window_start_ts": start_ts,
+        "window_end_ts": start_ts + 300,
+        "target_price_ts": start_ts,
+        "target_price": 100,
+    }
+    state = {}
+
+    def changed(history):
+        return routes_module._paper_threshold_signal_changed(
+            "session", source_strategy, run_strategy,
+            {"event": event_payload, "history": history}, state,
+        )
+
+    watching = [{"t": start_ts + 1, "yes_ask": 31, "no_ask": 69}]
+    assert not changed(watching)
+
+    opened = watching + [
+        {"t": start_ts + 2, "yes_ask": 30, "yes_bid": 29, "no_ask": 71, "no_bid": 70},
+    ]
+    assert changed(opened)
+    assert not changed(opened + [
+        {"t": start_ts + 3, "yes_ask": 56, "yes_bid": 55, "no_ask": 45, "no_bid": 44},
+    ])
+
+    profitable = opened + [
+        {"t": start_ts + 3, "yes_ask": 56, "yes_bid": 55, "no_ask": 45, "no_bid": 44},
+        {"t": start_ts + 4, "yes_ask": 61, "yes_bid": 60, "no_ask": 40, "no_bid": 39},
+    ]
+    assert changed(profitable)
+    assert not changed(profitable + [
+        {"t": start_ts + 5, "yes_ask": 62, "yes_bid": 61, "no_ask": 39, "no_bid": 38},
     ])
 
 
@@ -4109,7 +4202,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
                 "timeframe": "5m",
                 "strategy_mode": "smart",
                 "include_partial_contracts": "true",
-                "strategy_count": "8",
+                "strategy_count": "9",
                 "starting_balance": "500",
             },
         )
@@ -4134,6 +4227,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_pullback_continuation",
             "smart_settlement_drift",
             "price_threshold_70_stop_40",
+            "price_threshold_30_take_60",
         }
         assert {
             "smart_value_edge",
@@ -4144,6 +4238,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_pullback_continuation",
             "smart_settlement_drift",
             "price_threshold_70_stop_40",
+            "price_threshold_30_take_60",
         } <= smart_families
         all_trades = store.list_user_records_filtered(
             user["id"], "transactions", {"group_id": group["id"]}
@@ -4158,7 +4253,10 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
         assert trades
         assert all(trade["ask_price"] == trade["entry_price"] for trade in all_trades)
         assert all(
-            trade["quote_source"] == "live_monitor_smart_history"
+            trade["quote_source"] in {
+                "live_monitor_smart_history",
+                "live_monitor_threshold_history",
+            }
             for trade in all_trades
         )
         assert all(

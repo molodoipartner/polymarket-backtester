@@ -36,6 +36,7 @@ SMART_LIVE_FAMILY_LABELS = {
     "smart_pullback_continuation": "Smart Pullback Continuation",
     "smart_settlement_drift": "Smart Settlement Drift",
     "price_threshold_70_stop_40": "Price Threshold 70 Stop 40",
+    "price_threshold_30_take_60": "Price Threshold 30 Take 60",
 }
 
 ACTIVE_SMART_LIVE_FAMILIES = (
@@ -47,6 +48,7 @@ ACTIVE_SMART_LIVE_FAMILIES = (
     "smart_pullback_continuation",
     "smart_settlement_drift",
     "price_threshold_70_stop_40",
+    "price_threshold_30_take_60",
 )
 
 ALL_LIVE_FAMILY_LABELS = {
@@ -1166,7 +1168,10 @@ class LiveMonitorStrategyGenerator:
         prior_outcomes: list[str] = []
 
         for event in events:
-            if strategy["family"] == "price_threshold_70_stop_40":
+            if strategy["family"] in {
+                "price_threshold_70_stop_40",
+                "price_threshold_30_take_60",
+            }:
                 threshold_trades, available_after_threshold = self._price_threshold_70_stop_40_trades(
                     event,
                     strategy,
@@ -1366,8 +1371,16 @@ class LiveMonitorStrategyGenerator:
         if not rows:
             return [], available_cash
 
-        entry_threshold = float(strategy.get("entry_price_cents", 70.0)) / 100
-        stop_loss = float(strategy.get("stop_loss_cents", 40.0)) / 100
+        inverse = strategy["family"] == "price_threshold_30_take_60"
+        entry_threshold = float(
+            strategy.get("entry_price_cents", 30.0 if inverse else 70.0)
+        ) / 100
+        exit_threshold = float(
+            strategy.get(
+                "take_profit_cents" if inverse else "stop_loss_cents",
+                60.0 if inverse else 40.0,
+            )
+        ) / 100
         min_entry_ts = event["start_ts"] + float(strategy.get("entry_second", 0.0))
         entry = None
         for index, row in enumerate(rows):
@@ -1377,10 +1390,16 @@ class LiveMonitorStrategyGenerator:
             candidates = []
             for side in ("up", "down"):
                 ask_price = self._side_ask(row, side)
-                if ask_price is not None and ask_price >= entry_threshold:
+                threshold_reached = (
+                    ask_price <= entry_threshold
+                    if inverse
+                    else ask_price >= entry_threshold
+                ) if ask_price is not None else False
+                if threshold_reached:
                     candidates.append((side, ask_price))
             if candidates:
-                side, ask_price = max(candidates, key=lambda item: item[1])
+                chooser = min if inverse else max
+                side, ask_price = chooser(candidates, key=lambda item: item[1])
                 entry = {
                     "index": index,
                     "row": row,
@@ -1403,7 +1422,12 @@ class LiveMonitorStrategyGenerator:
         exit_row = None
         for row in rows[entry["index"] + 1:]:
             bid_price = self._side_bid(row, entry["side"])
-            if bid_price is not None and bid_price <= stop_loss:
+            exit_reached = (
+                bid_price >= exit_threshold
+                if inverse
+                else bid_price <= exit_threshold
+            ) if bid_price is not None else False
+            if exit_reached:
                 exit_row = row
                 break
         if exit_row:
@@ -1411,7 +1435,7 @@ class LiveMonitorStrategyGenerator:
             if exit_price is None:
                 return [], available_cash
             closed_at = datetime.fromtimestamp(float(exit_row["t"]), timezone.utc).isoformat()
-            exit_type = "stop_loss_bid"
+            exit_type = "take_profit_bid" if inverse else "stop_loss_bid"
         else:
             exit_price = 1.0 if entry["side"] == event["resolved_outcome"] else 0.0
             closed_at = event["expiration_time"]
@@ -1467,11 +1491,20 @@ class LiveMonitorStrategyGenerator:
             "settlement_value": round(settlement_value, 8),
             "pnl": round(pnl, 8),
             "quote_source": "live_monitor_threshold_history",
-            "entry_trigger_cents": float(strategy.get("entry_price_cents", 70.0)),
-            "stop_loss_cents": float(strategy.get("stop_loss_cents", 40.0)),
+            "entry_trigger_cents": float(
+                strategy.get("entry_price_cents", 30.0 if inverse else 70.0)
+            ),
             "saved_record_id": event.get("saved_record_id"),
             "partial_contract": event.get("partial_contract", False),
         }
+        if inverse:
+            transaction["take_profit_cents"] = float(
+                strategy.get("take_profit_cents", 60.0)
+            )
+        else:
+            transaction["stop_loss_cents"] = float(
+                strategy.get("stop_loss_cents", 40.0)
+            )
         return [transaction], available_after_close
 
     def _smart_trades(
@@ -2209,13 +2242,16 @@ class LiveMonitorStrategyGenerator:
             return float(rng.choice(values))
 
         def sample_for_family(family: str) -> dict:
-            if family == "price_threshold_70_stop_40":
+            if family in {
+                "price_threshold_70_stop_40",
+                "price_threshold_30_take_60",
+            }:
+                inverse = family == "price_threshold_30_take_60"
                 allocation = rng.choice((0.03, 0.05, 0.075, 0.1, 0.15, 0.2))
-                return {
+                specification = {
                     "family": family,
                     "entry_second": 0.0,
-                    "entry_price_cents": 70.0,
-                    "stop_loss_cents": 40.0,
+                    "entry_price_cents": 30.0 if inverse else 70.0,
                     "min_hold_seconds": 0.0,
                     "target_hold_seconds": 0.0,
                     "max_hold_seconds": 300.0,
@@ -2231,6 +2267,13 @@ class LiveMonitorStrategyGenerator:
                     "generation_method": "system_random_parameter_sample",
                     "generation_nonce": secrets.token_hex(8),
                 }
+                if inverse:
+                    specification["take_profit_cents"] = 60.0
+                    specification["exit_condition"] = "take_profit_60_or_settlement"
+                else:
+                    specification["stop_loss_cents"] = 40.0
+                    specification["exit_condition"] = "stop_loss_40_or_settlement"
+                return specification
             profile_name = rng.choice(family_profiles[family])
             profile = risk_profiles[profile_name]
             max_hold_seconds = pick(profile["max_hold_seconds"])
@@ -2348,6 +2391,18 @@ class LiveMonitorStrategyGenerator:
                 f"{specification['entry_price_cents']:g}c, then exits that same side at the saved "
                 f"bid if it falls to {specification['stop_loss_cents']:g}c. There is no take "
                 f"profit; if the stop loss never appears, it waits for settlement. It locks "
+                f"{allocation:.1%} of available cash and charges a {specification['fee_bps']:.0f} "
+                f"bps entry fee. Full-contract-only analysis excludes interrupted partial records; "
+                f"the mixed mode includes partial records but still excludes unsuitable records."
+            )
+        if family == "price_threshold_30_take_60":
+            return (
+                f"This live-monitor algorithm trades saved {asset} {timeframe} contracts inside "
+                f"the chart using an inverted fixed price threshold rule. It scans both UP and "
+                f"DOWN from the start of each contract, buys the first side whose saved ask is at "
+                f"or below {specification['entry_price_cents']:g}c, then exits that same side at "
+                f"the saved bid if it reaches {specification['take_profit_cents']:g}c. There is no "
+                f"stop loss; if the take profit never appears, it waits for settlement. It locks "
                 f"{allocation:.1%} of available cash and charges a {specification['fee_bps']:.0f} "
                 f"bps entry fee. Full-contract-only analysis excludes interrupted partial records; "
                 f"the mixed mode includes partial records but still excludes unsuitable records."

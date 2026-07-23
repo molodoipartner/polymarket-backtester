@@ -4576,8 +4576,13 @@ def _paper_threshold_signal_changed(
     avoids rerunning the full backtest and file-backed accounting on every quote tick.
     """
     spec = _paper_strategy_spec(source_strategy, run_strategy)
-    if str(spec.get("family") or "") != "price_threshold_70_stop_40":
+    family = str(spec.get("family") or "")
+    if family not in {
+        "price_threshold_70_stop_40",
+        "price_threshold_30_take_60",
+    }:
         return True
+    inverse = family == "price_threshold_30_take_60"
 
     event = snapshot.get("event") or {}
     event_key = _paper_event_key(session_id, event)
@@ -4623,8 +4628,15 @@ def _paper_threshold_signal_changed(
     target_became_known = target_known and not bool(state.get("target_known"))
     state["target_known"] = target_known
 
-    entry_threshold = float(spec.get("entry_price_cents", 70.0)) / 100
-    stop_loss = float(spec.get("stop_loss_cents", 40.0)) / 100
+    entry_threshold = float(
+        spec.get("entry_price_cents", 30.0 if inverse else 70.0)
+    ) / 100
+    exit_threshold = float(
+        spec.get(
+            "take_profit_cents" if inverse else "stop_loss_cents",
+            60.0 if inverse else 40.0,
+        )
+    ) / 100
     min_entry_ts = (window_start or 0.0) + float(spec.get("entry_second", 0.0))
     signal_changed = False
     for index in range(processed_rows, len(rows)) if state.get("stop_index") is None else ():
@@ -4635,10 +4647,16 @@ def _paper_threshold_signal_changed(
             candidates = []
             for side in ("up", "down"):
                 ask = LiveMonitorStrategyGenerator._side_ask(row, side)
-                if ask is not None and ask >= entry_threshold:
+                threshold_reached = (
+                    ask <= entry_threshold
+                    if inverse
+                    else ask >= entry_threshold
+                ) if ask is not None else False
+                if threshold_reached:
                     candidates.append((side, ask))
             if candidates:
-                side, _ = max(candidates, key=lambda item: item[1])
+                chooser = min if inverse else max
+                side, _ = chooser(candidates, key=lambda item: item[1])
                 state["entry_index"] = index
                 state["entry_side"] = side
                 signal_changed = True
@@ -4646,7 +4664,12 @@ def _paper_threshold_signal_changed(
         if index <= int(state["entry_index"]):
             continue
         bid = LiveMonitorStrategyGenerator._side_bid(row, str(state["entry_side"]))
-        if bid is not None and bid <= stop_loss:
+        exit_reached = (
+            bid >= exit_threshold
+            if inverse
+            else bid <= exit_threshold
+        ) if bid is not None else False
+        if exit_reached:
             state["stop_index"] = index
             signal_changed = True
             break
