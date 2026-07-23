@@ -346,6 +346,10 @@ def test_live_monitor_smart_generator_samples_unique_dynamic_parameters():
         "smart_settlement_drift",
         "price_threshold_70_stop_40",
         "price_threshold_30_take_60",
+        "fixed_stake_value_discount",
+        "fixed_stake_momentum_confirm",
+        "fixed_stake_pullback",
+        "fixed_stake_late_breakout",
     }
     assert {item["generation_method"] for item in first} == {
         "system_random_parameter_sample"
@@ -368,6 +372,82 @@ def test_live_monitor_smart_generator_supports_one_thousand_configurations():
     assert LiveMonitorStrategyGenerator.MAX_STRATEGIES == 1000
     assert len(specifications) == 1000
     assert len({tuple(sorted(item.items())) for item in specifications}) == 1000
+
+
+def test_fixed_stake_smart_families_generate_randomized_fixed_cash_strategies():
+    families = (
+        "fixed_stake_value_discount",
+        "fixed_stake_momentum_confirm",
+        "fixed_stake_pullback",
+        "fixed_stake_late_breakout",
+    )
+
+    specifications = LiveMonitorStrategyGenerator.specifications(
+        4, "smart", strategy_families=families
+    )
+
+    assert {item["family"] for item in specifications} == set(families)
+    assert all(item["position_size_mode"] == "fixed_cash" for item in specifications)
+    assert all(item["entry_mode"] == "single_entry" for item in specifications)
+    assert all(item["max_entries_per_contract"] == 1 for item in specifications)
+    assert all(item["allocation_pct"] == 0 for item in specifications)
+    assert all(item["fixed_position_amount"] in {5, 10, 15, 20, 25, 30} for item in specifications)
+    assert all(item["generation_method"] == "system_random_parameter_sample" for item in specifications)
+
+
+def test_fixed_stake_smart_family_uses_same_cash_amount_after_balance_changes(monkeypatch):
+    generator = LiveMonitorStrategyGenerator(None, None)
+    monkeypatch.setattr(generator, "_estimated_up_probability_at", lambda *args: 0.8)
+    monkeypatch.setattr(
+        generator,
+        "_smart_entry_candidate",
+        lambda *args: ("up", 0.5, 30.0),
+    )
+    monkeypatch.setattr(
+        generator,
+        "_smart_exit",
+        lambda *args: (None, "settlement", None, None),
+    )
+    strategy = {
+        "family": "fixed_stake_value_discount",
+        "entry_second": 0,
+        "min_hold_seconds": 0,
+        "entry_mode": "single_entry",
+        "max_entries_per_contract": 1,
+        "min_edge_cents": 1,
+        "fixed_position_amount": 10,
+        "allocation_pct": 0,
+        "fee_bps": 10,
+    }
+
+    def fixed_event(event_id, start_ts):
+        end_ts = start_ts + 300
+        return {
+            "id": event_id,
+            "market_id": f"market-{event_id}",
+            "question": "BTC Up or Down?",
+            "asset": "BTC",
+            "timeframe": "5m",
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "start_time": datetime.fromtimestamp(start_ts, timezone.utc).isoformat(),
+            "expiration_time": datetime.fromtimestamp(end_ts, timezone.utc).isoformat(),
+            "resolved_outcome": "up",
+            "history": [{"t": start_ts + 1}],
+        }
+
+    result = generator._run(
+        [fixed_event("fixed-1", 1782639600), fixed_event("fixed-2", 1782639900)],
+        strategy,
+        100,
+    )
+
+    assert result["trade_count"] == 2
+    assert result["transactions"][0]["balance_before"] != result["transactions"][1]["balance_before"]
+    for trade in result["transactions"]:
+        assert trade["position_size_mode"] == "fixed_cash"
+        assert trade["fixed_position_amount"] == 10
+        assert trade["margin_locked"] + trade["entry_fee"] == pytest.approx(10)
 
 
 def test_inverted_price_threshold_family_buys_at_30_and_takes_profit_at_60():
@@ -4202,7 +4282,7 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
                 "timeframe": "5m",
                 "strategy_mode": "smart",
                 "include_partial_contracts": "true",
-                "strategy_count": "9",
+                "strategy_count": "13",
                 "starting_balance": "500",
             },
         )
@@ -4228,6 +4308,10 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_settlement_drift",
             "price_threshold_70_stop_40",
             "price_threshold_30_take_60",
+            "fixed_stake_value_discount",
+            "fixed_stake_momentum_confirm",
+            "fixed_stake_pullback",
+            "fixed_stake_late_breakout",
         }
         assert {
             "smart_value_edge",
@@ -4239,6 +4323,10 @@ def test_live_monitor_analysis_generates_smart_intrachart_strategies(tmp_path: P
             "smart_settlement_drift",
             "price_threshold_70_stop_40",
             "price_threshold_30_take_60",
+            "fixed_stake_value_discount",
+            "fixed_stake_momentum_confirm",
+            "fixed_stake_pullback",
+            "fixed_stake_late_breakout",
         } <= smart_families
         all_trades = store.list_user_records_filtered(
             user["id"], "transactions", {"group_id": group["id"]}

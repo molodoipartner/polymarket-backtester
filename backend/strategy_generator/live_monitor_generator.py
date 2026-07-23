@@ -37,6 +37,17 @@ SMART_LIVE_FAMILY_LABELS = {
     "smart_settlement_drift": "Smart Settlement Drift",
     "price_threshold_70_stop_40": "Price Threshold 70 Stop 40",
     "price_threshold_30_take_60": "Price Threshold 30 Take 60",
+    "fixed_stake_value_discount": "Fixed Stake Value Discount",
+    "fixed_stake_momentum_confirm": "Fixed Stake Momentum Confirm",
+    "fixed_stake_pullback": "Fixed Stake Pullback",
+    "fixed_stake_late_breakout": "Fixed Stake Late Breakout",
+}
+
+FIXED_STAKE_SMART_FAMILIES = {
+    "fixed_stake_value_discount",
+    "fixed_stake_momentum_confirm",
+    "fixed_stake_pullback",
+    "fixed_stake_late_breakout",
 }
 
 ACTIVE_SMART_LIVE_FAMILIES = (
@@ -49,6 +60,10 @@ ACTIVE_SMART_LIVE_FAMILIES = (
     "smart_settlement_drift",
     "price_threshold_70_stop_40",
     "price_threshold_30_take_60",
+    "fixed_stake_value_discount",
+    "fixed_stake_momentum_confirm",
+    "fixed_stake_pullback",
+    "fixed_stake_late_breakout",
 )
 
 ALL_LIVE_FAMILY_LABELS = {
@@ -1531,14 +1546,28 @@ class LiveMonitorStrategyGenerator:
         entries = []
         min_entry_ts = event["start_ts"] + float(strategy["entry_second"])
         latest_entry_ts = event["end_ts"] - float(strategy["min_hold_seconds"])
+        fixed_stake = strategy["family"] in FIXED_STAKE_SMART_FAMILIES
         entry_mode = str(strategy.get("entry_mode", "single_entry"))
         max_entries = max(1, int(strategy.get("max_entries_per_contract", 1)))
-        if entry_mode != "scale_in":
+        if fixed_stake:
+            entry_mode = "single_entry"
+            max_entries = 1
+        elif entry_mode != "scale_in":
             max_entries = 1
         entry_gap_seconds = float(strategy.get("add_entry_min_gap_seconds", 20.0))
         add_edge_cents = float(strategy.get("add_entry_edge_cents", strategy["min_edge_cents"]))
         max_price_worse = float(strategy.get("add_entry_max_price_worse_cents", 2.0))
-        contract_budget = min(available_cash, available_cash * allocation_pct)
+        if fixed_stake:
+            fixed_position_amount = float(strategy["fixed_position_amount"])
+            if (
+                fixed_position_amount < MIN_POSITION_BUDGET
+                or available_cash < fixed_position_amount
+            ):
+                return [], available_cash
+            contract_budget = fixed_position_amount
+        else:
+            fixed_position_amount = None
+            contract_budget = min(available_cash, available_cash * allocation_pct)
         entry_budget = contract_budget / max_entries
         if entry_budget < MIN_POSITION_BUDGET:
             return [], available_cash
@@ -1648,7 +1677,7 @@ class LiveMonitorStrategyGenerator:
                 (float(exit_row["t"]) if exit_row else event["end_ts"])
                 - float(entry["row"]["t"])
             )
-            transactions.append({
+            transaction = {
                 "event_id": event["id"],
                 "market_id": event["market_id"],
                 "market_question": event["question"],
@@ -1692,7 +1721,11 @@ class LiveMonitorStrategyGenerator:
                 "average_entry_price": round(average_entry_price or entry["ask_price"], 8),
                 "saved_record_id": event.get("saved_record_id"),
                 "partial_contract": event.get("partial_contract", False),
-            })
+            }
+            if fixed_stake:
+                transaction["position_size_mode"] = "fixed_cash"
+                transaction["fixed_position_amount"] = round(fixed_position_amount, 4)
+            transactions.append(transaction)
         return transactions, available_after_close
 
     def _smart_entry_candidate(
@@ -1805,6 +1838,55 @@ class LiveMonitorStrategyGenerator:
             if abs(deviation) < float(strategy["deviation_threshold_pct"]):
                 return None, None, None
             if side != ("up" if deviation > 0 else "down"):
+                return None, None, None
+        elif family == "fixed_stake_value_discount":
+            spread = self._side_spread_cents(row, side)
+            if spread is None or spread > float(strategy["max_spread_cents"]):
+                return None, None, None
+            if ask * 100 > float(strategy["max_entry_price_cents"]):
+                return None, None, None
+        elif family == "fixed_stake_momentum_confirm":
+            spread = self._side_spread_cents(row, side)
+            if momentum is None or abs(momentum) < float(strategy["momentum_threshold_pct"]):
+                return None, None, None
+            if side != ("up" if momentum > 0 else "down"):
+                return None, None, None
+            if spread is None or spread > float(strategy["max_spread_cents"]):
+                return None, None, None
+        elif family == "fixed_stake_pullback":
+            slow = self._crypto_momentum_pct_at(
+                rows, row_index, float(strategy["slow_momentum_lookback_seconds"])
+            )
+            if momentum is None or slow is None:
+                return None, None, None
+            if abs(slow) < float(strategy["momentum_threshold_pct"]):
+                return None, None, None
+            pullback_threshold = float(strategy["momentum_threshold_pct"]) * 0.5
+            if slow > 0:
+                if momentum > pullback_threshold or side != "up":
+                    return None, None, None
+            elif momentum < -pullback_threshold or side != "down":
+                return None, None, None
+        elif family == "fixed_stake_late_breakout":
+            row_ts = self._float_or_none(row.get("t"))
+            deviation = self._target_deviation_pct(row)
+            spread = self._side_spread_cents(row, side)
+            if row_ts is None or deviation is None or momentum is None:
+                return None, None, None
+            elapsed_ratio = (row_ts - event["start_ts"]) / max(
+                event["end_ts"] - event["start_ts"], 1.0
+            )
+            if elapsed_ratio < float(strategy["late_min_elapsed_ratio"]):
+                return None, None, None
+            if abs(deviation) < float(strategy["deviation_threshold_pct"]):
+                return None, None, None
+            if abs(momentum) < float(strategy["momentum_threshold_pct"]):
+                return None, None, None
+            if (deviation > 0) != (momentum > 0):
+                return None, None, None
+            if side != ("up" if deviation > 0 else "down"):
+                return None, None, None
+            if spread is None or spread > float(strategy["max_spread_cents"]):
                 return None, None, None
         return side, ask, edge_cents
 
@@ -2008,7 +2090,7 @@ class LiveMonitorStrategyGenerator:
         distance_scale = max(float(strategy["distance_scale_pct"]), 1e-9)
         momentum_scale = max(float(strategy["momentum_scale_pct"]), 1e-9)
         family = strategy["family"]
-        if family == "smart_momentum_edge":
+        if family in {"smart_momentum_edge", "fixed_stake_momentum_confirm"}:
             raw = distance_pct / distance_scale + 1.35 * momentum_pct / momentum_scale
         elif family == "smart_reversion_edge":
             raw = distance_pct / distance_scale - 1.1 * momentum_pct / momentum_scale
@@ -2020,9 +2102,9 @@ class LiveMonitorStrategyGenerator:
             ) or 0.0
             acceleration_pct = momentum_pct - slow_momentum
             raw = distance_pct / distance_scale + 1.55 * acceleration_pct / momentum_scale
-        elif family == "smart_breakout_confirmation":
+        elif family in {"smart_breakout_confirmation", "fixed_stake_late_breakout"}:
             raw = 1.15 * distance_pct / distance_scale + 1.15 * momentum_pct / momentum_scale
-        elif family == "smart_pullback_continuation":
+        elif family in {"smart_pullback_continuation", "fixed_stake_pullback"}:
             slow_momentum = self._crypto_momentum_pct_at(
                 rows, row_index, float(strategy["slow_momentum_lookback_seconds"])
             ) or 0.0
@@ -2236,6 +2318,10 @@ class LiveMonitorStrategyGenerator:
             "smart_breakout_confirmation": ("balanced", "patient"),
             "smart_pullback_continuation": ("scalper", "balanced"),
             "smart_settlement_drift": ("balanced", "patient"),
+            "fixed_stake_value_discount": ("balanced", "patient"),
+            "fixed_stake_momentum_confirm": ("scalper", "balanced"),
+            "fixed_stake_pullback": ("scalper", "balanced"),
+            "fixed_stake_late_breakout": ("balanced", "patient"),
         }
 
         def pick(values: tuple[float, ...]) -> float:
@@ -2315,7 +2401,7 @@ class LiveMonitorStrategyGenerator:
                     ]
                 )
             )
-            return {
+            specification = {
                 "family": family,
                 "entry_second": pick((5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0)),
                 "min_edge_cents": min_edge,
@@ -2355,7 +2441,18 @@ class LiveMonitorStrategyGenerator:
                 "uses_intrachart_exit": True,
                 "generation_method": "system_random_parameter_sample",
                 "risk_profile": profile_name,
+                "max_entry_price_cents": pick((35.0, 40.0, 45.0, 50.0, 55.0, 60.0)),
             }
+            if family in FIXED_STAKE_SMART_FAMILIES:
+                specification.update({
+                    "entry_mode": "single_entry",
+                    "max_entries_per_contract": 1,
+                    "allocation_pct": 0.0,
+                    "max_allocation_pct": 0.0,
+                    "position_size_mode": "fixed_cash",
+                    "fixed_position_amount": pick((5.0, 10.0, 15.0, 20.0, 25.0, 30.0)),
+                })
+            return specification
 
         ordered = []
         seen = set()
@@ -2445,8 +2542,30 @@ class LiveMonitorStrategyGenerator:
                     "waits for enough contract time to pass, then follows the side implied by the "
                     "current crypto price drifting away from the target"
                 ),
+                "fixed_stake_value_discount": (
+                    "buys only a relatively inexpensive side when the probability model finds "
+                    "enough value and the saved bid/ask spread is acceptable"
+                ),
+                "fixed_stake_momentum_confirm": (
+                    "requires the probability edge to agree with meaningful short-term crypto "
+                    "momentum and rejects entries with a wide saved spread"
+                ),
+                "fixed_stake_pullback": (
+                    "follows the slower crypto trend only after short-term momentum pauses or "
+                    "pulls back, while the selected quote still has model edge"
+                ),
+                "fixed_stake_late_breakout": (
+                    "waits until later in the contract and enters only when distance from the "
+                    "target, short-term momentum, model edge, and a reasonable spread agree"
+                ),
             }
-            if specification.get("entry_mode") == "scale_in":
+            if family in FIXED_STAKE_SMART_FAMILIES:
+                entry_rule = (
+                    f"It uses exactly ${specification['fixed_position_amount']:g} of cash for every "
+                    f"position, independent of the current balance, and skips the entry if that "
+                    f"full fixed amount is unavailable."
+                )
+            elif specification.get("entry_mode") == "scale_in":
                 entry_rule = (
                     f"It can split the {allocation:.1%} contract budget into up to "
                     f"{int(specification.get('max_entries_per_contract', 1))} same-side entries. "
