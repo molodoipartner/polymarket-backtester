@@ -1565,5 +1565,72 @@ function initSmartFamilyReport(){
   };
   refreshButton&&refreshButton.addEventListener('click',refresh);
 }
+function initRealTradeBalanceChart(){
+  const panel=document.getElementById('real-trade-balance-chart');
+  if(!panel)return;
+  const canvas=document.getElementById('real-trade-balance-canvas');
+  const chartWrap=document.getElementById('real-trade-chart-wrap');
+  const range=document.getElementById('real-trade-chart-range');
+  const status=document.getElementById('real-trade-chart-status');
+  const metrics={
+    count:document.getElementById('real-trade-chart-count'),
+    final:document.getElementById('real-trade-chart-final'),
+    min:document.getElementById('real-trade-chart-min'),
+    max:document.getElementById('real-trade-chart-max')
+  };
+  const money=value=>{
+    const number=Number(value)||0;
+    return (number>=0?'+':'-')+'$'+Math.abs(number).toFixed(6);
+  };
+  const render=payload=>{
+    const summary=payload.summary||{},orders=payload.points||[];
+    if(metrics.count)metrics.count.textContent=String(summary.order_count||0);
+    [['final','final_balance'],['min','minimum_balance'],['max','maximum_balance']].forEach(([key,field])=>{
+      if(!metrics[key])return;
+      const value=Number(summary[field])||0;
+      metrics[key].textContent=money(value);
+      metrics[key].className=value>0?'profit':value<0?'loss':'';
+    });
+    const points=orders.map((order,index)=>({
+      x:Date.parse(order.t),y:Number(order.balance),flow:Number(order.cash_flow),
+      action:String(order.action||'').toUpperCase(),side:order.side||'-',
+      slug:order.event_slug||'-',price:finiteNumber(order.actual_price),index
+    })).filter(point=>Number.isFinite(point.x)&&Number.isFinite(point.y));
+    if(!points.length){
+      const existing=chartInstances.get(canvas)||Chart.getChart(canvas);if(existing)existing.destroy();
+      if(chartWrap)chartWrap.classList.add('hidden');
+      if(status)status.textContent='No matched real orders with known cash amounts in this range.';
+      return;
+    }
+    if(chartWrap)chartWrap.classList.remove('hidden');
+    const line=[{x:points[0].x-1,y:0,action:'START',side:'-',slug:'Range start',flow:0},...points];
+    const tooltipLabel=context=>{
+      const raw=context.raw||{},parts=['Balance '+money(raw.y)];
+      if(raw.action&&raw.action!=='START')parts.push(raw.action+' '+raw.side+' '+money(raw.flow));
+      if(raw.price!==null&&raw.price!==undefined)parts.push('fill '+Number(raw.price).toFixed(6));
+      return parts.join(' · ');
+    };
+    replaceChart(canvas,{type:'line',data:{datasets:[
+      {label:'Balance from zero',data:line,borderColor:neon,backgroundColor:'#29f19c14',fill:true,tension:.18,pointRadius:2,borderWidth:2,parsing:false},
+      {label:'OPEN',type:'scatter',data:points.filter(point=>point.action==='OPEN'),backgroundColor:'#ff647c',pointStyle:'triangle',rotation:180,pointRadius:6,parsing:false},
+      {label:'CLOSE',type:'scatter',data:points.filter(point=>point.action==='CLOSE'),backgroundColor:neon,pointRadius:5,parsing:false}
+    ]},options:{animation:false,normalized:true,responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'nearest'},plugins:{legend:{labels:{color:text}},tooltip:{callbacks:{title:items=>items.length?timeTick(items[0].parsed.x):'',label:tooltipLabel,afterLabel:context=>context.raw?.slug||''}}},scales:{x:timeScale,y:{ticks:{color:text,callback:value=>money(value)},grid:{color:grid}}}}});
+    if(status)status.textContent='Loaded '+points.length+' matched real orders. Range starts at $0.000000.';
+  };
+  const load=async()=>{
+    if(!range||!canvas)return;
+    range.disabled=true;
+    if(status)status.textContent='Loading real-order cash flow...';
+    try{
+      const url=(panel.dataset.chartUrl||'/api/account/real-trades/balance-chart')+'?limit='+encodeURIComponent(range.value);
+      const response=await fetch(url,{headers:{Accept:'application/json'}}),payload=await response.json();
+      if(!response.ok)throw new Error(errorDetailMessage(payload.detail,'Unable to load real-order chart'));
+      render(payload);
+    }catch(error){if(status)status.textContent='Chart failed: '+error.message}
+    finally{range.disabled=false}
+  };
+  range&&range.addEventListener('change',load);
+  load();
+}
 window.addEventListener('pagehide',()=>{chartInstances.forEach(chart=>chart.destroy());chartInstances.clear()},{once:true});
-document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initSavedContractInlineCharts();initLiveRetestLoading();initLiveRetestRefresh();initLiveMonitor();initLocalDataTools();initCopyTextButtons();initSmartFamilyReport()});
+document.addEventListener('DOMContentLoaded',()=>{initGroupGeneration();initCacheCalendar();initRetestProgress();initFavoriteForms();initLiveTimeRanges();initLiveAnalysis();initStrategyTradeContractCharts();initSavedContractInlineCharts();initLiveRetestLoading();initLiveRetestRefresh();initLiveMonitor();initLocalDataTools();initCopyTextButtons();initSmartFamilyReport();initRealTradeBalanceChart()});

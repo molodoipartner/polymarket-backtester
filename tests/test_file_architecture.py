@@ -2092,6 +2092,48 @@ def test_account_real_order_pagination_reads_newest_pages(tmp_path: Path):
     assert third_has_next is False
 
 
+def test_real_trade_balance_chart_starts_at_zero_and_uses_matched_cash_flow():
+    payload = routes_module._real_trade_balance_chart_payload([
+        {
+            "status": "submitted",
+            "order_action": "open",
+            "side": "UP",
+            "submitted_at": "2026-07-23T10:00:00+00:00",
+            "response": {
+                "status": "matched",
+                "makingAmount": "2.0",
+                "takingAmount": "2.8",
+            },
+        },
+        {
+            "status": "failed",
+            "order_action": "open",
+            "amount": 99.0,
+            "submitted_at": "2026-07-23T10:01:00+00:00",
+        },
+        {
+            "status": "submitted",
+            "order_action": "close",
+            "side": "UP",
+            "submitted_at": "2026-07-23T10:02:00+00:00",
+            "response": {
+                "status": "matched",
+                "makingAmount": "2.8",
+                "takingAmount": "2.1",
+            },
+        },
+    ], 100)
+
+    assert [point["cash_flow"] for point in payload["points"]] == [-2.0, 2.1]
+    assert [point["balance"] for point in payload["points"]] == [-2.0, 0.1]
+    assert payload["summary"] == {
+        "order_count": 2,
+        "final_balance": 0.1,
+        "minimum_balance": -2.0,
+        "maximum_balance": 0.1,
+    }
+
+
 def test_paper_real_trading_close_retry_uses_clob_error_balance_without_lookup(tmp_path: Path):
     store = FileStore(tmp_path / "server_data")
     user = store.create_user("real-paper-close-retry@example.com", "Real Paper", hash_password("secure-pass"))

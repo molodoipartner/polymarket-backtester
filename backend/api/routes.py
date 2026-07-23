@@ -959,6 +959,25 @@ def account_smart_family_report(request: Request):
     return _smart_family_report(_store(request), user["id"])
 
 
+@router.get("/api/account/real-trades/balance-chart")
+async def account_real_trades_balance_chart(
+    request: Request,
+    limit: Annotated[int, Query()] = 100,
+):
+    user = _require_user(request)
+    if limit not in {25, 50, 100, 250, 500}:
+        raise HTTPException(422, "Chart range must be 25, 50, 100, 250, or 500 orders")
+    orders, _has_more = await asyncio.to_thread(
+        _store(request).list_user_records_reverse_page,
+        user["id"],
+        "real_orders",
+        {},
+        1,
+        limit,
+    )
+    return _real_trade_balance_chart_payload(list(reversed(orders)), limit)
+
+
 @router.post("/account/clear-project-cache")
 async def clear_project_cache(request: Request):
     user = _require_user(request)
@@ -3269,15 +3288,24 @@ def _paper_close_fill(response: dict | None) -> tuple[float | None, float | None
 def _real_order_account_row(order: dict) -> dict:
     row = dict(order)
     action = str(row.get("order_action") or "open").lower()
+    response = row.get("response") if isinstance(row.get("response"), dict) else {}
     if action == "close":
-        quantity, notional, average = _paper_close_fill(row.get("response"))
+        quantity, notional, average = _paper_close_fill(response)
         row["actual_quantity"] = row.get("real_close_quantity") or quantity
         row["actual_notional"] = row.get("real_close_proceeds") or notional
         row["actual_price"] = row.get("real_close_avg_price") or average
     else:
-        row["actual_quantity"] = row.get("real_open_quantity")
-        row["actual_notional"] = row.get("real_open_notional_amount") or row.get("amount")
-        row["actual_price"] = row.get("real_open_avg_price")
+        response_quantity = _number_or_none(response.get("takingAmount"))
+        response_notional = _number_or_none(response.get("makingAmount"))
+        row["actual_quantity"] = response_quantity or row.get("real_open_quantity")
+        row["actual_notional"] = (
+            response_notional or row.get("real_open_notional_amount") or row.get("amount")
+        )
+        row["actual_price"] = (
+            round(response_notional / response_quantity, 8)
+            if response_notional and response_quantity
+            else row.get("real_open_avg_price")
+        )
     row["signal_price"] = _number_or_none(
         row.get("signal_exit_price") if action == "close" else row.get("signal_entry_price")
     )
@@ -3308,6 +3336,50 @@ def _real_order_account_row(order: dict) -> dict:
         or row.get("created_at")
     )
     return row
+
+
+def _real_trade_balance_chart_payload(orders: list[dict], limit: int) -> dict:
+    balance = 0.0
+    minimum = 0.0
+    maximum = 0.0
+    points = []
+    for order in orders:
+        if str(order.get("status") or "").lower() != "submitted":
+            continue
+        row = _real_order_account_row(order)
+        actual_notional = _number_or_none(row.get("actual_notional"))
+        if actual_notional is None or actual_notional <= 0:
+            continue
+        action = str(row.get("order_action") or "open").lower()
+        cash_flow = actual_notional if action == "close" else -actual_notional
+        balance = round(balance + cash_flow, 8)
+        minimum = min(minimum, balance)
+        maximum = max(maximum, balance)
+        points.append({
+            "t": (
+                row.get("clob_send_at")
+                or row.get("submitted_at")
+                or row.get("paper_signal_at")
+                or row.get("created_at")
+            ),
+            "balance": balance,
+            "cash_flow": round(cash_flow, 8),
+            "action": action,
+            "side": row.get("side"),
+            "event_slug": row.get("event_slug"),
+            "actual_price": row.get("actual_price"),
+            "actual_quantity": row.get("actual_quantity"),
+        })
+    return {
+        "range": limit,
+        "points": points,
+        "summary": {
+            "order_count": len(points),
+            "final_balance": round(balance, 8),
+            "minimum_balance": round(minimum, 8),
+            "maximum_balance": round(maximum, 8),
+        },
+    }
 
 
 def _real_order_console_rows(order: dict) -> list[dict]:

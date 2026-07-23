@@ -120,6 +120,32 @@
     <div><p class="eyebrow">Polymarket CLOB</p><h2>Real executed orders</h2><p class="muted">Actual average fill price is calculated from the matched CLOB response, not from the paper signal price.</p></div>
     <span class="badge">Page {{ account_page_number }}</span>
   </div>
+  <section class="mb-6 rounded-lg border border-line bg-ink/40 p-4" id="real-trade-balance-chart" data-chart-url="/api/account/real-trades/balance-chart">
+    <div class="section-title">
+      <div>
+        <p class="eyebrow">Selected real orders</p>
+        <h2>Balance change from zero</h2>
+        <p class="muted">Synthetic net cash flow: every matched OPEN subtracts actual spend and every matched CLOSE adds actual proceeds. This is not the Polymarket wallet balance.</p>
+      </div>
+      <label>Chart range
+        <select id="real-trade-chart-range">
+          <option value="25">Last 25 orders</option>
+          <option value="50">Last 50 orders</option>
+          <option value="100" selected>Last 100 orders</option>
+          <option value="250">Last 250 orders</option>
+          <option value="500">Last 500 orders</option>
+        </select>
+      </label>
+    </div>
+    <div class="grid gap-3 sm:grid-cols-4">
+      <div class="metric-card"><p>Included orders</p><strong id="real-trade-chart-count">-</strong></div>
+      <div class="metric-card"><p>Final</p><strong id="real-trade-chart-final">-</strong></div>
+      <div class="metric-card"><p>Lowest</p><strong id="real-trade-chart-min">-</strong></div>
+      <div class="metric-card"><p>Highest</p><strong id="real-trade-chart-max">-</strong></div>
+    </div>
+    <p class="muted mt-3" id="real-trade-chart-status">Loading real-order cash flow...</p>
+    <div class="mt-4 h-80" id="real-trade-chart-wrap"><canvas id="real-trade-balance-canvas"></canvas></div>
+  </section>
   <div class="overflow-x-auto">
     <table>
       <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Signal price</th><th>Actual fill</th><th>Difference</th><th>Quantity</th><th>Notional</th><th>Signal to CLOB</th><th>CLOB</th></tr></thead>
