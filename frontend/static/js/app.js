@@ -711,7 +711,7 @@ function initLiveMonitor(){
     card.innerHTML=[
       '<div class="section-title">',
       '<div><p class="eyebrow">Live monitor</p><h2 class="text-xl" data-live-event-title>Live session</h2><p class="muted" data-live-event-slug>-</p></div>',
-      '<div class="live-card-actions"><button class="secondary hidden" type="button" data-paper-manual-open>Open UP $1</button><button class="secondary hidden" type="button" data-paper-manual-close>Close manual</button><button class="secondary" type="button" data-live-chart-toggle>Show chart</button><button class="secondary" type="button" data-live-stop>Stop</button></div>',
+      '<div class="live-card-actions"><button class="secondary hidden" type="button" data-paper-manual-open>Open UP</button><button class="secondary hidden" type="button" data-paper-manual-close>Close manual</button><button class="secondary" type="button" data-live-chart-toggle>Show chart</button><button class="secondary" type="button" data-live-stop>Stop</button></div>',
       '</div>',
       '<div class="live-status-grid">',
       '<div class="metric-card"><p>Crypto price</p><strong data-live-crypto-price>-</strong><span class="muted"><span class="ws-dot" data-live-crypto-dot></span><span data-live-crypto-status>Waiting</span></span></div>',
@@ -760,6 +760,8 @@ function initLiveMonitor(){
       sessionShort:card.querySelector('[data-live-session-short]')
     };
     controller.sessionShort.textContent=shortToken(id);
+    const configuredAmount=finiteNumber(payload.real_order_amount);
+    controller.manualOpenButton.textContent=configuredAmount===null?'Open UP':'Open UP '+fmtMoney(configuredAmount);
     controller.chartToggle.addEventListener('click',()=>toggleChart(controller));
     controller.manualOpenButton.addEventListener('click',()=>manualPaperAction(controller,'open'));
     controller.manualCloseButton.addEventListener('click',()=>manualPaperAction(controller,'close'));
@@ -777,6 +779,8 @@ function initLiveMonitor(){
       existing.manualOpenUrl=payload.manual_open_url||existing.manualOpenUrl||'';
       existing.manualCloseUrl=payload.manual_close_url||existing.manualCloseUrl||'';
       existing.runUrl=payload.run_url||existing.runUrl||'';
+      const configuredAmount=finiteNumber(payload.real_order_amount);
+      if(configuredAmount!==null)existing.manualOpenButton.textContent='Open UP '+fmtMoney(configuredAmount);
       existing.manualOpenButton?.classList.toggle('hidden',!existing.manualOpenUrl);
       existing.manualCloseButton?.classList.toggle('hidden',!existing.manualCloseUrl);
       return existing;

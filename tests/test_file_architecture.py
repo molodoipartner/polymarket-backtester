@@ -1213,6 +1213,8 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
         assert "Start trading" in paper_page.text
         assert "Starting balance" in paper_page.text
         assert 'name="real_trading"' in paper_page.text
+        assert 'name="real_order_amount"' in paper_page.text
+        assert "Real order amount ($)" in paper_page.text
         assert "Real trading" in paper_page.text
         assert "<th>Entry $</th>" in paper_page.text
         assert "<th>Balance</th>" in paper_page.text
@@ -1226,8 +1228,11 @@ def test_live_monitor_analysis_counts_and_generates_group(tmp_path: Path, monkey
             strategies[0],
             "paper-session",
             starting_balance=750,
+            real_order_amount=7.25,
         )
         assert run_group["starting_balance"] == 750
+        assert run_group["paper_trading"]["real_order_amount"] == 7.25
+        assert run_strategy["paper_trading"]["real_order_amount"] == 7.25
         write_live_monitor_record(
             store,
             user,
@@ -1830,6 +1835,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
         SimpleNamespace(slug="previous", window_start_ts=1782639300),
         100,
         True,
+        real_order_amount=2.75,
     )
 
     class FakeExecutor:
@@ -1949,7 +1955,7 @@ def test_paper_real_trading_executes_signal_once(tmp_path: Path, monkeypatch):
     assert display_only["real_orders"][0]["status"] == "submitted"
     assert len(executor.calls) == 1
     assert executor.calls[0].token_id == "up-token"
-    assert executor.calls[0].amount == 1.0
+    assert executor.calls[0].amount == 2.75
     assert executor.calls[0].order_type == "FAK"
     assert executor.calls[0].price == 0.99
     # Balance is checked at session start/rollover, never in the OPEN path.

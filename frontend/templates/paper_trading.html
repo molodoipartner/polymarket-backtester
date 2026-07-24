@@ -51,7 +51,11 @@
     <label class="live-real-trading-toggle">
       <input name="real_trading" type="checkbox" value="true">
       Real trading
-      <span class="muted">Market BUY $1.00 on each live signal</span>
+      <span class="muted">Submit a market BUY on each live signal</span>
+    </label>
+    <label>
+      Real order amount ($)
+      <input name="real_order_amount" type="number" min="0.01" step="0.01" value="{{ '%.2f'|format(real_order_amount) }}" required>
     </label>
     <label class="live-real-trading-toggle">
       <input name="server_optimized" type="checkbox" value="true">

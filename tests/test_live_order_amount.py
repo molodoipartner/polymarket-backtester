@@ -22,6 +22,12 @@ def test_paper_real_order_amount_falls_back_to_one_for_invalid_values(monkeypatc
     assert routes._paper_real_order_amount() == 1.0
 
 
+def test_paper_real_order_amount_prefers_run_value_over_global_setting(monkeypatch):
+    monkeypatch.setattr(settings, "polymarket_live_order_amount", 2.0)
+
+    assert routes._paper_real_order_amount(7.25) == 7.25
+
+
 def test_market_buy_allows_configured_amounts_above_one_dollar(monkeypatch):
     executor = PolymarketLiveOrderExecutor()
     captured = {}
