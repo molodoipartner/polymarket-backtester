@@ -2638,6 +2638,14 @@ def _finalize_paper_live_contract(
     event = generator._record_to_event(saved, asset, timeframe)
     if not event:
         return
+    initial_prior_outcomes = _paper_prior_outcomes(
+        request,
+        user_id,
+        source_group,
+        source_strategy,
+        run_strategy,
+        float(event["start_ts"]),
+    )
     result = generator._run(
         [event],
         _paper_strategy_spec(source_strategy, run_strategy),
@@ -2651,6 +2659,7 @@ def _finalize_paper_live_contract(
                 _number_or_none(saved_preview.get("window_start_ts")),
             )
         ),
+        initial_prior_outcomes=initial_prior_outcomes,
     )
     generated = []
     for trade in result.get("transactions") or []:
@@ -2768,6 +2777,57 @@ def _paper_first_session_contract_id(
     return str(previews[0].get("id") or "") if previews else None
 
 
+def _paper_prior_outcomes(
+    request: Request,
+    user_id: str,
+    source_group: dict,
+    source_strategy: dict,
+    run_strategy: dict,
+    before_ts: float,
+) -> list[str]:
+    strategy = _paper_strategy_spec(source_strategy, run_strategy)
+    if str(strategy.get("family") or "") not in SMART_LIVE_FAMILY_LABELS:
+        return []
+    try:
+        prior_window = max(0, int(strategy.get("prior_window") or 0))
+    except (TypeError, ValueError):
+        prior_window = 0
+    if not prior_window:
+        return []
+
+    live_monitor = request.app.state.live_monitor
+    if not hasattr(live_monitor, "list_saved_previews"):
+        return []
+    asset = str((source_group.get("assets") or [""])[0]).upper()
+    timeframe = str(source_group.get("timeframe") or "")
+    include_partial = bool(source_group.get("include_partial_contracts", False))
+    generator = LiveMonitorStrategyGenerator(_store(request), request.app.state.live_monitor)
+    candidates = []
+    for record in live_monitor.list_saved_previews(user_id, category=asset.lower()):
+        if record.get("unsuitable_contract"):
+            continue
+        if record.get("partial_contract") and not include_partial:
+            continue
+        if generator._record_timeframe(record) != timeframe:
+            continue
+        end_ts = _number_or_none(record.get("window_end_ts"))
+        outcome = str(record.get("winning_outcome") or "").strip().lower()
+        if end_ts is None or end_ts > before_ts + 1e-6:
+            continue
+        if outcome not in {"up", "down", "flat"}:
+            continue
+        candidates.append(
+            (
+                end_ts,
+                _number_or_none(record.get("window_start_ts")) or end_ts,
+                str(record.get("id") or ""),
+                outcome,
+            )
+        )
+    candidates.sort(key=lambda item: item[:3])
+    return [item[3] for item in candidates[-prior_window:]]
+
+
 def _paper_live_trade_preview(
     request: Request,
     user_id: str,
@@ -2779,6 +2839,7 @@ def _paper_live_trade_preview(
     *,
     persist: bool = False,
     execute_real_orders: bool = True,
+    initial_prior_outcomes: list[str] | None = None,
 ) -> dict:
     store = _store(request)
     run_group = store.get_user_record(user_id, "groups", run_group["id"]) or run_group
@@ -2855,10 +2916,20 @@ def _paper_live_trade_preview(
         "slug": event_payload.get("slug"),
     }
     try:
+        if initial_prior_outcomes is None:
+            initial_prior_outcomes = _paper_prior_outcomes(
+                request,
+                user_id,
+                source_group,
+                source_strategy,
+                run_strategy,
+                window_start,
+            )
         result = generator._run(
             [event],
             _paper_strategy_spec(source_strategy, run_strategy),
             current_cash,
+            initial_prior_outcomes=initial_prior_outcomes,
         )
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         return {
@@ -4696,6 +4767,8 @@ async def _paper_real_trading_worker(
     last_decision_key = None
     last_health_log_at = 0.0
     threshold_signal_state: dict = {}
+    prior_outcomes_window_start = None
+    initial_prior_outcomes: list[str] = []
     logger.info(
         "Paper real trading worker started session=%s strategy=%s",
         session.id,
@@ -4774,6 +4847,25 @@ async def _paper_real_trading_worker(
             cache_key = _paper_visual_preview_key(session.id, run_strategy, snapshot)
             preview_snapshot = dict(snapshot)
             preview_snapshot["history"] = list(snapshot.get("history") or [])
+            window_start = _number_or_none(
+                (preview_snapshot.get("event") or {}).get("window_start_ts")
+            )
+            if (
+                window_start is not None
+                and (
+                    prior_outcomes_window_start is None
+                    or abs(window_start - prior_outcomes_window_start) > 1e-6
+                )
+            ):
+                initial_prior_outcomes = _paper_prior_outcomes(
+                    request,
+                    user_id,
+                    source_group,
+                    source_strategy,
+                    run_strategy,
+                    window_start,
+                )
+                prior_outcomes_window_start = window_start
             decision_started = time.perf_counter()
             try:
                 paper_payload = await asyncio.to_thread(
@@ -4787,6 +4879,7 @@ async def _paper_real_trading_worker(
                     preview_snapshot,
                     persist=False,
                     execute_real_orders=True,
+                    initial_prior_outcomes=initial_prior_outcomes,
                 )
                 _store_paper_visual_preview(cache_key, paper_payload)
                 duration_ms = (time.perf_counter() - decision_started) * 1000.0

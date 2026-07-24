@@ -1172,6 +1172,7 @@ class LiveMonitorStrategyGenerator:
         strategy: dict,
         initial_capital: float,
         metrics_only: bool = False,
+        initial_prior_outcomes: list[str] | None = None,
     ) -> dict:
         available_cash = initial_capital
         equity_curve = [] if metrics_only else [
@@ -1180,7 +1181,11 @@ class LiveMonitorStrategyGenerator:
         transactions = []
         allocation_pct = float(strategy["allocation_pct"])
         fee_rate = float(strategy["fee_bps"]) / 10_000
-        prior_outcomes: list[str] = []
+        prior_outcomes = [
+            str(outcome).strip().lower()
+            for outcome in (initial_prior_outcomes or [])
+            if str(outcome).strip().lower() in {"up", "down", "flat"}
+        ]
 
         for event in events:
             if strategy["family"] in {
