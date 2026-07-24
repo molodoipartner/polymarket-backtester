@@ -128,6 +128,61 @@ async def test_polymarket_orderbook_updates_quote_from_book_and_price_change():
 
 
 @pytest.mark.asyncio
+async def test_polymarket_orderbook_uses_provider_timestamp_instead_of_receipt_time(
+    monkeypatch,
+):
+    async def on_update(_kind, _detail):
+        return None
+
+    monkeypatch.setattr(live_monitor.time, "time", lambda: 2_000_000_000.0)
+    state = LiveMonitorState(quotes={"token-1": LiveQuote()})
+    client = PolymarketLiveOrderBook(["token-1"], state, on_update)
+
+    await client._apply_message(
+        {
+            "event_type": "book",
+            "asset_id": "token-1",
+            "timestamp": "1784924865000",
+            "bids": [{"price": "0.41", "size": "7"}],
+            "asks": [{"price": "0.44", "size": "9"}],
+        }
+    )
+    assert state.quotes["token-1"].event_at == 1784924865.0
+    assert state.quotes["token-1"].updated_at == 1784924865.0
+
+    await client._apply_message(
+        {
+            "event_type": "price_change",
+            "timestamp": "1784924865250",
+            "price_changes": [
+                {
+                    "asset_id": "token-1",
+                    "side": "buy",
+                    "price": "0.42",
+                    "size": "3",
+                    "best_bid": "0.42",
+                    "best_ask": "0.44",
+                }
+            ],
+        }
+    )
+    assert state.quotes["token-1"].event_at == 1784924865.25
+    assert state.quotes["token-1"].updated_at == 1784924865.25
+
+    await client._apply_message(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-1",
+            "timestamp": "1784924865500",
+            "best_bid": "0.42",
+            "best_ask": "0.43",
+        }
+    )
+    assert state.quotes["token-1"].event_at == 1784924865.5
+    assert state.quotes["token-1"].updated_at == 1784924865.5
+
+
+@pytest.mark.asyncio
 async def test_price_change_can_reuse_previous_side_when_best_price_missing():
     async def on_update(_kind, _detail):
         return None
@@ -2975,6 +3030,46 @@ def test_history_sample_does_not_use_future_quote_update(tmp_path):
     assert row["yes_ask"] == 45.0
     assert row["quote_event_at"] == 1000.1
     assert row["quote_age_seconds"] == 0.4
+
+
+def test_quote_timeline_orders_delayed_provider_events_by_event_time(tmp_path):
+    event = ResolvedPolymarketEvent(
+        url="https://polymarket.com/event/btc-updown-5m-1000",
+        slug="btc-updown-5m-1000",
+        title="Bitcoin Up or Down",
+        markets=[],
+        tokens=[
+            LiveToken(
+                token_id="token-1",
+                market_question="Bitcoin Up or Down",
+                outcome="Up",
+            )
+        ],
+        crypto_symbol="btc/usd",
+        window_size_seconds=300,
+        window_start_ts=1000,
+        window_end_ts=1300,
+    )
+    session = LiveMonitorSession("session-1", "user-1", event, tmp_path)
+
+    session.state.quotes["token-1"] = LiveQuote(
+        bid=0.5,
+        ask=0.55,
+        updated_at=1000.6,
+        event_at=1000.6,
+    )
+    session._remember_quote_update("token-1")
+    session.state.quotes["token-1"] = LiveQuote(
+        bid=0.4,
+        ask=0.45,
+        updated_at=1000.1,
+        event_at=1000.1,
+    )
+    session._remember_quote_update("token-1")
+
+    timeline = session._quote_timeline["token-1"]
+    assert [quote.event_at for quote in timeline] == [1000.1, 1000.6]
+    assert session._quote_at("token-1", 1000.5).bid == 0.4
 
 
 @pytest.mark.asyncio

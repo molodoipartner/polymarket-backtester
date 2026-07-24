@@ -101,6 +101,10 @@ LIVE_STREAM_MIN_INTERVAL_SECONDS = _env_float(
     0.25,
     0.05,
 )
+SOURCE_SETTLE_DELAY_SECONDS = _env_float(
+    "LIVE_MONITOR_SOURCE_SETTLE_DELAY_SECONDS",
+    3.0,
+)
 SAVED_RECORD_PREVIEW_CACHE_LIMIT = _env_int(
     "LIVE_MONITOR_SAVED_PREVIEW_CACHE_LIMIT",
     32,
@@ -446,6 +450,7 @@ class PolymarketLiveOrderBook:
     async def _apply_message(self, message: dict) -> None:
         event_type = message.get("event_type")
         now = time.time()
+        event_at = _timestamp_from_mapping(message) or now
 
         if event_type == "book" or (
             not event_type and ("bids" in message or "asks" in message)
@@ -462,7 +467,7 @@ class PolymarketLiveOrderBook:
                 token_id,
                 bid,
                 ask,
-                now,
+                event_at,
                 bid_size=bid_size,
                 ask_size=ask_size,
             )
@@ -509,7 +514,7 @@ class PolymarketLiveOrderBook:
                     token_id,
                     float(best_bid) if best_bid is not None else None,
                     float(best_ask) if best_ask is not None else None,
-                    now,
+                    event_at,
                     bid_size=self._polymarket_level_size(
                         token_id,
                         "bids",
@@ -534,7 +539,7 @@ class PolymarketLiveOrderBook:
                 token_id,
                 _polymarket_bid(message.get("best_bid")),
                 _polymarket_ask(message.get("best_ask")),
-                now,
+                event_at,
                 bid_size=self._polymarket_level_size(
                     token_id, "bids", _polymarket_bid(message.get("best_bid"))
                 ),
@@ -552,7 +557,7 @@ class PolymarketLiveOrderBook:
             self._tick_sizes[token_id] = new_tick_size
             quote = self.state.quotes[token_id]
             quote.tick_size = new_tick_size
-            quote.event_at = now
+            quote.event_at = event_at
             quote.event_count += 1
             await self.on_update("quote", {"token_id": token_id})
 
@@ -1247,16 +1252,18 @@ class LiveMonitorSession:
                 sample_ts = self._next_history_sample_ts or _ceil_history_sample_time(
                     time.time()
                 )
-                await asyncio.sleep(max(0, sample_ts - time.time()))
+                wake_at = sample_ts + SOURCE_SETTLE_DELAY_SECONDS
+                await asyncio.sleep(max(0, wake_at - time.time()))
                 captured_at = time.time()
-                sample_delay_ms = max(0.0, (captured_at - sample_ts) * 1000.0)
+                scheduler_delay_ms = max(0.0, (captured_at - wake_at) * 1000.0)
+                observable_at = captured_at - SOURCE_SETTLE_DELAY_SECONDS
                 sample_ts, skipped_samples = _coalesce_late_history_sample(
                     sample_ts,
-                    captured_at,
+                    observable_at,
                 )
-                if sample_delay_ms >= 250.0:
+                if scheduler_delay_ms >= 250.0:
                     self._report_sampler_delay(
-                        sample_delay_ms,
+                        scheduler_delay_ms,
                         skipped_samples,
                     )
                 self._tick_count += 1
@@ -1423,9 +1430,11 @@ class LiveMonitorSession:
                     return
                 if time.time() < self.event.window_end_ts:
                     await self._preload_next_event(next_url)
-            switch_at = float(self.event.window_end_ts)
-            if self._preloaded_next is not None:
-                switch_at += PRELOADED_HISTORY_PRIORITY_SECONDS
+            switch_at = (
+                float(self.event.window_end_ts)
+                + SOURCE_SETTLE_DELAY_SECONDS
+                + PRELOADED_HISTORY_PRIORITY_SECONDS
+            )
             delay = max(0, switch_at - time.time())
             await asyncio.sleep(delay)
             if self._stopped:
@@ -1605,13 +1614,15 @@ class LiveMonitorSession:
                 and sample_ts > preloaded.event.window_end_ts
             ):
                 return
-            await asyncio.sleep(max(0, sample_ts - time.time()))
+            wake_at = sample_ts + SOURCE_SETTLE_DELAY_SECONDS
+            await asyncio.sleep(max(0, wake_at - time.time()))
             if self._stopped or preloaded.history_stopped:
                 return
             captured_at = time.time()
+            observable_at = captured_at - SOURCE_SETTLE_DELAY_SECONDS
             sample_ts, _skipped_samples = _coalesce_late_history_sample(
                 sample_ts,
-                captured_at,
+                observable_at,
             )
             self._capture_preloaded_history_row(
                 preloaded,
@@ -1915,6 +1926,11 @@ class LiveMonitorSession:
             timeline[-1] = snapshot
         else:
             timeline.append(snapshot)
+            if (
+                len(timeline) > 1
+                and event_at < (timeline[-2].event_at or 0)
+            ):
+                timeline.sort(key=lambda item: item.event_at or 0)
 
     def _remember_crypto_update(self) -> None:
         if self.state.crypto_price is None:
