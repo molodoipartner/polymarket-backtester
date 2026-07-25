@@ -922,23 +922,6 @@ def account_page(request: Request):
                 store, user["id"], "real_orders", account_page_number, 50
             )
             real_orders = [_real_order_account_row(item) for item in saved_orders]
-            paper_trade_ids = {
-                str(item.get("paper_trade_id") or "").strip()
-                for item in real_orders
-                if str(item.get("paper_trade_id") or "").strip()
-            }
-            completed_trades = {
-                str(item.get("id")): item
-                for item in store.list_user_records_by_ids(
-                    user["id"], "paper_trades", paper_trade_ids
-                )
-            }
-            for item in real_orders:
-                completed = completed_trades.get(str(item.get("paper_trade_id") or ""))
-                if item.get("account_balance_after_completion") is None and completed:
-                    item["account_balance_after_completion"] = completed.get(
-                        "polymarket_balance_after_resolution"
-                    )
         elif console_kind == "connections":
             real_console, account_has_next_page = _account_recent_page(
                 store, user["id"], "real_trade_console", account_page_number, 100
@@ -2718,11 +2701,39 @@ def _finalize_paper_live_contract(
     }
     if (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
         wallet_balance, wallet_response = _paper_collateral_balance_snapshot(request)
+        wallet_recorded_at = utc_iso()
         changes.update({
             "polymarket_balance_after_resolution": wallet_balance,
-            "polymarket_balance_after_resolution_at": utc_iso(),
+            "polymarket_balance_after_resolution_at": wallet_recorded_at,
             "polymarket_balance_after_resolution_response": wallet_response,
         })
+        if wallet_balance is not None:
+            real_orders = store.list_user_records_filtered(
+                user_id, "real_orders", {"paper_trade_id": paper_id}
+            )
+            closed_open_ids = {
+                str(order.get("open_order_id") or "")
+                for order in real_orders
+                if str(order.get("status") or "").lower() == "submitted"
+                and str(order.get("order_action") or "").lower() == "close"
+            }
+            for order in real_orders:
+                if (
+                    str(order.get("status") or "").lower() == "submitted"
+                    and str(order.get("order_action") or "open").lower() == "open"
+                    and str(order.get("id") or "") not in closed_open_ids
+                ):
+                    store.update_user_record(
+                        user_id,
+                        "real_orders",
+                        str(order["id"]),
+                        {
+                            "account_balance_after_completion": wallet_balance,
+                            "account_balance_after_completion_at": wallet_recorded_at,
+                            "account_balance_after_completion_response": wallet_response,
+                            "completion_type": "resolution",
+                        },
+                    )
     if existing:
         store.update_user_record(user_id, "paper_trades", paper_id, changes)
     else:
