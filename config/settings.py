@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     export_token: str = ""
     render_export_url: str = "https://polymarket-backtester.onrender.com/api/admin/export-data"
     render_export_token: str = ""
+    fly_contract_export_url: str = (
+        "https://polymarket-backtester.fly.dev/api/admin/export-live-contracts"
+    )
+    fly_contract_export_token: str = ""
+    fly_contract_export_user_email: str = ""
     username: str = "test"
     password: str = "TestUser123!"
     admin_username: str = "admin"

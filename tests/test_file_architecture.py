@@ -2340,6 +2340,7 @@ def test_real_trade_balance_chart_resolves_only_unclosed_token_remainder():
         "paper-up": {
             "id": "paper-up",
             "winning_outcome": "Up",
+            "polymarket_balance_after_resolution": 137.42,
             "window_end_ts": datetime(2026, 7, 23, 10, 5, tzinfo=timezone.utc).timestamp(),
         }
     }
@@ -2352,6 +2353,7 @@ def test_real_trade_balance_chart_resolves_only_unclosed_token_remainder():
     assert payload["points"][-1]["actual_quantity"] == pytest.approx(1.8)
     assert payload["points"][-1]["cash_flow"] == pytest.approx(1.8)
     assert payload["points"][-1]["won"] is True
+    assert payload["points"][-1]["account_balance_after_completion"] == 137.42
     assert payload["summary"]["resolution_count"] == 1
     assert payload["summary"]["final_balance"] == pytest.approx(0.3)
 
@@ -5039,3 +5041,86 @@ def test_admin_export_data_requires_admin_or_token(tmp_path: Path, monkeypatch):
         )
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
             assert f"server_data/users/{user['id']}/profile.json" in archive.getnames()
+
+
+def test_fly_contract_export_contains_only_requested_users_saved_contracts(
+    tmp_path: Path, monkeypatch
+):
+    store, user = populated_store(tmp_path)
+    other = store.create_user(
+        "other@example.com", "Other", hash_password("secure-pass")
+    )
+    for owner, record_id in ((user, "wanted"), (other, "not-wanted")):
+        directory = (
+            store.root / "live_monitor" / "users" / owner["id"] / "saved_contracts"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{record_id}.json").write_text(
+            json.dumps({"id": record_id, "slug": f"btc-{record_id}"}),
+            encoding="utf-8",
+        )
+
+    class IdleCollector:
+        def __init__(self, current_store):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(settings, "fly_contract_export_token", "fly-token")
+    monkeypatch.setattr(app_module, "FileStore", lambda *_: store)
+    monkeypatch.setattr(app_module, "DataCollector", IdleCollector)
+    with TestClient(app_module.create_app()) as client:
+        assert client.get(
+            "/api/admin/export-live-contracts",
+            params={"user_email": user["email"]},
+        ).status_code == 403
+        response = client.get(
+            "/api/admin/export-live-contracts",
+            params={"user_email": user["email"]},
+            headers={"Authorization": "Bearer fly-token"},
+        )
+        assert response.status_code == 200
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
+            assert archive.getnames() == ["saved_contracts/wanted.json"]
+
+
+def test_merge_fly_contracts_adds_only_missing_contracts_to_destination(tmp_path: Path):
+    destination = tmp_path / "active-storage" / "saved_contracts"
+    destination.mkdir(parents=True)
+    existing_path = destination / "local-id.json"
+    existing_payload = {
+        "id": "local-id",
+        "slug": "btc-updown-5m-100",
+        "history": [{"t": 1, "up": 0.4}],
+    }
+    existing_path.write_text(json.dumps(existing_payload), encoding="utf-8")
+    archive_path = tmp_path / "fly.tar.gz"
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        for filename, payload in (
+            (
+                "same-remote-id.json",
+                {
+                    "id": "same-remote-id",
+                    "slug": "btc-updown-5m-100",
+                    "history": [{"t": 2, "up": 0.6}],
+                },
+            ),
+            (
+                "new-remote-id.json",
+                {"id": "new-remote-id", "slug": "btc-updown-5m-200"},
+            ),
+        ):
+            encoded = json.dumps(payload).encode()
+            info = tarfile.TarInfo(f"saved_contracts/{filename}")
+            info.size = len(encoded)
+            archive.addfile(info, io.BytesIO(encoded))
+
+    result = routes_module._merge_live_contract_archive(archive_path, destination)
+
+    assert result == {"added": 1, "skipped_existing": 1, "invalid": 0}
+    assert json.loads(existing_path.read_text(encoding="utf-8")) == existing_payload
+    assert {
+        json.loads(path.read_text(encoding="utf-8"))["id"]
+        for path in destination.glob("*.json")
+    } == {"local-id", "new-remote-id"}

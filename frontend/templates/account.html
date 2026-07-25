@@ -148,7 +148,7 @@
   </section>
   <div class="overflow-x-auto">
     <table>
-      <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Signal price</th><th>Actual fill</th><th>Difference</th><th>Quantity</th><th>Notional</th><th>Signal to CLOB</th><th>CLOB</th></tr></thead>
+      <thead><tr><th>Time</th><th>Contract</th><th>Action</th><th>Side</th><th>Status</th><th>Signal price</th><th>Actual fill</th><th>Difference</th><th>Quantity</th><th>Notional</th><th>Account balance after completion</th><th>Signal to CLOB</th><th>CLOB</th></tr></thead>
       <tbody>
       {% for order in real_orders %}
         <tr>
@@ -164,11 +164,12 @@
           </td>
           <td>{{ '%.6f'|format(order.actual_quantity) if order.actual_quantity is not none else '-' }}</td>
           <td>{{ '$%.6f'|format(order.actual_notional) if order.actual_notional is not none else '-' }}</td>
+          <td>{{ '$%.2f'|format(order.get('account_balance_after_completion')) if order.get('account_balance_after_completion') is not none else '-' }}</td>
           <td>{{ '%.2f ms'|format(order.signal_to_clob_ms) if order.signal_to_clob_ms is not none else '-' }}</td>
           <td>{{ '%.2f ms'|format(order.clob_duration_ms) if order.clob_duration_ms is not none else '-' }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="12" class="empty">No real Polymarket orders have been saved on this page.</td></tr>
+        <tr><td colspan="13" class="empty">No real Polymarket orders have been saved on this page.</td></tr>
       {% endfor %}
       </tbody>
     </table>

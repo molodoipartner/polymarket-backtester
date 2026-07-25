@@ -1364,7 +1364,7 @@ function initLocalDataTools(){
   const drawer=document.getElementById('local-data-drawer'),backdrop=document.getElementById('local-data-backdrop');
   const openButtons=document.querySelectorAll('[data-local-data-open]');
   if(!openButtons.length||!drawer||!backdrop)return;
-  const closeButton=document.getElementById('local-data-close'),status=document.getElementById('local-data-status'),list=document.getElementById('local-data-list'),refreshButton=document.getElementById('local-data-refresh'),downloadButton=document.getElementById('local-data-download'),tokenForm=document.getElementById('local-data-token-form'),tokenInput=document.getElementById('local-data-token');
+  const closeButton=document.getElementById('local-data-close'),status=document.getElementById('local-data-status'),list=document.getElementById('local-data-list'),refreshButton=document.getElementById('local-data-refresh'),downloadButton=document.getElementById('local-data-download'),flyImportButton=document.getElementById('local-data-import-fly'),tokenForm=document.getElementById('local-data-token-form'),tokenInput=document.getElementById('local-data-token'),flyForm=document.getElementById('local-data-fly-form'),flyTokenInput=document.getElementById('local-data-fly-token'),flyEmailInput=document.getElementById('local-data-fly-email');
   let loading=false;
   const setStatus=(text,mode='')=>{status.textContent=text;status.className='local-data-status '+mode};
   const open=()=>{drawer.classList.remove('hidden');backdrop.classList.remove('hidden');loadProfiles()};
@@ -1379,6 +1379,8 @@ function initLocalDataTools(){
     list.textContent='';
     const profiles=payload.profiles||[];
     if(downloadButton)downloadButton.disabled=!payload.download_configured||loading;
+    if(flyImportButton)flyImportButton.disabled=!payload.fly_import_configured||loading;
+    if(flyEmailInput&&!flyEmailInput.value)flyEmailInput.value=payload.fly_contract_export_user_email||'';
     if(!profiles.length){list.innerHTML='<p class="muted">No data profiles found.</p>';return}
     for(const profile of profiles){
       const row=document.createElement('article');
@@ -1424,6 +1426,22 @@ function initLocalDataTools(){
       loadProfiles();
     }
   };
+  const importFlyContracts=async()=>{
+    if(loading)return;
+    loading=true;
+    if(flyImportButton){flyImportButton.disabled=true;flyImportButton.textContent='Importing...'}
+    setStatus('Downloading missing Fly contracts into the active storage');
+    try{
+      const payload=await requestJson('/api/local-data/import-fly-contracts',{method:'POST'});
+      setStatus('Added '+payload.added+'; already present '+payload.skipped_existing+'; invalid '+payload.invalid,'ok');
+    }catch(error){
+      setStatus(error.message,'error');
+    }finally{
+      loading=false;
+      if(flyImportButton)flyImportButton.textContent='Import missing Fly contracts';
+      loadProfiles();
+    }
+  };
   const saveToken=async event=>{
     event.preventDefault();
     const token=(tokenInput?.value||'').trim();
@@ -1434,6 +1452,23 @@ function initLocalDataTools(){
       await requestJson('/api/local-data/config',{method:'POST',body});
       if(tokenInput)tokenInput.value='';
       setStatus('Token saved locally','ok');
+      loadProfiles();
+    }catch(error){
+      setStatus(error.message,'error');
+    }
+  };
+  const saveFlyAccess=async event=>{
+    event.preventDefault();
+    const token=(flyTokenInput?.value||'').trim(),email=(flyEmailInput?.value||'').trim();
+    if(!email){setStatus('Enter the Fly account email','warn');return}
+    const body=new FormData();
+    body.append('fly_contract_export_token',token);
+    body.append('fly_contract_export_user_email',email);
+    setStatus('Saving Fly access');
+    try{
+      await requestJson('/api/local-data/config',{method:'POST',body});
+      if(flyTokenInput)flyTokenInput.value='';
+      setStatus('Fly access saved locally','ok');
       loadProfiles();
     }catch(error){
       setStatus(error.message,'error');
@@ -1459,7 +1494,9 @@ function initLocalDataTools(){
   backdrop.addEventListener('click',close);
   refreshButton&&refreshButton.addEventListener('click',loadProfiles);
   downloadButton&&downloadButton.addEventListener('click',downloadRender);
+  flyImportButton&&flyImportButton.addEventListener('click',importFlyContracts);
   tokenForm&&tokenForm.addEventListener('submit',saveToken);
+  flyForm&&flyForm.addEventListener('submit',saveFlyAccess);
 }
 function initCopyTextButtons(){
   document.querySelectorAll('[data-copy-text-target]').forEach(button=>{
@@ -1599,7 +1636,7 @@ function initRealTradeBalanceChart(){
       x:Date.parse(order.t),y:Number(order.balance),flow:Number(order.cash_flow),
       action:String(order.action||'').toUpperCase(),side:order.side||'-',
       slug:order.event_slug||'-',price:finiteNumber(order.actual_price),
-      won:order.won,winning:order.winning_outcome||null,index
+      won:order.won,winning:order.winning_outcome||null,accountBalanceAfterCompletion:finiteNumber(order.account_balance_after_completion),index
     })).filter(point=>Number.isFinite(point.x)&&Number.isFinite(point.y));
     if(!points.length){
       const existing=chartInstances.get(canvas)||Chart.getChart(canvas);if(existing)existing.destroy();
@@ -1612,7 +1649,10 @@ function initRealTradeBalanceChart(){
     const tooltipLabel=context=>{
       const raw=context.raw||{},parts=['Balance '+money(raw.y)];
       if(raw.action&&raw.action!=='START')parts.push(raw.action+' '+raw.side+' '+money(raw.flow));
-      if(raw.action==='RESOLUTION')parts.push(raw.won?'won; payout $1':'lost; payout $0');
+      if(raw.action==='RESOLUTION'){
+        parts.push(raw.won?'won; payout $1':'lost; payout $0');
+        if(raw.accountBalanceAfterCompletion!==null)parts.push('Account balance after completion '+money(raw.accountBalanceAfterCompletion));
+      }
       if(raw.price!==null&&raw.price!==undefined)parts.push('fill '+Number(raw.price).toFixed(6));
       return parts.join(' · ');
     };

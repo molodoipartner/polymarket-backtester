@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import tarfile
+import tempfile
 import threading
 import time
 import traceback
@@ -921,6 +922,23 @@ def account_page(request: Request):
                 store, user["id"], "real_orders", account_page_number, 50
             )
             real_orders = [_real_order_account_row(item) for item in saved_orders]
+            paper_trade_ids = {
+                str(item.get("paper_trade_id") or "").strip()
+                for item in real_orders
+                if str(item.get("paper_trade_id") or "").strip()
+            }
+            completed_trades = {
+                str(item.get("id")): item
+                for item in store.list_user_records_by_ids(
+                    user["id"], "paper_trades", paper_trade_ids
+                )
+            }
+            for item in real_orders:
+                completed = completed_trades.get(str(item.get("paper_trade_id") or ""))
+                if item.get("account_balance_after_completion") is None and completed:
+                    item["account_balance_after_completion"] = completed.get(
+                        "polymarket_balance_after_resolution"
+                    )
         elif console_kind == "connections":
             real_console, account_has_next_page = _account_recent_page(
                 store, user["id"], "real_trade_console", account_page_number, 100
@@ -2698,6 +2716,13 @@ def _finalize_paper_live_contract(
         "roi": round((final_capital / initial_capital - 1) * 100, 6) if initial_capital else 0.0,
         "final_capital": final_capital,
     }
+    if (run_group.get("paper_trading") or {}).get("real_trading_enabled"):
+        wallet_balance, wallet_response = _paper_collateral_balance_snapshot(request)
+        changes.update({
+            "polymarket_balance_after_resolution": wallet_balance,
+            "polymarket_balance_after_resolution_at": utc_iso(),
+            "polymarket_balance_after_resolution_response": wallet_response,
+        })
     if existing:
         store.update_user_record(user_id, "paper_trades", paper_id, changes)
     else:
@@ -3243,6 +3268,18 @@ def _paper_collateral_balance_info(executor) -> tuple[float, dict]:
     return balance, info
 
 
+def _paper_collateral_balance_snapshot(request: Request) -> tuple[float | None, dict | None]:
+    """Record wallet state without ever changing the result of an order."""
+    try:
+        balance, response = _paper_collateral_balance_info(
+            _paper_live_order_executor(request)
+        )
+        return round(balance, 8), response
+    except Exception:
+        logger.exception("Could not record Polymarket collateral balance snapshot")
+        return None, None
+
+
 def _paper_signal_audit_snapshot(
     snapshot: dict,
     trade: dict,
@@ -3446,6 +3483,9 @@ def _real_trade_balance_chart_payload(
             "actual_quantity": round(remaining_quantity, 8),
             "winning_outcome": winning_outcome,
             "won": won,
+            "account_balance_after_completion": contract.get(
+                "polymarket_balance_after_resolution"
+            ),
             "_sequence": sequence,
         })
 
@@ -4218,6 +4258,20 @@ def _execute_paper_real_trading_signals(
                     "amount": quantity,
                     "token_id": token_id,
                 })
+                wallet_balance, wallet_response = _paper_collateral_balance_snapshot(
+                    request
+                )
+                if wallet_balance is not None:
+                    record = store.update_user_record(
+                        user_id,
+                        "real_orders",
+                        close_order_id,
+                        {
+                            "account_balance_after_completion": wallet_balance,
+                            "account_balance_after_completion_at": utc_iso(),
+                            "account_balance_after_completion_response": wallet_response,
+                        },
+                    )
             except Exception as error:
                 failed_close = {
                     **close_base,
@@ -6621,6 +6675,14 @@ def _valid_export_token(request: Request) -> bool:
     return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
 
 
+def _valid_fly_contract_export_token(request: Request) -> bool:
+    expected = settings.fly_contract_export_token.strip()
+    if not expected:
+        return False
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
+
+
 def _data_archive_chunks(store: FileStore):
     output: queue.Queue = queue.Queue(maxsize=8)
     finished = object()
@@ -6653,6 +6715,35 @@ def _data_archive_chunks(store: FileStore):
         yield item
 
 
+def _live_contract_archive_chunks(directory: Path):
+    output: queue.Queue = queue.Queue(maxsize=8)
+    finished = object()
+
+    def archive_worker() -> None:
+        try:
+            writer = _QueueWriter(output)
+            with tarfile.open(fileobj=writer, mode="w|gz") as archive:
+                for path in sorted(directory.glob("*.json")):
+                    archive.add(
+                        path,
+                        arcname=f"saved_contracts/{path.name}",
+                        recursive=False,
+                    )
+        except BaseException as error:
+            output.put(error)
+        finally:
+            output.put(finished)
+
+    threading.Thread(target=archive_worker, daemon=True).start()
+    while True:
+        item = output.get()
+        if item is finished:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
 @router.get("/api/admin/export-data")
 def export_data(request: Request):
     if not (_is_admin(request) or _valid_export_token(request)):
@@ -6662,6 +6753,33 @@ def export_data(request: Request):
         media_type="application/gzip",
         headers={
             "Content-Disposition": "attachment; filename=polymarket-server-data.tar.gz",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/api/admin/export-live-contracts")
+def export_live_contracts(
+    request: Request,
+    user_email: Annotated[str, Query()],
+):
+    if not (_is_admin(request) or _valid_fly_contract_export_token(request)):
+        raise HTTPException(403, "Administrator access required")
+    user = _store(request).find_user_by_email(user_email)
+    if not user:
+        raise HTTPException(404, "Fly account not found")
+    directory = (
+        _store(request).root
+        / "live_monitor"
+        / "users"
+        / str(user["id"])
+        / "saved_contracts"
+    )
+    return StreamingResponse(
+        _live_contract_archive_chunks(directory),
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": "attachment; filename=fly-live-contracts.tar.gz",
             "Cache-Control": "no-store",
         },
     )
@@ -6691,6 +6809,89 @@ def _render_export_token() -> str:
     return settings.render_export_token.strip() or str(
         _local_data_tools_config().get("render_export_token", "")
     ).strip()
+
+
+def _fly_contract_export_config() -> tuple[str, str]:
+    config = _local_data_tools_config()
+    token = settings.fly_contract_export_token.strip() or str(
+        config.get("fly_contract_export_token", "")
+    ).strip()
+    email = settings.fly_contract_export_user_email.strip() or str(
+        config.get("fly_contract_export_user_email", "")
+    ).strip()
+    return token, email
+
+
+def _saved_contract_key(record: dict) -> tuple:
+    slug = str(record.get("slug") or "").strip().lower()
+    if slug:
+        return ("slug", slug)
+    symbol = str(
+        record.get("crypto_symbol") or record.get("asset") or ""
+    ).strip().upper()
+    start = _number_or_none(record.get("window_start_ts"))
+    end = _number_or_none(record.get("window_end_ts"))
+    if symbol and start is not None and end is not None:
+        return ("window", symbol, round(start, 3), round(end, 3))
+    return ("id", str(record.get("id") or "").strip())
+
+
+def _merge_live_contract_archive(archive_path: Path, destination: Path) -> dict:
+    destination.mkdir(parents=True, exist_ok=True)
+    existing_keys = set()
+    for path in destination.glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict):
+            existing_keys.add(_saved_contract_key(record))
+
+    added = skipped = invalid = 0
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for member in archive:
+            name = member.name.replace("\\", "/")
+            if (
+                not member.isfile()
+                or not name.startswith("saved_contracts/")
+                or "/" in name[len("saved_contracts/"):]
+                or not name.lower().endswith(".json")
+            ):
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                invalid += 1
+                continue
+            try:
+                record = json.loads(source.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                invalid += 1
+                continue
+            if not isinstance(record, dict) or not str(record.get("id") or "").strip():
+                invalid += 1
+                continue
+            key = _saved_contract_key(record)
+            if key in existing_keys:
+                skipped += 1
+                continue
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(record["id"]))
+            if not safe_id:
+                invalid += 1
+                continue
+            path = destination / f"{safe_id}.json"
+            suffix = 1
+            while path.exists():
+                path = destination / f"{safe_id}__fly_{suffix}.json"
+                suffix += 1
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+            existing_keys.add(key)
+            added += 1
+    return {"added": added, "skipped_existing": skipped, "invalid": invalid}
 
 
 def _local_server_data_root() -> Path:
@@ -6814,9 +7015,12 @@ async def _replace_local_data_root(request: Request, data_root: Path) -> None:
 @router.get("/api/local-data/profiles")
 def local_data_profiles(request: Request):
     _require_local_data_tools(request)
+    fly_token, fly_email = _fly_contract_export_config()
     return {
         "current_root": str(_store(request).root),
         "download_configured": bool(_render_export_token()),
+        "fly_import_configured": bool(fly_token and fly_email),
+        "fly_contract_export_user_email": fly_email,
         "profiles": _local_data_profiles(_store(request).root),
     }
 
@@ -6824,17 +7028,81 @@ def local_data_profiles(request: Request):
 @router.post("/api/local-data/config")
 def save_local_data_config(
     request: Request,
-    render_export_token: Annotated[str, Form()] = "",
+    render_export_token: Annotated[str | None, Form()] = None,
+    fly_contract_export_token: Annotated[str | None, Form()] = None,
+    fly_contract_export_user_email: Annotated[str | None, Form()] = None,
 ):
     _require_local_data_tools(request)
     config = _local_data_tools_config()
-    token = render_export_token.strip()
-    if token:
-        config["render_export_token"] = token
-    else:
-        config.pop("render_export_token", None)
+    if render_export_token is not None:
+        token = render_export_token.strip()
+        if token:
+            config["render_export_token"] = token
+        else:
+            config.pop("render_export_token", None)
+    if fly_contract_export_token is not None:
+        fly_token = fly_contract_export_token.strip()
+        if fly_token:
+            config["fly_contract_export_token"] = fly_token
+    if fly_contract_export_user_email is not None:
+        fly_email = fly_contract_export_user_email.strip().lower()
+        if fly_email:
+            config["fly_contract_export_user_email"] = fly_email
     _save_local_data_tools_config(config)
-    return {"download_configured": bool(_render_export_token())}
+    configured_token, configured_email = _fly_contract_export_config()
+    return {
+        "download_configured": bool(_render_export_token()),
+        "fly_import_configured": bool(configured_token and configured_email),
+    }
+
+
+@router.post("/api/local-data/import-fly-contracts")
+async def import_fly_contracts(request: Request):
+    _require_local_data_tools(request)
+    user = _require_user(request)
+    token, email = _fly_contract_export_config()
+    if not token or not email:
+        raise HTTPException(400, "Set the Fly export token and Fly account email first")
+    destination = (
+        _store(request).root
+        / "live_monitor"
+        / "users"
+        / str(user["id"])
+        / "saved_contracts"
+    )
+    with tempfile.TemporaryDirectory(prefix="fly-contract-import-") as temporary_dir:
+        archive_path = Path(temporary_dir) / "contracts.tar.gz"
+        try:
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                async with client.stream(
+                    "GET",
+                    settings.fly_contract_export_url,
+                    params={"user_email": email},
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    if response.status_code != 200:
+                        detail = (
+                            await response.aread()
+                        ).decode("utf-8", errors="replace")[:300]
+                        raise HTTPException(
+                            response.status_code,
+                            detail or "Fly contract export failed",
+                        )
+                    with archive_path.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            handle.write(chunk)
+            result = await asyncio.to_thread(
+                _merge_live_contract_archive, archive_path, destination
+            )
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(500, f"Fly contract import failed: {error}") from error
+    return {
+        **result,
+        "destination": str(destination.resolve()),
+        "current_root": str(_store(request).root),
+    }
 
 
 @router.post("/api/local-data/download-render")

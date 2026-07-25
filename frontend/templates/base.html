@@ -41,12 +41,22 @@
     <div class="local-data-actions">
       <button id="local-data-refresh" class="secondary" type="button">Refresh</button>
       <button id="local-data-download" class="primary" type="button">Download Render data</button>
+      <button id="local-data-import-fly" class="primary" type="button">Import missing Fly contracts</button>
     </div>
     <form id="local-data-token-form" class="local-data-token-form">
       <label>Render export token
         <input id="local-data-token" type="password" autocomplete="off" placeholder="Paste EXPORT_TOKEN">
       </label>
       <button class="secondary" type="submit">Save token</button>
+    </form>
+    <form id="local-data-fly-form" class="local-data-token-form">
+      <label>Fly account email
+        <input id="local-data-fly-email" type="email" autocomplete="off" placeholder="Account on Fly">
+      </label>
+      <label>Fly contract export token
+        <input id="local-data-fly-token" type="password" autocomplete="off" placeholder="Fly export token">
+      </label>
+      <button class="secondary" type="submit">Save Fly access</button>
     </form>
     <div id="local-data-list" class="local-data-list"></div>
   </aside>
